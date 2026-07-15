@@ -1,0 +1,74 @@
+{
+  "inbound_format": "openai_embed",
+  "target_format": "gemini_embed",
+  "target_model": "gemini-embedding-001",
+  "inbound_body": {
+    "model": "my-embed",
+    "input": [
+      "a",
+      "b"
+    ]
+  },
+  "expected_upstream_body": {
+    "requests": [
+      {
+        "model": "models/gemini-embedding-001",
+        "content": {
+          "parts": [
+            {
+              "text": "a"
+            }
+          ]
+        }
+      },
+      {
+        "model": "models/gemini-embedding-001",
+        "content": {
+          "parts": [
+            {
+              "text": "b"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "upstream_response_body": {
+    "embeddings": [
+      {
+        "values": [
+          0.1
+        ]
+      },
+      {
+        "values": [
+          0.2
+        ]
+      }
+    ]
+  },
+  "expected_client_body": {
+    "object": "list",
+    "model": "",
+    "data": [
+      {
+        "object": "embedding",
+        "index": 0,
+        "embedding": [
+          0.10000000149011612
+        ]
+      },
+      {
+        "object": "embedding",
+        "index": 1,
+        "embedding": [
+          0.20000000298023224
+        ]
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 0,
+      "total_tokens": 0
+    }
+  }
+}

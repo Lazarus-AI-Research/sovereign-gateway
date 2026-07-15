@@ -1,0 +1,54 @@
+# Example models file — load into the database with:
+#   gateway import models.example.toml gateway.toml
+#
+# Each [[model]] is a public model name (what clients request) with one or more
+# deployments. Models live ONLY in the database; the serve config carries none.
+# Add or remove them at runtime via POST/DELETE /admin/v1/models.
+
+[[model]]
+model_name = "gpt-4o"            # the public name clients request
+  aliases = ["gpt-4", "fast"]    # extra public names that resolve to this model
+  [[model.deployments]]
+  provider = "openai"            # free-form attribution label (for access policy + telemetry)
+  upstream_model = "gpt-4o"      # id sent upstream
+  upstream_format = "openai_chat" # chat: anthropic | openai_chat | openai_responses | gemini
+                                  # embeddings: openai_embed | gemini_embed | cohere_embed | voyage_embed | ollama_embed
+  api_key = "sk-..."             # the upstream provider key, stored on the deployment
+  weight = 1
+  # health_check = "none"        # none | http_ok | models_list | probe — independent of upstream_format
+  # health_path = "/health"      # for http_ok: absolute URL, or path on api_base's origin
+  # api_base = "https://api.openai.com/v1"        # optional override
+  # pricing = { input_per_1m = 2.5, output_per_1m = 10.0 }   # optional USD/1M overrides
+
+[[model]]
+model_name = "claude-3-5-sonnet"
+  [[model.deployments]]
+  provider = "anthropic"
+  upstream_model = "claude-3-5-sonnet-20241022"
+  upstream_format = "anthropic"
+  api_key = "sk-ant-..."
+  weight = 1
+
+# ---------------------------------------------------------------------------
+# Embedding models: same deployment shape, an embeddings upstream_format.
+# openai_embed covers every OpenAI-compatible embedding server (OpenAI, vLLM,
+# TEI, LiteLLM, Jina incl. its multimodal inputs, Voyage's TEXT endpoint).
+# voyage_embed is the interleaved text+image multimodal endpoint. ollama_embed
+# is upstream-only (no inbound Ollama surface).
+# ---------------------------------------------------------------------------
+[[model]]
+model_name = "text-embedding-3-small"
+  [[model.deployments]]
+  provider = "openai"
+  upstream_model = "text-embedding-3-small"
+  upstream_format = "openai_embed"
+  api_key = "sk-..."
+  # pricing = { input_per_1m = 0.02, output_per_1m = 0.0 }
+
+[[model]]
+model_name = "voyage-multimodal-3"
+  [[model.deployments]]
+  provider = "voyage"
+  upstream_model = "voyage-multimodal-3"
+  upstream_format = "voyage_embed"
+  api_key = "pa-..."

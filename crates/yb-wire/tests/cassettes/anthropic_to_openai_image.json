@@ -1,0 +1,24 @@
+{
+  "inbound_format": "anthropic",
+  "inbound_body": {
+    "model": "claude-3-5-sonnet-20241022",
+    "max_tokens": 1024,
+    "messages": [
+      {"role": "user", "content": [
+        {"type": "text", "text": "What is in this image?"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+      ]}
+    ]
+  },
+  "target_format": "openai_chat",
+  "expected_upstream_body": {
+    "model": "claude-3-5-sonnet-20241022",
+    "messages": [
+      {"role": "user", "content": [
+        {"type": "text", "text": "What is in this image?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+      ]}
+    ],
+    "max_tokens": 1024
+  }
+}

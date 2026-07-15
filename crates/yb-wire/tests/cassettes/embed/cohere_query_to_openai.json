@@ -1,0 +1,55 @@
+{
+  "inbound_format": "cohere_embed",
+  "target_format": "openai_embed",
+  "target_model": "text-embedding-3-large",
+  "inbound_body": {
+    "model": "embed-v4.0",
+    "input_type": "search_query",
+    "texts": [
+      "find me"
+    ]
+  },
+  "expected_upstream_body": {
+    "model": "text-embedding-3-large",
+    "input": [
+      "find me"
+    ],
+    "encoding_format": "float"
+  },
+  "upstream_response_body": {
+    "object": "list",
+    "model": "text-embedding-3-large",
+    "data": [
+      {
+        "object": "embedding",
+        "index": 0,
+        "embedding": [
+          9.0
+        ]
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 2,
+      "total_tokens": 2
+    }
+  },
+  "expected_client_body": {
+    "id": "emb-22-1",
+    "embeddings": {
+      "float": [
+        [
+          9.0
+        ]
+      ]
+    },
+    "texts": [],
+    "meta": {
+      "api_version": {
+        "version": "2"
+      },
+      "billed_units": {
+        "input_tokens": 2
+      }
+    }
+  }
+}

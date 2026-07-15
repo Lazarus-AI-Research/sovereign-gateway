@@ -1,0 +1,38 @@
+[package]
+name = "yb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yb-core.workspace = true
+yb-wire.workspace = true
+yb-gateway.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+futures.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+sha2.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+yb-store.workspace = true
+yb-providers.workspace = true
+tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+
+# Build-time only: bundles the TSX admin UI (frontend/src) into a single ES
+# module embedded via include_str!. NOT a runtime dependency — does not ship in
+# the binary or its dependency graph (see build.rs).
+[build-dependencies]
+rolldown = "1.1.3"
+tokio = { workspace = true }

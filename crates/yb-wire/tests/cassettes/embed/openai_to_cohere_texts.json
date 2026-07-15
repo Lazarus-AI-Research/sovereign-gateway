@@ -1,0 +1,69 @@
+{
+  "inbound_format": "openai_embed",
+  "target_format": "cohere_embed",
+  "target_model": "embed-v4.0",
+  "inbound_body": {
+    "model": "my-embed",
+    "input": [
+      "hello",
+      "world"
+    ]
+  },
+  "expected_upstream_body": {
+    "model": "embed-v4.0",
+    "input_type": "search_document",
+    "texts": [
+      "hello",
+      "world"
+    ],
+    "embedding_types": [
+      "float"
+    ]
+  },
+  "upstream_response_body": {
+    "id": "x",
+    "embeddings": {
+      "float": [
+        [
+          1.0,
+          2.0
+        ],
+        [
+          3.0,
+          4.0
+        ]
+      ]
+    },
+    "meta": {
+      "billed_units": {
+        "input_tokens": 4
+      }
+    }
+  },
+  "expected_client_body": {
+    "object": "list",
+    "model": "",
+    "data": [
+      {
+        "object": "embedding",
+        "index": 0,
+        "embedding": [
+          1.0,
+          2.0
+        ]
+      },
+      {
+        "object": "embedding",
+        "index": 1,
+        "embedding": [
+          3.0,
+          4.0
+        ]
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 4,
+      "total_tokens": 4
+    }
+  }
+}

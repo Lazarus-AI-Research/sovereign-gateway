@@ -1,0 +1,22 @@
+{
+  "inbound_format": "anthropic",
+  "inbound_body": {
+    "model": "claude-3-5-sonnet-20241022",
+    "max_tokens": 1024,
+    "system": "You are helpful.",
+    "messages": [
+      {"role": "user", "content": "Hello there"}
+    ],
+    "temperature": 0.5
+  },
+  "target_format": "openai_chat",
+  "expected_upstream_body": {
+    "model": "claude-3-5-sonnet-20241022",
+    "messages": [
+      {"role": "system", "content": "You are helpful."},
+      {"role": "user", "content": "Hello there"}
+    ],
+    "max_tokens": 1024,
+    "temperature": 0.5
+  }
+}

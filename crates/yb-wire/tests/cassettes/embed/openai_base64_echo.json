@@ -1,0 +1,52 @@
+{
+  "inbound_format": "openai_embed",
+  "target_format": "openai_embed",
+  "target_model": "text-embedding-3-small",
+  "inbound_body": {
+    "model": "my-embed",
+    "input": "hello",
+    "encoding_format": "base64",
+    "dimensions": 2
+  },
+  "expected_upstream_body": {
+    "model": "text-embedding-3-small",
+    "input": [
+      "hello"
+    ],
+    "encoding_format": "float",
+    "dimensions": 2
+  },
+  "upstream_response_body": {
+    "object": "list",
+    "model": "text-embedding-3-small",
+    "data": [
+      {
+        "object": "embedding",
+        "index": 0,
+        "embedding": [
+          1.0,
+          2.0
+        ]
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1,
+      "total_tokens": 1
+    }
+  },
+  "expected_client_body": {
+    "object": "list",
+    "model": "text-embedding-3-small",
+    "data": [
+      {
+        "object": "embedding",
+        "index": 0,
+        "embedding": "AACAPwAAAEA="
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1,
+      "total_tokens": 1
+    }
+  }
+}

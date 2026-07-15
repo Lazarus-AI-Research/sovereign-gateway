@@ -1,0 +1,22 @@
+target/
+**/*.rs.bk
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+/data/
+reqlog/
+*.duckdb
+*.duckdb.wal
+*.parquet
+.env
+
+# example-run artifacts
+fujitsu.db*
+fujitsu-reqlog/
+live.db*
+live.toml
+live.models.toml
+live.log
+uncut*
+.claude/

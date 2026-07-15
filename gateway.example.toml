@@ -1,0 +1,88 @@
+# gateway.example.toml — the complete gateway configuration.
+#
+# Copy to `gateway.toml` (or pass a path: `gateway /etc/gateway.toml`) and edit.
+# This single file is the ONLY process-configuration source — there are no
+# GATEWAY_* environment variables, and no env indirection for upstream keys
+# (each deployment carries its own `api_key`). Models are configured separately,
+# in the database — see the routing section below and `models.example.toml`.
+
+[server]
+bind = "0.0.0.0:8080"
+deployment_mode = "selfhosted"   # selfhosted (admin API on) | managed
+
+[database]
+backend = "sqlite"               # sqlite | postgres
+path = "./gateway.db"           # sqlite file (when backend = "sqlite")
+# dsn = "postgres://user:pass@localhost:5432/gateway"   # when backend = "postgres"
+
+[security]
+# No passwords here. Users (the login accounts — username + password + role) live
+# in the database and own their API keys — run `gateway setup` (defaults to
+# admin/admin), or `serve` creates a default admin on first run. Manage users in
+# the admin UI or /admin/v1/users.
+# Web sessions are server-side: login creates a row in the `sessions` table keyed
+# by an opaque cookie token, so logout revokes immediately (nothing to set here).
+# 32-byte AES-256-GCM key (base64 or hex) for BYOK secret-at-rest; plaintext if unset.
+# byok_key = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# Admin-console login methods. `providers` may list any of: local (the gateway's own
+# username/password users), sso (an external identity provider spoken over its
+# client-authenticated server-to-server JSON API — the "direct", non-SAML flow),
+# and saml (backend seam; not yet wired). Defaults to ["local"]. `yb_` API keys
+# are separate and unaffected. The gateway owns authorization: sso proves the email,
+# the gateway decides the role. New sso users default to member; grant admin with
+# `gateway set-role <email> admin` (creates the user if needed, so you can assign
+# a role before their first login) or in the console.
+[auth]
+providers = ["local"]
+# [auth.sso]
+# base_url = "http://127.0.0.1:1411"          # IdP backend, reached server-to-server
+# client_id = "gateway"
+# client_secret = "…"                          # kept server-side; never sent to the browser
+# callback_base = "https://gateway.example.com" # origin the IdP embeds in the magic link
+# turnstile_sitekey = "0x4AAA..."             # Cloudflare Turnstile sitekey (public) → login shows a bot-check widget; the IdP validates the token
+
+[reqlog]
+# Full request/response capture to DuckDB (WAL -> compressed parquet shards) for
+# training-data collection. Off by default.
+enabled = false
+dir = "./reqlog"
+queue_size = 4096
+shard_max_bytes = 268435456      # 256 MiB: seal a shard once the WAL passes this
+rotate_secs = 3600               # ...or at least this often (and on UTC date change)
+retention_days = 30              # prune parquet shards older than this (0 = keep all)
+max_body_bytes = 262144          # truncate captured bodies past this size
+
+[telemetry]
+# OpenTelemetry export: metrics (push and/or Prometheus pull), plus one event
+# (OTLP log record) and one span per served turn — structured turn metadata
+# only (ids, models, tokens, cost, latency, status); never request/response
+# bodies (those are the reqlog's job). Off by default.
+enabled = false
+# otlp_endpoint = "http://localhost:4318"   # OTLP/HTTP base; push off when unset
+push_interval_secs = 15          # seconds between OTLP pushes
+prometheus = true                # serve Prometheus text at GET /metrics (pull)
+service_name = "gateway"        # OTel service.name resource attribute
+
+[features]
+budgets_enabled = false          # enforce spend budgets (402/alert) on the request path
+ratelimit_enabled = false        # enforce RPM/TPM/concurrency (429) on the request path
+ratelimit_window_secs = 60       # rate-limit accounting window
+
+[upstream]
+mode = "http"                    # http (real upstreams) | mock (offline canned responses)
+
+# ---------------------------------------------------------------------------
+# Routing policy. The model list is NOT here — models live in the database.
+# Load them from a dedicated models file with:
+#   gateway import models.example.toml gateway.toml
+# and add/remove at runtime via POST/DELETE /admin/v1/models.
+# ---------------------------------------------------------------------------
+[routing]
+strategy = "simple"              # simple (weighted) | round_robin | least_busy
+
+# Per-model fallback chains: if every deployment of the primary model fails over
+# (retryable status / model-not-found), each fallback model's deployments are
+# tried next, in order.
+[routing.fallbacks]
+gpt-4o = ["claude-3-5-sonnet"]

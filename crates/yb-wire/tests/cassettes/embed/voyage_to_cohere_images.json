@@ -1,0 +1,80 @@
+{
+  "inbound_format": "voyage_embed",
+  "target_format": "cohere_embed",
+  "target_model": "embed-v4.0",
+  "inbound_body": {
+    "model": "voyage-multimodal-3",
+    "input_type": "document",
+    "inputs": [
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "This is a banana."
+          },
+          {
+            "type": "image_base64",
+            "image_base64": "data:image/jpeg;base64,QUJD"
+          }
+        ]
+      }
+    ]
+  },
+  "expected_upstream_body": {
+    "model": "embed-v4.0",
+    "input_type": "search_document",
+    "inputs": [
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "This is a banana."
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/jpeg;base64,QUJD"
+            }
+          }
+        ]
+      }
+    ],
+    "embedding_types": [
+      "float"
+    ]
+  },
+  "upstream_response_body": {
+    "id": "x",
+    "embeddings": {
+      "float": [
+        [
+          0.75,
+          0.5
+        ]
+      ]
+    },
+    "meta": {
+      "billed_units": {
+        "input_tokens": 5,
+        "image_tokens": 10
+      }
+    }
+  },
+  "expected_client_body": {
+    "object": "list",
+    "model": "",
+    "data": [
+      {
+        "object": "embedding",
+        "index": 0,
+        "embedding": [
+          0.75,
+          0.5
+        ]
+      }
+    ],
+    "usage": {
+      "total_tokens": 15
+    }
+  }
+}

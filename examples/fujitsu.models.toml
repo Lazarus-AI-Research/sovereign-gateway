@@ -1,0 +1,123 @@
+# Models for the fujitsu example, loaded with:
+#   gateway import examples/fujitsu.models.toml examples/fujitsu.toml
+#
+# The source llm_config.yaml's model_mapping (tier names) becomes aliases:
+# s_tier -> gpt-5.5, a_tier -> gpt-5.4, b_tier -> gpt-5.4-mini. Each deployment
+# carries its own api_key (placeholder here; required only for a real http run).
+
+[[model]]
+model_name = "gemini-3.1-pro-preview"
+  [[model.deployments]]
+  provider = "gemini"
+  upstream_model = "gemini-3.1-pro-preview"
+  upstream_format = "gemini"
+  api_base = "http://127.0.0.1:8082/v1beta"
+  api_key = "REPLACE_WITH_YOUR_KEY"
+
+[[model]]
+model_name = "gemini-3-pro-preview"
+  [[model.deployments]]
+  provider = "gemini"
+  upstream_model = "gemini-3-pro-preview"
+  upstream_format = "gemini"
+  api_base = "http://127.0.0.1:8082/v1beta"
+  api_key = "REPLACE_WITH_YOUR_KEY"
+
+[[model]]
+model_name = "gemini-3-flash-preview"
+  [[model.deployments]]
+  provider = "gemini"
+  upstream_model = "gemini-3-flash-preview"
+  upstream_format = "gemini"
+  api_base = "http://127.0.0.1:8082/v1beta"
+  api_key = "REPLACE_WITH_YOUR_KEY"
+
+[[model]]
+model_name = "gemini-3.1-flash-lite-preview"
+  [[model.deployments]]
+  provider = "gemini"
+  upstream_model = "gemini-3.1-flash-lite-preview"
+  upstream_format = "gemini"
+  api_base = "http://127.0.0.1:8082/v1beta"
+  api_key = "REPLACE_WITH_YOUR_KEY"
+
+[[model]]
+model_name = "claude-opus-4-6"
+  [[model.deployments]]
+  provider = "anthropic"
+  upstream_model = "claude-opus-4-6"
+  upstream_format = "anthropic"
+  api_key = "REPLACE_WITH_YOUR_KEY"
+
+[[model]]
+model_name = "claude-sonnet-4-6"
+  [[model.deployments]]
+  provider = "anthropic"
+  upstream_model = "claude-sonnet-4-6"
+  upstream_format = "anthropic"
+  api_key = "REPLACE_WITH_YOUR_KEY"
+
+[[model]]
+model_name = "claude-haiku-4-5"
+  [[model.deployments]]
+  provider = "anthropic"
+  upstream_model = "claude-haiku-4-5"
+  upstream_format = "anthropic"
+  api_key = "REPLACE_WITH_YOUR_KEY"
+
+[[model]]
+model_name = "gpt-5.5"
+  aliases = ["s_tier"]
+  [[model.deployments]]
+  provider = "openai"
+  upstream_model = "gpt-5.5"
+  upstream_format = "openai_responses"
+  api_base = "https://your-openai-endpoint.example.com/v1"
+  api_key = "REPLACE_WITH_YOUR_KEY"
+
+[[model]]
+model_name = "gpt-5.4"
+  aliases = ["a_tier"]
+  [[model.deployments]]
+  provider = "openai"
+  upstream_model = "gpt-5.4"
+  upstream_format = "openai_responses"
+  api_base = "https://your-openai-endpoint.example.com/v1"
+  api_key = "REPLACE_WITH_YOUR_KEY"
+
+[[model]]
+model_name = "gpt-5.4-mini"
+  aliases = ["b_tier"]
+  [[model.deployments]]
+  provider = "openai"
+  upstream_model = "gpt-5.4-mini"
+  upstream_format = "openai_responses"
+  api_base = "https://your-openai-endpoint.example.com/v1"
+  api_key = "REPLACE_WITH_YOUR_KEY"
+
+[[model]]
+model_name = "gpt-5.3-codex"
+  [[model.deployments]]
+  provider = "openai"
+  upstream_model = "gpt-5.3-codex"
+  upstream_format = "openai_responses"
+  api_base = "https://your-openai-endpoint.example.com/v1"
+  api_key = "REPLACE_WITH_YOUR_KEY"
+
+[[model]]
+model_name = "gpt-5.3-codex-spark"
+  [[model.deployments]]
+  provider = "openai"
+  upstream_model = "gpt-5.3-codex-spark"
+  upstream_format = "openai_responses"
+  api_base = "https://your-openai-endpoint.example.com/v1"
+  api_key = "REPLACE_WITH_YOUR_KEY"
+
+[[model]]
+model_name = "gpt-5.1-codex-mini"
+  [[model.deployments]]
+  provider = "openai"
+  upstream_model = "gpt-5.1-codex-mini"
+  upstream_format = "openai_responses"
+  api_base = "https://your-openai-endpoint.example.com/v1"
+  api_key = "REPLACE_WITH_YOUR_KEY"

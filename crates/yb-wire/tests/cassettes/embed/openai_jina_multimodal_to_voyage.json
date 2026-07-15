@@ -1,0 +1,85 @@
+{
+  "inbound_format": "openai_embed",
+  "target_format": "voyage_embed",
+  "target_model": "voyage-multimodal-3",
+  "inbound_body": {
+    "model": "jina-clip-v2",
+    "input": [
+      {
+        "text": "a banana"
+      },
+      {
+        "image": "data:image/png;base64,QUJD"
+      }
+    ]
+  },
+  "expected_upstream_body": {
+    "model": "voyage-multimodal-3",
+    "inputs": [
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "a banana"
+          }
+        ]
+      },
+      {
+        "content": [
+          {
+            "type": "image_base64",
+            "image_base64": "data:image/png;base64,QUJD"
+          }
+        ]
+      }
+    ]
+  },
+  "upstream_response_body": {
+    "object": "list",
+    "model": "voyage-multimodal-3",
+    "data": [
+      {
+        "object": "embedding",
+        "index": 0,
+        "embedding": [
+          0.5
+        ]
+      },
+      {
+        "object": "embedding",
+        "index": 1,
+        "embedding": [
+          0.25
+        ]
+      }
+    ],
+    "usage": {
+      "total_tokens": 12,
+      "image_pixels": 313600
+    }
+  },
+  "expected_client_body": {
+    "object": "list",
+    "model": "voyage-multimodal-3",
+    "data": [
+      {
+        "object": "embedding",
+        "index": 0,
+        "embedding": [
+          0.5
+        ]
+      },
+      {
+        "object": "embedding",
+        "index": 1,
+        "embedding": [
+          0.25
+        ]
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 12,
+      "total_tokens": 12
+    }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "inbound_format": "openai_embed",
+  "target_format": "ollama_embed",
+  "target_model": "nomic-embed-text",
+  "inbound_body": {
+    "model": "my-embed",
+    "input": [
+      "a",
+      "b"
+    ]
+  },
+  "expected_upstream_body": {
+    "model": "nomic-embed-text",
+    "input": [
+      "a",
+      "b"
+    ]
+  },
+  "upstream_response_body": {
+    "model": "nomic-embed-text",
+    "embeddings": [
+      [
+        1.0
+      ],
+      [
+        2.0
+      ]
+    ],
+    "prompt_eval_count": 6
+  },
+  "expected_client_body": {
+    "object": "list",
+    "model": "nomic-embed-text",
+    "data": [
+      {
+        "object": "embedding",
+        "index": 0,
+        "embedding": [
+          1.0
+        ]
+      },
+      {
+        "object": "embedding",
+        "index": 1,
+        "embedding": [
+          2.0
+        ]
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 6,
+      "total_tokens": 6
+    }
+  }
+}

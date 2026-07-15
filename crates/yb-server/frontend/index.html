@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SovereignGateway admin</title>
+<style>
+  /* Dark (default) + light, following the system via prefers-color-scheme. */
+  :root {
+    --bg:#0f1216; --panel:#171b21; --panel2:#1d232b; --line:#2a323c; --fg:#e6edf3;
+    --mut:#8b97a6; --acc:#4aa8ff; --acc-fg:#04121f; --ok:#3fb950; --bad:#f85149;
+    --token-bg:#0c2a14; --token-line:#3fb950; --token-fg:#9be9a8;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:#f6f8fa; --panel:#ffffff; --panel2:#f0f3f6; --line:#d7dee6; --fg:#1f2933;
+      --mut:#5a6675; --acc:#0969da; --acc-fg:#ffffff; --ok:#1a7f37; --bad:#cf222e;
+      --token-bg:#dafbe1; --token-line:#1a7f37; --token-fg:#0f5323;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  a { color:var(--acc); }
+  header { display:flex; align-items:center; gap:12px; padding:12px 18px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:5; }
+  header .logo { font-weight:700; letter-spacing:.5px; }
+  header .sp { flex:1; }
+  .mut { color:var(--mut); }
+  main { max-width:1100px; margin:0 auto; padding:18px; }
+  nav { display:flex; gap:6px; margin-bottom:16px; flex-wrap:wrap; }
+  nav button { background:var(--panel); color:var(--fg); border:1px solid var(--line); padding:7px 14px; border-radius:7px; cursor:pointer; }
+  nav button.on { background:var(--acc); border-color:var(--acc); color:var(--acc-fg); font-weight:600; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  h2 { margin:0 0 12px; font-size:15px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--mut); font-weight:600; }
+  td.mono,code,.mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  input,select { background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:7px; padding:8px 10px; font:inherit; }
+  input::placeholder { color:var(--mut); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:8px; }
+  button.btn { background:var(--acc); color:var(--acc-fg); border:none; padding:8px 14px; border-radius:7px; cursor:pointer; font-weight:600; }
+  button.ghost { background:transparent; color:var(--mut); border:1px solid var(--line); padding:5px 10px; border-radius:6px; cursor:pointer; }
+  button.del { color:var(--bad); }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .pill { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--mut); }
+  .pill.admin { color:var(--acc); border-color:var(--acc); }
+  .err { color:var(--bad); }
+  .login { max-width:380px; margin:12vh auto; }
+  .token { background:var(--token-bg); border:1px solid var(--token-line); color:var(--token-fg); padding:10px; border-radius:8px; word-break:break-all; }
+  .empty { color:var(--mut); padding:14px 4px; }
+  .link { color:var(--acc); cursor:pointer; }
+  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:flex-start; justify-content:center; padding:8vh 16px; z-index:50; }
+  .modal { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; width:min(640px,94vw); max-height:84vh; overflow:auto; }
+  .modal-x { float:right; background:none; border:none; color:var(--mut); font-size:20px; cursor:pointer; line-height:1; }
+  .back { display:inline-block; margin-bottom:10px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script type="module" src="/ui/app.js"></script>
+</body>
+</html>

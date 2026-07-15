@@ -1,0 +1,22 @@
+{
+  "inbound_format": "openai_chat",
+  "inbound_body": {
+    "model": "gpt-4o",
+    "messages": [
+      {"role": "system", "content": "You are helpful."},
+      {"role": "user", "content": "Hello there"}
+    ],
+    "max_tokens": 256,
+    "temperature": 0.5
+  },
+  "target_format": "anthropic",
+  "expected_upstream_body": {
+    "model": "gpt-4o",
+    "max_tokens": 256,
+    "system": "You are helpful.",
+    "messages": [
+      {"role": "user", "content": "Hello there"}
+    ],
+    "temperature": 0.5
+  }
+}

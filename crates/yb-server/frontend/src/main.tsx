@@ -1,0 +1,676 @@
+// SovereignGateway admin — Preact + TSX, bundled by rolldown (build.rs) into one ES
+// module the Rust server embeds. Classic JSX (pragma `h`); preact is vendored.
+//
+// Auth is cookie-based: POST /admin/v1/auth/login sets an HttpOnly session
+// cookie; every request uses `credentials: 'include'`. The login account IS the
+// user (username + Argon2 password + role). Admins manage everything; members
+// read the catalog and manage their own keys + see their own spend.
+//
+// Navigation uses preact-router (history API, clean paths — not hash).
+import { h, Fragment, render } from './vendor/preact.mjs';
+import { useState, useEffect } from './vendor/hooks.mjs';
+import { Router, route } from './vendor/preact-router.mjs';
+
+async function api<T = any>(path: string, opts: { method?: string; body?: any } = {}): Promise<T> {
+  const res = await fetch('/admin/v1' + path, {
+    method: opts.method || 'GET',
+    credentials: 'include',
+    headers: { 'content-type': 'application/json' },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const text = await res.text();
+  let data: any = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!res.ok) {
+    const err: any = new Error((data && data.error && data.error.message) || 'HTTP ' + res.status);
+    err.status = res.status;
+    throw err;
+  }
+  return data as T;
+}
+
+function useAsync<T>(fn: () => Promise<T>, deps: any[] = []) {
+  const [state, setState] = useState<{ loading: boolean; data: T | null; error: string }>({
+    loading: true, data: null, error: '',
+  });
+  const reload = () => {
+    setState((s) => ({ ...s, loading: true }));
+    fn().then((data) => setState({ loading: false, data, error: '' }))
+        .catch((e) => setState({ loading: false, data: null, error: String(e.message || e) }));
+  };
+  useEffect(() => { reload(); }, deps);
+  return [state, reload] as const;
+}
+
+const FORMATS = ['openai_chat', 'openai_responses', 'anthropic', 'gemini', 'openai_embed', 'gemini_embed', 'cohere_embed', 'voyage_embed', 'ollama_embed'];
+const PERIODS = ['day', 'week', 'month', 'total'];
+const SUBJECTS = ['key', 'user', 'team'];
+
+const csvToList = (s: string): string[] => s.split(',').map((x) => x.trim()).filter(Boolean);
+const listToCsv = (l?: string[]): string => (l || []).join(', ');
+const usd = (micros: number) => '$' + (micros / 1e6).toFixed(2);
+const uuid = () => (crypto as any).randomUUID();
+const nowIso = () => new Date().toISOString();
+const isUnrestricted = (a: any) => !a || !(a.allowed_models?.length || a.denied_models?.length || a.allowed_providers?.length || a.denied_providers?.length);
+
+type Me = { username: string; role: string };
+
+function Login({ onAuth }: { onAuth: () => void }) {
+  // Which login methods the server offers (GET /auth/config). Until loaded we
+  // assume local so the form isn't blank on a fast connection. Only methods the
+  // UI can actually service are shown (saml is a backend seam, not yet usable).
+  const RENDERABLE = ['local', 'sso'];
+  const [providers, setProviders] = useState<string[]>(['local']);
+  const [tab, setTab] = useState<string>('local');
+  const [sitekey, setSitekey] = useState<string>('');
+  useEffect(() => {
+    api<{ providers: string[]; turnstile_sitekey?: string }>('/auth/config')
+      .then((c) => {
+        const p = (c.providers || []).filter((x) => RENDERABLE.includes(x));
+        const shown = p.length ? p : ['local'];
+        setProviders(shown);
+        setTab(shown[0]);
+        if (c.turnstile_sitekey) setSitekey(c.turnstile_sitekey);
+      })
+      .catch(() => {});
+  }, []);
+
+  // --- local username/password ---
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [err, setErr] = useState('');
+  const goLocal = async () => {
+    setErr('');
+    try { await api('/auth/login', { method: 'POST', body: { username, password } }); onAuth(); }
+    catch (e: any) { setErr(e.message); }
+  };
+
+  // --- sso email → code ---
+  const [email, setEmail] = useState('');
+  const [code, setCode] = useState('');
+  const [sent, setSent] = useState(false);
+  const [devCode, setDevCode] = useState('');
+  const [tsToken, setTsToken] = useState('');
+
+  // Cloudflare Turnstile: load the script once and render a Managed widget on the
+  // email step when a sitekey is configured. Managed mode is invisible unless
+  // Cloudflare decides a challenge is warranted; the callback yields the token.
+  useEffect(() => {
+    if (tab !== 'sso' || !sitekey || sent) return;
+    let widgetId: any;
+    const w = window as any;
+    const render = () => {
+      const el = document.getElementById('cf-ts');
+      if (el && w.turnstile && !el.hasChildNodes()) {
+        widgetId = w.turnstile.render(el, {
+          sitekey,
+          callback: (t: string) => setTsToken(t),
+          'expired-callback': () => setTsToken(''),
+          'error-callback': () => setTsToken(''),
+        });
+      }
+    };
+    let poll: any;
+    if (w.turnstile) {
+      render();
+    } else if (!document.getElementById('cf-ts-script')) {
+      const s = document.createElement('script');
+      s.id = 'cf-ts-script';
+      s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+      s.async = true; s.defer = true;
+      s.onload = render;
+      document.head.appendChild(s);
+    } else {
+      poll = setInterval(() => { if (w.turnstile) { clearInterval(poll); render(); } }, 200);
+    }
+    return () => {
+      if (poll) clearInterval(poll);
+      if (widgetId && w.turnstile) { try { w.turnstile.remove(widgetId); } catch (_e) {} }
+    };
+  }, [tab, sitekey, sent]);
+
+  const startSso = async () => {
+    setErr('');
+    try {
+      const body: any = { email };
+      if (sitekey) body.turnstile_token = tsToken;
+      const r = await api<any>('/auth/sso/start', { method: 'POST', body });
+      setSent(true);
+      if (r && r.dev_code) setDevCode(r.dev_code);
+    } catch (e: any) { setErr(e.message); }
+  };
+  const verifySso = async () => {
+    setErr('');
+    try { await api('/auth/sso/code', { method: 'POST', body: { email, code } }); onAuth(); }
+    catch (e: any) { setErr(e.message); }
+  };
+
+  const label = (p: string) => (p === 'local' ? 'Password' : p === 'sso' ? 'Email code' : p);
+
+  return (
+    <div class="login card">
+      <h2>SovereignGateway admin</h2>
+      {providers.length > 1 && (
+        <div class="row" style="margin-bottom:12px">
+          {providers.map((p) => (
+            <button class={'ghost' + (tab === p ? ' active' : '')} onClick={() => { setTab(p); setErr(''); }}>{label(p)}</button>
+          ))}
+        </div>
+      )}
+
+      {tab === 'local' && (
+        <Fragment>
+          <p class="mut">Sign in with your account. First run defaults to <span class="mono">admin / admin</span>.</p>
+          <div class="grid" style="margin-bottom:10px">
+            <input placeholder="username" value={username} onInput={(e: any) => setUsername(e.target.value)}
+              onKeyDown={(e: any) => e.key === 'Enter' && goLocal()} />
+            <input type="password" placeholder="password" value={password} onInput={(e: any) => setPassword(e.target.value)}
+              onKeyDown={(e: any) => e.key === 'Enter' && goLocal()} />
+          </div>
+          <button class="btn" onClick={goLocal}>Sign in</button>
+        </Fragment>
+      )}
+
+      {tab === 'sso' && (
+        <Fragment>
+          {!sent ? (
+            <Fragment>
+              <p class="mut">Sign in with your email — we'll send you a 6-digit code.</p>
+              <div class="grid" style="margin-bottom:10px">
+                <input placeholder="email" value={email} onInput={(e: any) => setEmail(e.target.value)}
+                  onKeyDown={(e: any) => { if (e.key === 'Enter' && !(sitekey && !tsToken)) startSso(); }} />
+              </div>
+              {sitekey && <div id="cf-ts" style="margin-bottom:10px"></div>}
+              <button class="btn" onClick={startSso} disabled={!!sitekey && !tsToken}>Send me a code</button>
+            </Fragment>
+          ) : (
+            <Fragment>
+              <p class="mut">Enter the code sent to <span class="mono">{email}</span>, or open the emailed link.</p>
+              {devCode && <p class="mut">dev code: <span class="mono">{devCode}</span></p>}
+              <div class="grid" style="margin-bottom:10px">
+                <input placeholder="6-digit code" value={code} autocomplete="one-time-code" inputmode="numeric"
+                  onInput={(e: any) => setCode(e.target.value)} onKeyDown={(e: any) => e.key === 'Enter' && verifySso()} />
+              </div>
+              <div class="row">
+                <button class="btn" onClick={verifySso}>Sign in</button>
+                <button class="ghost" onClick={() => { setSent(false); setCode(''); setDevCode(''); }}>use a different email</button>
+              </div>
+            </Fragment>
+          )}
+        </Fragment>
+      )}
+
+      {err && <p class="err">{err}</p>}
+    </div>
+  );
+}
+
+/** Edit an AccessPolicy as four comma-separated lists. */
+function AccessEditor({ value, onSave }: { value: any; onSave: (p: any) => void }) {
+  const [am, setAm] = useState(listToCsv(value.allowed_models));
+  const [dm, setDm] = useState(listToCsv(value.denied_models));
+  const [ap, setAp] = useState(listToCsv(value.allowed_providers));
+  const [dp, setDp] = useState(listToCsv(value.denied_providers));
+  return (
+    <div class="grid" style="margin-top:6px">
+      <input placeholder="allowed models (csv)" value={am} onInput={(e: any) => setAm(e.target.value)} />
+      <input placeholder="denied models (csv)" value={dm} onInput={(e: any) => setDm(e.target.value)} />
+      <input placeholder="allowed providers (csv)" value={ap} onInput={(e: any) => setAp(e.target.value)} />
+      <input placeholder="denied providers (csv)" value={dp} onInput={(e: any) => setDp(e.target.value)} />
+      <button class="btn" onClick={() => onSave({
+        allowed_models: csvToList(am), denied_models: csvToList(dm),
+        allowed_providers: csvToList(ap), denied_providers: csvToList(dp),
+      })}>Save access</button>
+    </div>
+  );
+}
+
+/** A simple modal overlay. */
+function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: any }) {
+  return (
+    <div class="modal-bg" onClick={onClose}>
+      <div class="modal" onClick={(e: any) => e.stopPropagation()}>
+        <button class="modal-x" onClick={onClose}>×</button>
+        <h2>{title}</h2>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/** Set $ caps (per period or total) for one subject — used on user/team detail
+ *  pages. The subject (type + id) is fixed by context, not typed in. */
+function BudgetEditor({ subjectType, subjectId }: { subjectType: string; subjectId: string }) {
+  const [{ data, error }, reload] = useAsync<any[]>(
+    () => api(`/budgets?subject_type=${subjectType}&subject_id=${encodeURIComponent(subjectId)}`), [subjectId]);
+  const [dollars, setDollars] = useState('');
+  const [period, setPeriod] = useState('month');
+  const create = async () => {
+    await api('/budgets', { method: 'PUT', body: {
+      id: uuid(), subject_type: subjectType, subject_id: subjectId, period,
+      hard_limit_micros: Math.round(parseFloat(dollars || '0') * 1e6),
+      soft_limit_micros: null, action: 'block', enabled: true,
+      created_at: nowIso(), updated_at: nowIso(), deleted_at: null,
+    }});
+    setDollars(''); reload();
+  };
+  const del = async (id: string) => { await api('/budgets/' + id, { method: 'DELETE' }); reload(); };
+  return (
+    <Fragment>
+      <h3 style="margin:14px 0 6px;font-size:14px">Budgets <span class="mut">— $ caps, per period or total (429 on breach)</span></h3>
+      {error && <p class="err">{error}</p>}
+      {(data && data.length) ? (
+        <table><thead><tr><th>period</th><th>cap</th><th>action</th><th></th></tr></thead>
+          <tbody>{data.map((b) => (
+            <tr key={b.id}><td>{b.period}</td><td class="mono">{usd(b.hard_limit_micros)}</td><td>{b.action}</td>
+              <td><button class="ghost del" onClick={() => del(b.id)}>delete</button></td></tr>
+          ))}</tbody></table>
+      ) : <p class="empty">No budget set.</p>}
+      <div class="row" style="margin-top:8px">
+        <input placeholder="cap in USD (e.g. 50)" value={dollars} onInput={(e: any) => setDollars(e.target.value)} />
+        <select value={period} onChange={(e: any) => setPeriod(e.target.value)}>{PERIODS.map((p) => <option>{p}</option>)}</select>
+        <button class="btn" onClick={create}>Set budget</button>
+      </div>
+    </Fragment>
+  );
+}
+
+function Models({ admin }: { admin: boolean }) {
+  const [{ loading, data, error }, reload] = useAsync<any[]>(() => api('/models'));
+  const blank = { model_name: '', provider: '', upstream_model: '', upstream_format: 'openai_chat', api_base: '', api_key: '' };
+  const [f, setF] = useState<any>(blank);
+  const [msg, setMsg] = useState('');
+  const upd = (k: string, v: string) => setF((s: any) => ({ ...s, [k]: v }));
+  const add = async () => {
+    setMsg('');
+    try {
+      const body: any = { ...f };
+      if (!body.api_base) delete body.api_base;
+      if (!body.api_key) delete body.api_key;
+      await api('/models', { method: 'POST', body });
+      setF(blank); setShowAdd(false); reload();
+    } catch (e: any) { setMsg(e.message); }
+  };
+  const [showAdd, setShowAdd] = useState(false);
+  const del = async (id: string) => { if (confirm('Delete this deployment?')) { await api('/models/' + id, { method: 'DELETE' }); reload(); } };
+  const [{ data: aliasData }, reloadAliases] = useAsync<any[]>(() => api('/aliases'));
+  const aliasesFor = (name: string) => (aliasData || []).filter((a) => a.target === name);
+  const addAlias = async (target: string) => {
+    const a = prompt('New alias for ' + target + ':');
+    if (!a) return;
+    try { await api('/aliases', { method: 'POST', body: { alias: a.trim(), target } }); reloadAliases(); }
+    catch (e: any) { alert(e.message); }
+  };
+  const delAlias = async (a: string) => { if (confirm('Remove alias “' + a + '”?')) { await api('/aliases/' + encodeURIComponent(a), { method: 'DELETE' }); reloadAliases(); } };
+  return (
+    <Fragment>
+      <div class="card">
+        <div class="row"><h2 style="margin:0">Models <span class="mut">— the live deployment list (DB-backed)</span></h2>
+          <span class="sp" style="flex:1"></span>
+          {admin && <button class="btn" onClick={() => { setMsg(''); setShowAdd(true); }}>+ Add deployment</button>}</div>
+        {error && <p class="err" style="margin-top:10px">{error}</p>}
+        {loading ? <p class="empty">Loading…</p> : !data || !data.length
+          ? <p class="empty">No models. {admin ? 'Click “Add deployment” or run ' : 'Ask an admin, or run '}<span class="mono">gateway import</span>.</p>
+          : (
+            <table style="margin-top:10px">
+              <thead><tr><th>model_name</th><th>provider</th><th>upstream_model</th><th>format</th><th>aliases</th><th>api_base</th>{admin && <th></th>}</tr></thead>
+              <tbody>{data.map((m) => (
+                <tr key={m.id}>
+                  <td class="mono">{m.model_name}</td><td>{m.provider}</td>
+                  <td class="mono">{m.upstream_model}</td>
+                  <td><span class="pill">{m.upstream_format}</span></td>
+                  <td>{aliasesFor(m.model_name).map((a) => (
+                        <span key={a.alias} class="pill mono">{a.alias}{admin && <a onClick={() => delAlias(a.alias)} style="cursor:pointer;color:var(--bad)"> ×</a>}</span>
+                      ))}
+                      {admin && <a onClick={() => addAlias(m.model_name)} style="cursor:pointer" class="mut">+ alias</a>}</td>
+                  <td class="mono mut">{m.api_base || '—'}</td>
+                  {admin && <td><button class="ghost del" onClick={() => del(m.id)}>delete</button></td>}
+                </tr>
+              ))}</tbody>
+            </table>
+          )}
+      </div>
+      {admin && showAdd && (
+        <Modal title="Add a deployment" onClose={() => setShowAdd(false)}>
+          <div class="grid">
+            <input placeholder="model_name (public)" value={f.model_name} onInput={(e: any) => upd('model_name', e.target.value)} />
+            <input placeholder="provider label" value={f.provider} onInput={(e: any) => upd('provider', e.target.value)} />
+            <input placeholder="upstream_model" value={f.upstream_model} onInput={(e: any) => upd('upstream_model', e.target.value)} />
+            <select value={f.upstream_format} onChange={(e: any) => upd('upstream_format', e.target.value)}>{FORMATS.map((k) => <option>{k}</option>)}</select>
+            <input placeholder="api_base (optional)" value={f.api_base} onInput={(e: any) => upd('api_base', e.target.value)} />
+            <input placeholder="api_key (optional, literal)" value={f.api_key} onInput={(e: any) => upd('api_key', e.target.value)} />
+          </div>
+          <div class="row" style="margin-top:12px"><button class="btn" onClick={add}>Add model</button>{msg && <span class="err">{msg}</span>}</div>
+        </Modal>
+      )}
+    </Fragment>
+  );
+}
+
+function Users({ me }: { me: Me }) {
+  const [{ data, error }, reload] = useAsync<any[]>(() => api('/users'));
+  const [f, setF] = useState({ username: '', password: '', role: 'member' });
+  const [inv, setInv] = useState({ email: '', role: 'member' });
+  const [msg, setMsg] = useState('');
+  // When local password login is disabled, a password account can never sign in
+  // — so "add user" becomes an invite that provisions them in the IdP.
+  const [localEnabled, setLocalEnabled] = useState(true);
+  useEffect(() => {
+    api<{ providers: string[] }>('/auth/config')
+      .then((c) => setLocalEnabled((c.providers || ['local']).includes('local')))
+      .catch(() => {});
+  }, []);
+  const add = async () => {
+    setMsg('');
+    try { await api('/users', { method: 'POST', body: f }); setF({ username: '', password: '', role: 'member' }); reload(); }
+    catch (e: any) { setMsg(e.message); }
+  };
+  const invite = async () => {
+    setMsg('');
+    try { await api('/users/invite', { method: 'POST', body: inv }); setInv({ email: '', role: 'member' }); reload(); }
+    catch (e: any) { setMsg(e.message); }
+  };
+  return (
+    <div class="card">
+      <h2>Users <span class="mut">— login accounts. Click one to set budgets.</span></h2>
+      {error && <p class="err">{error}</p>}
+      <table><thead><tr><th>username</th><th>role</th><th>last login</th></tr></thead>
+        <tbody>{(data || []).map((u) => (
+          <tr key={u.id} class="link" onClick={() => route('/users/' + u.id)}>
+            <td class="mono">{u.username}{u.username === me.username && <span class="mut"> (you)</span>}</td>
+            <td><span class={u.role === 'admin' ? 'pill admin' : 'pill'}>{u.role}</span></td>
+            <td class="mut">{u.last_login_at ? String(u.last_login_at).slice(0, 19).replace('T', ' ') : '—'}</td>
+          </tr>
+        ))}</tbody></table>
+      {localEnabled ? (
+        <div class="row" style="margin-top:12px">
+          <input placeholder="username" value={f.username} onInput={(e: any) => setF((s) => ({ ...s, username: e.target.value }))} />
+          <input type="password" placeholder="password" value={f.password} onInput={(e: any) => setF((s) => ({ ...s, password: e.target.value }))} />
+          <select value={f.role} onChange={(e: any) => setF((s) => ({ ...s, role: e.target.value }))}><option value="admin">admin</option><option value="member">member</option></select>
+          <button class="btn" onClick={add}>Add user</button>{msg && <span class="err">{msg}</span>}
+        </div>
+      ) : (
+        <Fragment>
+          <p class="mut" style="margin-top:12px">Invite by email — they sign in via SSO; no password needed.</p>
+          <div class="row">
+            <input placeholder="email" value={inv.email} onInput={(e: any) => setInv((s) => ({ ...s, email: e.target.value }))}
+              onKeyDown={(e: any) => e.key === 'Enter' && invite()} />
+            <select value={inv.role} onChange={(e: any) => setInv((s) => ({ ...s, role: e.target.value }))}><option value="admin">admin</option><option value="member">member</option></select>
+            <button class="btn" onClick={invite}>Invite user</button>{msg && <span class="err">{msg}</span>}
+          </div>
+        </Fragment>
+      )}
+    </div>
+  );
+}
+
+/** `/users/:id` — a user's detail page: role, password, and their budgets. */
+function UserDetail({ id, me }: { id: string; me: Me }) {
+  const [{ data }, reload] = useAsync<any[]>(() => api('/users'), [id]);
+  const u = (data || []).find((x) => x.id === id);
+  const setRole = async (role: string) => { try { await api('/users/' + id + '/role', { method: 'PUT', body: { role } }); reload(); } catch (e: any) { alert(e.message); } };
+  const reset = async () => { const p = prompt('New password:'); if (p) { await api('/users/' + id + '/password', { method: 'PUT', body: { password: p } }); alert('password reset'); } };
+  const del = async () => { if (confirm('Delete this user?')) { try { await api('/users/' + id, { method: 'DELETE' }); route('/users'); } catch (e: any) { alert(e.message); } } };
+  return (
+    <div class="card">
+      <a class="link back" onClick={() => route('/users')}>← Users</a>
+      <h2>User <span class="mono">{u ? u.username : id}</span>{u && u.username === me.username && <span class="mut"> (you)</span>}</h2>
+      {u && <div class="row" style="margin-bottom:10px">
+        <span class="mut">role</span>
+        <select value={u.role} onChange={(e: any) => setRole(e.target.value)}><option value="admin">admin</option><option value="member">member</option></select>
+        <button class="ghost" onClick={reset}>reset password</button>
+        <button class="ghost del" onClick={del}>delete user</button>
+      </div>}
+      <BudgetEditor subjectType="user" subjectId={id} />
+    </div>
+  );
+}
+
+function TeamMembers({ teamId, users }: { teamId: string; users: any[] }) {
+  const [{ data }, reload] = useAsync<any[]>(() => api('/teams/' + teamId + '/members'), [teamId]);
+  const [uid, setUid] = useState('');
+  const name = (id: string) => (users.find((u) => u.id === id) || {}).username || id;
+  const add = async () => { if (uid) { await api('/teams/' + teamId + '/members', { method: 'POST', body: { user_id: uid } }); setUid(''); reload(); } };
+  const del = async (id: string) => { await api('/teams/' + teamId + '/members/' + id, { method: 'DELETE' }); reload(); };
+  return (
+    <Fragment>
+      <div class="mut" style="margin-top:8px">members:</div>
+      <div class="row" style="margin-top:4px">
+        {(data || []).map((m) => <span key={m.id} class="pill">{name(m.user_id)} <a onClick={() => del(m.user_id)} style="cursor:pointer;color:var(--bad)">×</a></span>)}
+        {(!data || !data.length) && <span class="mut">none</span>}
+      </div>
+      <div class="row" style="margin-top:8px">
+        <select value={uid} onChange={(e: any) => setUid(e.target.value)}><option value="">— user —</option>{users.map((u) => <option value={u.id}>{u.username}</option>)}</select>
+        <button class="ghost" onClick={add}>add member</button>
+      </div>
+    </Fragment>
+  );
+}
+
+function Teams() {
+  const [{ data, error }, reload] = useAsync<any[]>(() => api('/teams'));
+  const [name, setName] = useState('');
+  const create = async () => { await api('/teams', { method: 'POST', body: { name } }); setName(''); reload(); };
+  return (
+    <div class="card">
+      <h2>Teams <span class="mut">— click a team to set access, members, and budgets</span></h2>
+      {error && <p class="err">{error}</p>}
+      {(data && data.length) ? (
+        <table><thead><tr><th>name</th><th>access</th><th>id</th></tr></thead>
+          <tbody>{data.map((t) => (
+            <tr key={t.id} class="link" onClick={() => route('/teams/' + t.id)}>
+              <td class="mono">{t.name}</td>
+              <td class="mut">{isUnrestricted(t.access) ? 'unrestricted' : 'restricted'}</td>
+              <td class="mut mono">{t.id}</td>
+            </tr>
+          ))}</tbody></table>
+      ) : <p class="empty">No teams yet.</p>}
+      <div class="row" style="margin-top:12px"><input placeholder="team name" value={name} onInput={(e: any) => setName(e.target.value)} /><button class="btn" onClick={create}>Create team</button></div>
+    </div>
+  );
+}
+
+/** `/teams/:id` — team detail: access policy, members, and budgets. */
+function TeamDetail({ id }: { id: string }) {
+  const [{ data }, reload] = useAsync<any[]>(() => api('/teams'), [id]);
+  const [users] = useAsync<any[]>(() => api('/users'));
+  const t = (data || []).find((x) => x.id === id);
+  const saveAccess = async (access: any) => { await api('/teams/' + id + '/access', { method: 'PUT', body: { access } }); alert('team access saved'); reload(); };
+  const del = async () => { if (confirm('Delete team?')) { await api('/teams/' + id, { method: 'DELETE' }); route('/teams'); } };
+  return (
+    <div class="card">
+      <a class="link back" onClick={() => route('/teams')}>← Teams</a>
+      <div class="row"><h2 style="margin:0">Team <span class="mono">{t ? t.name : id}</span></h2><span class="sp" style="flex:1"></span>
+        <button class="ghost del" onClick={del}>delete team</button></div>
+      <h3 style="margin:14px 0 4px;font-size:14px">Model access <span class="mut">(deny wins; allow-list = ceiling)</span></h3>
+      {t && <AccessEditor value={t.access || {}} onSave={saveAccess} />}
+      <TeamMembers teamId={id} users={users.data || []} />
+      <BudgetEditor subjectType="team" subjectId={id} />
+    </div>
+  );
+}
+
+function Keys({ admin }: { admin: boolean }) {
+  const [{ data, error }, reload] = useAsync<any[]>(() => api('/keys'));
+  const [teams] = useAsync<any[]>(() => api('/teams').catch(() => []));
+  const [users] = useAsync<any[]>(() => (admin ? api('/users') : Promise.resolve([])));
+  const [f, setF] = useState<any>({ name: '', team_id: '', owner_user_id: '', scopes: ['inference'] });
+  const [issued, setIssued] = useState<string | null>(null);
+  const [editing, setEditing] = useState<string>('');
+  const teamName = (id: string) => ((teams.data || []).find((t) => t.id === id) || {}).name || 'team';
+  const userName = (id: string) => ((users.data || []).find((u) => u.id === id) || {}).username || id;
+  const toggleScope = (sc: string) => setF((s: any) => {
+    const has = s.scopes.includes(sc);
+    const scopes = has ? s.scopes.filter((x: string) => x !== sc) : [...s.scopes, sc];
+    return { ...s, scopes };
+  });
+  const create = async () => {
+    const body: any = { name: f.name };
+    // Scope grant set (JSON array); omit when it's just the default.
+    if (!(f.scopes.length === 1 && f.scopes[0] === 'inference')) body.scopes = f.scopes;
+    if (f.team_id) body.team_id = f.team_id;
+    if (admin && f.owner_user_id) body.owner_user_id = f.owner_user_id;
+    const r = await api<any>('/keys', { method: 'POST', body });
+    setIssued(r.token); setF({ name: '', team_id: '', owner_user_id: '', scopes: ['inference'] }); reload();
+  };
+  const del = async (id: string) => { if (confirm('Revoke this key?')) { await api('/keys/' + id, { method: 'DELETE' }); reload(); } };
+  const saveAccess = async (id: string, access: any) => { await api('/keys/' + id + '/access', { method: 'PUT', body: { access } }); setEditing(''); reload(); };
+  return (
+    <div class="card">
+      <h2>{admin ? 'API keys' : 'My API keys'} <span class="mut">— {admin ? 'all keys across users' : 'create and revoke your own keys'}</span></h2>
+      <div class="row" style="margin:12px 0">
+        <input placeholder="key name" value={f.name} onInput={(e: any) => setF((s: any) => ({ ...s, name: e.target.value }))} />
+        <select value={f.team_id} onChange={(e: any) => setF((s: any) => ({ ...s, team_id: e.target.value }))}><option value="">no team</option>{(teams.data || []).map((t) => <option value={t.id}>{t.name}</option>)}</select>
+        {admin && <select value={f.owner_user_id} onChange={(e: any) => setF((s: any) => ({ ...s, owner_user_id: e.target.value }))}><option value="">owner: me</option>{(users.data || []).map((u) => <option value={u.id}>{u.username}</option>)}</select>}
+        {admin && <label class="mut" style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" checked={f.scopes.includes('inference')} onChange={() => toggleScope('inference')} />inference</label>}
+        {admin && <label class="mut" style="display:inline-flex;align-items:center;gap:4px"><input type="checkbox" checked={f.scopes.includes('admin')} onChange={() => toggleScope('admin')} />admin (API)</label>}
+        <button class="btn" onClick={create}>Issue key</button>
+      </div>
+      {issued && <div style="margin-bottom:12px"><div class="mut">Copy now — shown once:</div><div class="token mono">{issued}</div></div>}
+      {error && <p class="err">{error}</p>}
+      <table><thead><tr><th>name</th><th>prefix</th><th>team</th>{admin && <th>owner</th>}<th>access</th><th></th></tr></thead>
+        <tbody>{(data || []).map((k) => (
+          <Fragment key={k.id}>
+            <tr>
+              <td>{k.name || '—'}{(k.scopes || []).includes('admin') && <span class="pill admin" style="margin-left:6px">admin</span>}</td><td class="mono">{k.key_prefix}…{k.key_suffix}</td>
+              <td class="mut">{k.team_id ? teamName(k.team_id) : '—'}</td>
+              {admin && <td class="mut">{userName(k.owner_user_id)}</td>}
+              <td class="mut">{isUnrestricted(k.access) ? 'unrestricted' : 'restricted'}</td>
+              <td class="row"><button class="ghost" onClick={() => setEditing(editing === k.id ? '' : k.id)}>access</button><button class="ghost del" onClick={() => del(k.id)}>revoke</button></td>
+            </tr>
+            {editing === k.id && <tr><td colSpan={admin ? 6 : 5}><AccessEditor value={k.access || {}} onSave={(p) => saveAccess(k.id, p)} /></td></tr>}
+          </Fragment>
+        ))}</tbody>
+      </table>
+      {(!data || !data.length) && <p class="empty">No keys yet.</p>}
+    </div>
+  );
+}
+
+function Budgets() {
+  // Budgets are set contextually on user/team detail pages; this standalone
+  // view is intentionally removed. (Kept as a no-op redirect target if linked.)
+  useEffect(() => { route('/users', true); }, []);
+  return null;
+}
+
+function Spend({ admin }: { admin: boolean }) {
+  const [{ data, error }] = useAsync<any[]>(() => api('/spend'));
+  // Members only see spend attributed to their own keys / user.
+  const [mine] = useAsync<any[]>(() => (admin ? Promise.resolve([]) : api('/keys').catch(() => [])), [admin]);
+  let rows = data || [];
+  if (!admin) {
+    const keyIds = new Set((mine.data || []).map((k) => k.id));
+    const userIds = new Set((mine.data || []).map((k) => k.owner_user_id));
+    rows = rows.filter((r) => (r.subject_type === 'key' && keyIds.has(r.subject_id)) || (r.subject_type === 'user' && userIds.has(r.subject_id)));
+  }
+  return (
+    <div class="card">
+      <h2>{admin ? 'Spend' : 'My spend'} <span class="mut">— rollups by subject (key / user / team)</span></h2>
+      {error && <p class="err">{error}</p>}
+      <table style="margin-top:10px"><thead><tr><th>subject</th><th>id</th><th>period</th><th>spend</th><th>requests</th><th>in/out tokens</th></tr></thead>
+        <tbody>{rows.map((r, i) => (
+          <tr key={i}><td><span class="pill">{r.subject_type}</span></td><td class="mono mut">{r.subject_id}</td><td>{r.period}</td>
+            <td class="mono">{usd(r.spend_micros)}</td><td>{r.request_count}</td><td class="mut">{r.input_tokens}/{r.output_tokens}</td></tr>
+        ))}</tbody></table>
+      {!rows.length && <p class="empty">No spend recorded yet.</p>}
+    </div>
+  );
+}
+
+/** `/account` — self-service: change your own password (current + new). */
+function Account({ me }: { me: Me }) {
+  const [cur, setCur] = useState('');
+  const [next, setNext] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [msg, setMsg] = useState('');
+  const [ok, setOk] = useState(false);
+  const submit = async () => {
+    setMsg(''); setOk(false);
+    if (!next) { setMsg('new password must not be empty'); return; }
+    if (next !== confirm) { setMsg('new passwords do not match'); return; }
+    try {
+      await api('/auth/password', { method: 'PUT', body: { current_password: cur, new_password: next } });
+      setOk(true); setCur(''); setNext(''); setConfirm('');
+    } catch (e: any) { setMsg(e.message); }
+  };
+  return (
+    <div class="card" style="max-width:440px">
+      <h2>Account <span class="mut">— {me.username}</span></h2>
+      <div class="grid" style="margin-top:10px">
+        <input type="password" placeholder="current password" value={cur} onInput={(e: any) => setCur(e.target.value)} />
+        <input type="password" placeholder="new password" value={next} onInput={(e: any) => setNext(e.target.value)} />
+        <input type="password" placeholder="confirm new password" value={confirm} onInput={(e: any) => setConfirm(e.target.value)} />
+      </div>
+      <div class="row" style="margin-top:12px"><button class="btn" onClick={submit}>Change password</button>
+        {ok && <span class="mut">password changed</span>}{msg && <span class="err">{msg}</span>}</div>
+    </div>
+  );
+}
+
+/** Imperatively redirect (used for `/` and unmatched paths). */
+function Redirect({ to }: { to: string; path?: string; default?: boolean }) {
+  useEffect(() => { route(to, true); }, []);
+  return null;
+}
+
+function NavLink({ href, label, current, set }: { href: string; label: string; current: string; set: (p: string) => void }) {
+  const go = (e: any) => { e.preventDefault(); route(href); set(href); };
+  return <a href={href} class={current === href ? 'on' : ''} onClick={go}>{label}</a>;
+}
+
+function App() {
+  const [me, setMe] = useState<Me | null | undefined>(undefined);
+  const [path, setPath] = useState(location.pathname);
+  const loadMe = () => api<Me>('/auth/me').then(setMe).catch(() => setMe(null));
+  useEffect(() => { loadMe(); }, []);
+  useEffect(() => {
+    const f = () => setPath(location.pathname);
+    addEventListener('popstate', f);
+    return () => removeEventListener('popstate', f);
+  }, []);
+
+  if (me === undefined) return <p class="empty" style="text-align:center;margin-top:14vh">Loading…</p>;
+  if (me === null) return <Login onAuth={loadMe} />;
+
+  const admin = me.role === 'admin';
+  const logout = async () => { try { await api('/auth/logout', { method: 'POST' }); } catch {} setMe(null); };
+
+  // Nav available to everyone; admin-only links gated below.
+  const links: [string, string, boolean][] = [
+    ['/models', 'Models', false],
+    ['/keys', 'Keys', false],
+    ['/teams', 'Teams', true],
+    ['/users', 'Users', true],
+    ['/spend', 'Spend', false],
+  ];
+
+  return (
+    <Fragment>
+      <header>
+        <span class="logo">SovereignGateway</span><span class="mut">admin</span>
+        <span class="sp"></span>
+        <a href="/account" class="mut mono" onClick={(e: any) => { e.preventDefault(); route('/account'); setPath('/account'); }}>{me.username}</a>
+        <span class={admin ? 'pill admin' : 'pill'}>{me.role}</span>
+        <button class="ghost" onClick={logout}>sign out</button>
+      </header>
+      <main>
+        <nav>{links.filter(([, , a]) => admin || !a).map(([href, label]) => <NavLink href={href} label={label} current={path} set={setPath} />)}</nav>
+        <Router onChange={(e: any) => setPath(e.url)}>
+          <Redirect path="/" to="/keys" />
+          <Models path="/models" admin={admin} />
+          <Keys path="/keys" admin={admin} />
+          {admin && <Teams path="/teams" />}
+          {admin && <TeamDetail path="/teams/:id" />}
+          {admin && <Users path="/users" me={me} />}
+          {admin && <UserDetail path="/users/:id" me={me} />}
+          <Spend path="/spend" admin={admin} />
+          <Account path="/account" me={me} />
+          <Redirect default to="/keys" />
+        </Router>
+      </main>
+    </Fragment>
+  );
+}
+
+render(<App />, document.getElementById('app')!);

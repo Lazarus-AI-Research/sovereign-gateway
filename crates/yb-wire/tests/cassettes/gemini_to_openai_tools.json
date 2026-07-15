@@ -1,0 +1,35 @@
+{
+  "inbound_format": "gemini",
+  "inbound_body": {
+    "systemInstruction": {"parts": [{"text": "You are helpful."}]},
+    "contents": [
+      {"role": "user", "parts": [{"text": "Weather in Paris?"}]},
+      {"role": "model", "parts": [{"functionCall": {"name": "get_weather", "args": {"location": "Paris"}}}]},
+      {"role": "user", "parts": [{"functionResponse": {"name": "get_weather", "response": {"temp": "24C"}}}]}
+    ],
+    "tools": [
+      {"functionDeclarations": [
+        {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"location": {"type": "string"}}}}
+      ]}
+    ],
+    "generationConfig": {"maxOutputTokens": 256, "temperature": 0.5}
+  },
+  "target_format": "openai_chat",
+  "target_model": "gpt-4o",
+  "expected_upstream_body": {
+    "model": "gpt-4o",
+    "messages": [
+      {"role": "system", "content": "You are helpful."},
+      {"role": "user", "content": "Weather in Paris?"},
+      {"role": "assistant", "content": null, "tool_calls": [
+        {"id": "get_weather", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\":\"Paris\"}"}}
+      ]},
+      {"role": "tool", "tool_call_id": "get_weather", "content": "{\"temp\":\"24C\"}"}
+    ],
+    "tools": [
+      {"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"location": {"type": "string"}}}}}
+    ],
+    "max_tokens": 256,
+    "temperature": 0.5
+  }
+}

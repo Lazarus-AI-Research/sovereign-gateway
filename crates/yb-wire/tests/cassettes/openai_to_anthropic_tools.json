@@ -1,0 +1,36 @@
+{
+  "inbound_format": "openai_chat",
+  "inbound_body": {
+    "model": "gpt-4o",
+    "max_tokens": 512,
+    "messages": [
+      {"role": "user", "content": "Weather in Paris?"},
+      {"role": "assistant", "content": null, "tool_calls": [
+        {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\":\"Paris\"}"}}
+      ]},
+      {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 24C"}
+    ],
+    "tools": [
+      {"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"location": {"type": "string"}}}}}
+    ],
+    "tool_choice": "auto"
+  },
+  "target_format": "anthropic",
+  "expected_upstream_body": {
+    "model": "gpt-4o",
+    "max_tokens": 512,
+    "messages": [
+      {"role": "user", "content": "Weather in Paris?"},
+      {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"location": "Paris"}}
+      ]},
+      {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "call_1", "content": "Sunny, 24C"}
+      ]}
+    ],
+    "tools": [
+      {"name": "get_weather", "description": "Get weather", "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}}}
+    ],
+    "tool_choice": {"type": "auto"}
+  }
+}

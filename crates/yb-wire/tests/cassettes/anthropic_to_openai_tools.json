@@ -1,0 +1,37 @@
+{
+  "inbound_format": "anthropic",
+  "inbound_body": {
+    "model": "claude-3-5-sonnet-20241022",
+    "max_tokens": 1024,
+    "messages": [
+      {"role": "user", "content": "What is the weather in Paris?"},
+      {"role": "assistant", "content": [
+        {"type": "text", "text": "Let me check."},
+        {"type": "tool_use", "id": "toolu_01", "name": "get_weather", "input": {"location": "Paris"}}
+      ]},
+      {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_01", "content": "Sunny, 24C"}
+      ]}
+    ],
+    "tools": [
+      {"name": "get_weather", "description": "Get weather", "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}}
+    ],
+    "tool_choice": {"type": "auto"}
+  },
+  "target_format": "openai_chat",
+  "expected_upstream_body": {
+    "model": "claude-3-5-sonnet-20241022",
+    "messages": [
+      {"role": "user", "content": "What is the weather in Paris?"},
+      {"role": "assistant", "content": "Let me check.", "tool_calls": [
+        {"id": "toolu_01", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\":\"Paris\"}"}}
+      ]},
+      {"role": "tool", "tool_call_id": "toolu_01", "content": "Sunny, 24C"}
+    ],
+    "tools": [
+      {"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}}}
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 1024
+  }
+}
