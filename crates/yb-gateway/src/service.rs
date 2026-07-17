@@ -673,7 +673,6 @@ impl RecordCtx {
             ts: self.created_at,
             request_id: self.request_id.clone(),
             trace_id: self.trace_id.clone(),
-            installation_id: String::new(),
             surface: self.surface.clone(),
             requested_model: self.requested_model.clone(),
             decision_model: self.deployment.model_name.clone(),

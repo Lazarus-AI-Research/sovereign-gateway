@@ -11,7 +11,6 @@ pub struct RequestLogRecord {
     pub ts: Timestamp,
     pub request_id: String,
     pub trace_id: Option<String>,
-    pub installation_id: String,
     /// `anthropic` | `openai_chat` | `openai_responses` | `gemini`.
     pub surface: String,
     pub requested_model: String,

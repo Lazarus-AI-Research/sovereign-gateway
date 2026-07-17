@@ -85,7 +85,6 @@ CREATE TABLE IF NOT EXISTS turns (
     log_date           DATE,
     request_id         VARCHAR,
     trace_id           VARCHAR,
-    installation_id    VARCHAR,
     surface            VARCHAR,
     requested_model    VARCHAR,
     decision_model     VARCHAR,
@@ -104,7 +103,7 @@ CREATE TABLE IF NOT EXISTS turns (
 const INSERT_TURN: &str = "\
 INSERT INTO turns VALUES (
     CAST(? AS UBIGINT), CAST(? AS TIMESTAMP), CAST(? AS DATE),
-    ?, ?, ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?,
     CAST(? AS INTEGER), CAST(? AS INTEGER), ?, ?, ?
 )";
 
@@ -373,7 +372,6 @@ impl Worker {
                     log_date,
                     rec.request_id,
                     rec.trace_id,
-                    rec.installation_id,
                     rec.surface,
                     rec.requested_model,
                     rec.decision_model,
@@ -563,7 +561,6 @@ mod tests {
             ts: now(),
             request_id: format!("req-{i}"),
             trace_id: Some(format!("trace-{i}")),
-            installation_id: "inst-1".to_string(),
             surface: "anthropic".to_string(),
             requested_model: "claude-sonnet".to_string(),
             decision_model: "claude-sonnet".to_string(),
