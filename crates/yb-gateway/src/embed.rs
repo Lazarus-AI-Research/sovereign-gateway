@@ -198,7 +198,9 @@ fn build_embed_route_request(req: &EmbedRequest, ctx: &RequestCtx) -> RouteReque
         .flat_map(|i| &i.parts)
         .map(|p| match p {
             EmbedPart::Text { text } => text.len(),
-            EmbedPart::Image { .. } => 0,
+            // Binary parts carry no characters; their token cost is the
+            // upstream's business, and the estimate only sizes routing.
+            EmbedPart::Image { .. } | EmbedPart::Audio { .. } => 0,
         })
         .sum();
 

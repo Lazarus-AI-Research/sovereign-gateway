@@ -34,6 +34,16 @@ pub enum EmbedPart {
         /// http(s) URL; mutually exclusive with `data`.
         url: Option<String>,
     },
+    Audio {
+        /// The container format, as OpenAI's `input_audio.format` carries it:
+        /// e.g. `wav`, `mp3`. `None` when unknown.
+        format: Option<String>,
+        /// Raw base64 payload (no `data:` prefix).
+        data: Option<String>,
+        /// http(s) URL; mutually exclusive with `data`. Most deployments reject
+        /// this — fetching it would mean egress — but the IR can carry it.
+        url: Option<String>,
+    },
 }
 
 /// One embedding-producing unit: a list of parts. Multimodal formats allow
@@ -59,6 +69,16 @@ impl EmbedInput {
 
     pub fn has_image(&self) -> bool {
         self.parts.iter().any(|p| matches!(p, EmbedPart::Image { .. }))
+    }
+
+    pub fn has_audio(&self) -> bool {
+        self.parts.iter().any(|p| matches!(p, EmbedPart::Audio { .. }))
+    }
+
+    /// Whether this input needs a dialect richer than a flat `input` list —
+    /// because it interleaves parts into one vector, or carries audio.
+    pub fn needs_multipart(&self) -> bool {
+        self.parts.len() > 1 || self.has_audio()
     }
 }
 

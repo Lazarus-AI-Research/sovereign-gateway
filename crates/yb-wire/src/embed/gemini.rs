@@ -115,10 +115,10 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
 
     let mut requests = Vec::with_capacity(req.inputs.len());
     for input in &req.inputs {
-        if input.has_image() {
+        if input.has_image() || input.has_audio() {
             return Err(WireError::InvalidRequest(
-                "gemini_embed is text-only; route image inputs to a multimodal upstream \
-                 (voyage_embed)"
+                "gemini_embed is text-only; route image or audio inputs to a multimodal \
+                 upstream (voyage_embed for image, openai_embed for audio)"
                     .into(),
             ));
         }
@@ -127,7 +127,8 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
             .iter()
             .filter_map(|p| match p {
                 EmbedPart::Text { text } => Some(json!({"text": text})),
-                EmbedPart::Image { .. } => None,
+                // Unreachable: the guard above rejects both.
+                EmbedPart::Image { .. } | EmbedPart::Audio { .. } => None,
             })
             .collect();
         let mut r = Map::new();

@@ -114,6 +114,13 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
                     (None, Some(u)) => content.push(json!({"type": "image_url", "image_url": u})),
                     _ => return Err(WireError::invalid("inputs[]", "image without data or url")),
                 },
+                EmbedPart::Audio { .. } => {
+                    return Err(WireError::InvalidRequest(
+                        "voyage_embed carries interleaved text and image only; route audio \
+                         inputs to an openai_embed upstream"
+                            .into(),
+                    ))
+                }
             }
         }
         items.push(json!({"content": content}));

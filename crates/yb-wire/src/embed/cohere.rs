@@ -164,6 +164,13 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
                         let uri = image_to_data_uri(media_type.as_deref(), data.as_deref())?;
                         content.push(json!({"type": "image_url", "image_url": {"url": uri}}));
                     }
+                    EmbedPart::Audio { .. } => {
+                        return Err(WireError::InvalidRequest(
+                            "cohere_embed carries text and image only; route audio inputs to \
+                             an openai_embed upstream"
+                                .into(),
+                        ))
+                    }
                 }
             }
             items.push(json!({"content": content}));
