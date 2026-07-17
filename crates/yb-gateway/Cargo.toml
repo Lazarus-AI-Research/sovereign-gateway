@@ -8,7 +8,6 @@ license.workspace = true
 yb-core.workspace = true
 yb-wire.workspace = true
 yb-providers.workspace = true
-yb-reqlog.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

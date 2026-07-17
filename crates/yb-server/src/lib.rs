@@ -18,6 +18,9 @@
 pub mod admin;
 pub mod sso;
 pub mod state;
+/// The bundled admin console. Compiled only with the `console` feature; the
+/// JSON admin API under `/admin/v1` is independent of it.
+#[cfg(feature = "console")]
 pub mod ui;
 
 use axum::body::{Body, Bytes};
@@ -81,18 +84,25 @@ pub fn build_router(state: AppState) -> Router {
 
     if state.mode == DeploymentMode::Selfhosted {
         router = router
-            .route("/", get(ui::index))
-            .route("/ui/app.js", get(ui::app_js))
             // The IdP emails its magic link as `{callback_base}/auth/verify?lt=…`
             // (a fixed suffix), so the sso link handler is served here at the top
             // level — not only under /admin/v1. The typed-code flow is separate
             // (POST /admin/v1/auth/sso/code).
             .route("/auth/verify", get(admin::auth_sso_verify))
-            .nest("/admin/v1", admin::router())
-            // SPA fallback: serve the admin shell for any unmatched **non-API**
-            // GET so `preact-router` history paths (e.g. `/teams`) resolve on a
-            // deep-link or refresh. Unmatched API paths still return 404 JSON.
-            .fallback(spa_fallback);
+            .nest("/admin/v1", admin::router());
+
+        #[cfg(feature = "console")]
+        {
+            router = router
+                .route("/", get(ui::index))
+                .route("/ui/app.js", get(ui::app_js));
+        }
+
+        // SPA fallback: serve the admin shell for any unmatched **non-API** GET
+        // so `preact-router` history paths (e.g. `/teams`) resolve on a
+        // deep-link or refresh. Unmatched API paths still return 404 JSON.
+        // Without the console every unmatched path is a 404.
+        router = router.fallback(spa_fallback);
     }
 
     router.with_state(state)
@@ -100,19 +110,26 @@ pub fn build_router(state: AppState) -> Router {
 
 /// Fallback: 404 (JSON) for unmatched API paths, otherwise the SPA shell so
 /// client-side routes work on deep-link/refresh.
+///
+/// Without the `console` feature there is no shell to serve, so every unmatched
+/// path — API or not — gets the JSON 404.
 async fn spa_fallback(uri: axum::http::Uri) -> Response {
     let p = uri.path();
-    let is_api = p.starts_with("/admin")
-        || p.starts_with("/v1")
-        || p.starts_with("/v1beta")
-        || p.starts_with("/v2")
-        || p.starts_with("/ui")
-        || p == "/health";
-    if is_api {
-        error_response(&Error::NotFound(format!("no route for {p}")))
-    } else {
-        ui::index().await
+
+    #[cfg(feature = "console")]
+    {
+        let is_api = p.starts_with("/admin")
+            || p.starts_with("/v1")
+            || p.starts_with("/v1beta")
+            || p.starts_with("/v2")
+            || p.starts_with("/ui")
+            || p == "/health";
+        if !is_api {
+            return ui::index().await;
+        }
     }
+
+    error_response(&Error::NotFound(format!("no route for {p}")))
 }
 
 // ---- liveness / discovery ------------------------------------------------

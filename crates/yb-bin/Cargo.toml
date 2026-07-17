@@ -8,12 +8,25 @@ license.workspace = true
 name = "gateway"
 path = "src/main.rs"
 
+[features]
+default = []
+# Serve the bundled admin console. Off by default; see yb-server's `console`
+# feature. Pulls the rolldown/oxc build-dependency, which needs a toolchain
+# beyond the pinned stable one.
+console = ["yb-server/console"]
+# Request/response body logging to DuckDB → parquet. Off by default: it captures
+# prompt and response content, which appliance deployments must not do unless an
+# operator explicitly turns it on. With this off, `duckdb` is not compiled at all
+# and `[reqlog] enabled = true` in the config is rejected at startup rather than
+# silently ignored.
+reqlog = ["dep:yb-reqlog"]
+
 [dependencies]
 yb-core.workspace = true
 yb-wire.workspace = true
 yb-store.workspace = true
 yb-providers.workspace = true
-yb-reqlog.workspace = true
+yb-reqlog = { workspace = true, optional = true }
 yb-otel.workspace = true
 yb-gateway.workspace = true
 yb-server.workspace = true

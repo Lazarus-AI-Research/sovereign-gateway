@@ -1,0 +1,9 @@
+# Pin the toolchain so "builds on stable" is reproducible rather than a property
+# of whatever rustc happens to be on PATH.
+#
+# 1.94 matches workspace.package.rust-version. The default feature set builds on
+# it; the optional `console` feature does not — its rolldown/oxc build-dependency
+# needs unstable `if let` guards. That is the reason the console is opt-in.
+[toolchain]
+channel = "1.94"
+components = ["rustfmt", "clippy"]

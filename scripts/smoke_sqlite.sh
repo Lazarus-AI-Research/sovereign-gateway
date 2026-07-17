@@ -71,8 +71,12 @@ fail() { printf '  FAIL %s\n' "$*" >&2; echo "---- server.log (tail) ----" >&2; 
 
 # ---- 0. build --------------------------------------------------------------
 
-say "building gateway"
-( cd "$REPO_DIR" && cargo build -p yb-bin 2>&1 | tail -3 )
+# `reqlog` is off by default (it captures request/response bodies), but step 7
+# asserts a parquet shard, so this smoke run is the thing that covers it — build
+# the feature in explicitly. The `console` feature stays off: it is not exercised
+# here and its rolldown/oxc build-dependency does not compile on stable.
+say "building gateway (--features reqlog)"
+( cd "$REPO_DIR" && cargo build -p yb-bin --features reqlog 2>&1 | tail -3 )
 BIN="$REPO_DIR/target/debug/gateway"
 [[ -x "$BIN" ]] || fail "binary not found at $BIN"
 pass "built $BIN"

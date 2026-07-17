@@ -5453,7 +5453,6 @@ dependencies = [
  "uuid",
  "yb-core",
  "yb-providers",
- "yb-reqlog",
  "yb-wire",
 ]
 

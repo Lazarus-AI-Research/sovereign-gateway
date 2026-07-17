@@ -23,6 +23,22 @@ cargo build --release
 # binary at target/release/gateway
 ```
 
+Builds on the pinned stable toolchain (`rust-toolchain.toml`) with no default
+features. Two capabilities are opt-in:
+
+| Feature | Adds | Why it is off by default |
+| --- | --- | --- |
+| `console` | The bundled Preact admin console at `GET /` and `/ui/app.js` | Pulls the `rolldown`/`oxc` build-dependency, which needs a toolchain beyond pinned stable. Deployments that must not expose a gateway UI simply never build it. |
+| `reqlog` | Request/response body capture to DuckDB → parquet | It records prompt and response **content**, and bundles DuckDB (the slow part of the build). `[reqlog] enabled = true` without this feature is a startup error, never a silent no-op. |
+
+```sh
+cargo build --release --features console,reqlog   # everything
+cargo build --release --features reqlog           # no UI, body logging on
+```
+
+The JSON admin API (`/admin/v1/*`) is always available in `selfhosted` mode and
+does not depend on `console` — it is what a control plane drives.
+
 ## Configure
 
 The gateway is configured by one TOML file and reads no environment variables (only `RUST_LOG`). There is no environment indirection for upstream keys either — each deployment carries its own `api_key` directly.
@@ -59,7 +75,7 @@ The model list lives in the database. `import` is the only path that loads it fr
 
 Database backend, bind address, secrets, request logging, and feature flags all come from the TOML file; upstream keys come from the models file. To collect training data, set `[reqlog] enabled = true`. To use Postgres, set `[database] backend = "postgres"` and `dsn = "postgres://…"`.
 
-Open `http://localhost:8080/` for the bundled admin console (Preact, compiled into the binary). Sign in as a user — the login account is the user (username and password, Argon2-hashed in the DB). On first run `serve` auto-creates `admin` / `admin`. Change this credential immediately, in the UI or with `gateway setup --password <new>`, before exposing the gateway to a network.
+Built with `--features console`, `http://localhost:8080/` serves the bundled admin console (Preact, compiled into the binary); without it that path is a 404 and `/admin/v1/*` is the only management surface. Sign in as a user — the login account is the user (username and password, Argon2-hashed in the DB). On first run `serve` auto-creates `admin` / `admin`. Change this credential immediately, in the UI or with `gateway setup --password <new>`, before exposing the gateway to a network.
 
 Users have roles: **admin** (full control) and **member** (use the gateway, manage their own keys). Users own keys; there is no password in the TOML.
 

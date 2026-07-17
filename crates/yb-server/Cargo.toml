@@ -4,6 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# The bundled Preact admin console (`GET /` and `/ui/app.js`).
+#
+# Off by default, for two reasons:
+#  1. It is the only thing that pulls the `rolldown` build-dependency, whose
+#     `oxc_transformer` does not compile on stable Rust (unstable `if let`
+#     guards). Without this feature the workspace builds on the pinned stable
+#     toolchain.
+#  2. Appliance deployments must not expose a gateway UI at all, so they build
+#     without it and the console cannot be reached even by mistake.
+#
+# The JSON admin API (`/admin/v1/*`) is unaffected and remains available in
+# Selfhosted mode either way — it is what a control plane drives.
+console = ["dep:rolldown"]
+
 [dependencies]
 yb-core.workspace = true
 yb-wire.workspace = true
@@ -33,6 +49,10 @@ tower = { workspace = true, features = ["util"] }
 # Build-time only: bundles the TSX admin UI (frontend/src) into a single ES
 # module embedded via include_str!. NOT a runtime dependency — does not ship in
 # the binary or its dependency graph (see build.rs).
+#
+# Optional, and enabled only by the `console` feature: rolldown pulls oxc, which
+# does not compile on stable Rust. With the feature off, build.rs is a no-op and
+# oxc never enters the graph.
 [build-dependencies]
-rolldown = "1.1.3"
+rolldown = { version = "1.1.3", optional = true }
 tokio = { workspace = true }

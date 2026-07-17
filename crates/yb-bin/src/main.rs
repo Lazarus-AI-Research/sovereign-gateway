@@ -37,6 +37,7 @@
 //! ## Example `gateway.toml`
 //! See `gateway.example.toml` in the repository root.
 
+#[cfg(feature = "reqlog")]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +53,7 @@ use yb_core::{new_id, now, DeploymentRecord, NullLogger, NullObserver, Observer,
 use yb_gateway::{DeploymentRouter, Gateway};
 use yb_otel::OtelSink;
 use yb_providers::{HttpClient, MockClient, UpstreamClient};
+#[cfg(feature = "reqlog")]
 use yb_reqlog::{DuckLogger, ReqlogConfig};
 use yb_server::{build_router, AppState};
 use yb_store::{AesGcmEncryptor, Argon2Hasher, PostgresStore, SqliteStore};
@@ -498,6 +500,7 @@ fn build_upstream_client(mode: UpstreamMode) -> Arc<dyn UpstreamClient> {
 
 /// Build the request-log sink: a [`DuckLogger`] when `reqlog.enabled`, else the
 /// no-op [`NullLogger`].
+#[cfg(feature = "reqlog")]
 fn build_reqlog(r: &ReqlogSettings) -> Result<Arc<dyn RequestLogger>, Box<dyn std::error::Error>> {
     if !r.enabled {
         return Ok(Arc::new(NullLogger));
@@ -513,6 +516,22 @@ fn build_reqlog(r: &ReqlogSettings) -> Result<Arc<dyn RequestLogger>, Box<dyn st
     };
     tracing::info!(dir = %cfg.dir.display(), "request logging enabled (duckdb)");
     Ok(Arc::new(DuckLogger::new(cfg)?))
+}
+
+/// Without the `reqlog` feature there is no DuckDB sink compiled in.
+///
+/// `enabled = false` is the normal path and yields the no-op logger. `enabled =
+/// true` is a hard error rather than a silent downgrade: an operator who asked
+/// for request logging must never be left believing it is on when the binary
+/// cannot do it.
+#[cfg(not(feature = "reqlog"))]
+fn build_reqlog(r: &ReqlogSettings) -> Result<Arc<dyn RequestLogger>, Box<dyn std::error::Error>> {
+    if r.enabled {
+        return Err("[reqlog] enabled = true, but this binary was built without the \
+                    `reqlog` feature (rebuild with --features reqlog, or set enabled = false)"
+            .into());
+    }
+    Ok(Arc::new(NullLogger))
 }
 
 // ---- crypto ----------------------------------------------------------------

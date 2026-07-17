@@ -1,17 +1,24 @@
-//! Build script: bundle the Preact + TSX admin UI (`frontend/src/main.tsx`) into
-//! a single ES module at `$OUT_DIR/app.js`, which `src/ui.rs` embeds via
-//! `include_str!`. Uses the `rolldown` bundler as a **build-dependency** — it
+//! Build script for the bundled Preact + TSX admin UI.
+//!
+//! With the `console` feature on, this bundles `frontend/src/main.tsx` into a
+//! single ES module at `$OUT_DIR/app.js`, which `src/ui.rs` embeds via
+//! `include_str!`. It uses the `rolldown` bundler as a **build-dependency** — it
 //! runs here at build time and is never part of the runtime binary.
+//!
+//! With the feature off (the default) this is a no-op: `src/ui.rs` is compiled
+//! out, nothing needs `app.js`, and `rolldown`/`oxc` never enter the graph —
+//! which is what lets the workspace build on the pinned stable toolchain.
 //!
 //! Preact is vendored under `frontend/src/vendor/`, so the bundle is hermetic:
 //! no `npm`, no `node_modules`, no network. JSX is the classic runtime (pragma
 //! `h`/`Fragment`), configured via `frontend/tsconfig.json`.
 
-use std::path::PathBuf;
-
-use rolldown::{Bundler, BundlerOptions, InputItem, OutputFormat, RawMinifyOptions, TsConfig};
-
+#[cfg(feature = "console")]
 fn main() {
+    use std::path::PathBuf;
+
+    use rolldown::{Bundler, BundlerOptions, InputItem, OutputFormat, RawMinifyOptions, TsConfig};
+
     let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let frontend = crate_dir.join("frontend");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -46,3 +53,6 @@ fn main() {
         }
     });
 }
+
+#[cfg(not(feature = "console"))]
+fn main() {}
