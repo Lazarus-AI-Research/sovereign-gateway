@@ -1,0 +1,1183 @@
+openapi: 3.1.0
+info:
+  title: SovereignGateway
+  version: 0.1.0
+  description: |
+    The HTTP contract for SovereignGateway: the inference surfaces under `/v1`
+    and `/v1beta`, and the JSON admin API under `/admin/v1`.
+
+    This document is written from the running binary — every shape here was
+    captured from a live server, not inferred from source. `scripts/check_openapi.sh`
+    re-verifies it against a booted gateway.
+
+    **Scope.** The admin API is the whole management surface. The bundled console
+    is an optional `console` build feature and is not part of this contract; a
+    control plane drives `/admin/v1` directly and needs no UI.
+
+    **Auth.** Two disjoint credentials:
+      * `/admin/v1` — a session cookie from `POST /admin/v1/auth/login`, or an
+        `admin`-scoped virtual key as a bearer (machine auth).
+      * `/v1`, `/v1beta`, `/v2` — an `inference`-scoped virtual key, sent as
+        `Authorization: Bearer`, `x-api-key`, or `x-gateway-key`.
+
+    A key may hold both scopes; one holding only `admin` is rejected for
+    inference, and vice versa.
+
+    **Availability.** `/admin/v1` mounts only when `[server] deployment_mode =
+    "selfhosted"`.
+  license:
+    name: MIT OR Apache-2.0
+
+servers:
+  - url: http://localhost:8080
+    description: Default bind
+
+tags:
+  - name: health
+  - name: inference
+  - name: auth
+  - name: users
+  - name: models
+  - name: keys
+  - name: teams
+  - name: budgets
+
+security:
+  - sessionCookie: []
+  - adminKey: []
+
+paths:
+  # ---- health / discovery -------------------------------------------------
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness probe. Always 200 when the process is up.
+      security: []
+      responses:
+        "200":
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, const: ok }
+              example: { status: ok }
+
+  /metrics:
+    get:
+      tags: [health]
+      summary: Prometheus text exposition.
+      description: 404 when telemetry or its Prometheus view is disabled.
+      security: []
+      responses:
+        "200":
+          description: Metrics
+          content:
+            text/plain:
+              schema: { type: string }
+        "404": { description: Telemetry disabled }
+
+  /v1/models:
+    get:
+      tags: [inference, models]
+      summary: OpenAI-shaped list of the configured public model names.
+      description: |
+        Distinct `model_name`s from the DB deployments, in stable order.
+        `/openai/v1/models` is identical; `/anthropic/v1/models` returns the
+        Anthropic shape.
+      responses:
+        "200":
+          description: Model list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenAiModelList" }
+
+  # ---- inference ----------------------------------------------------------
+  /v1/chat/completions:
+    post:
+      tags: [inference]
+      summary: OpenAI Chat Completions.
+      description: |
+        The client dialect is translated to the upstream's format via the
+        provider-agnostic IR. Set `"stream": true` for SSE. The request body is
+        the vendor's own schema and is passed through, so it is not constrained
+        here.
+      security: [{ inferenceKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InferenceRequest" }
+      responses:
+        "200":
+          description: Vendor-shaped completion, or an SSE stream when streaming.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+            text/event-stream:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/messages:
+    post:
+      tags: [inference]
+      summary: Anthropic Messages.
+      security: [{ inferenceKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InferenceRequest" }
+      responses:
+        "200":
+          description: Vendor-shaped response, or SSE when streaming.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+            text/event-stream: { schema: { type: string } }
+        "401": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/responses:
+    post:
+      tags: [inference]
+      summary: OpenAI Responses.
+      security: [{ inferenceKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InferenceRequest" }
+      responses:
+        "200":
+          description: Vendor-shaped response, or SSE when streaming.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+            text/event-stream: { schema: { type: string } }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /v1/embeddings:
+    post:
+      tags: [inference]
+      summary: OpenAI-dialect embeddings.
+      description: |
+        The shape vLLM, TEI, LiteLLM, Jina and Voyage's text endpoint all speak.
+        Upstreams may be OpenAI-compatible, Gemini, Cohere, Voyage or Ollama.
+      security: [{ inferenceKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InferenceRequest" }
+      responses:
+        "200":
+          description: Embedding vectors, vendor-shaped.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /v1/multimodalembeddings:
+    post:
+      tags: [inference]
+      summary: Voyage-dialect multimodal embeddings.
+      security: [{ inferenceKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InferenceRequest" }
+      responses:
+        "200":
+          description: Vendor-shaped embeddings.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /v2/embed:
+    post:
+      tags: [inference]
+      summary: Cohere-dialect embeddings.
+      security: [{ inferenceKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InferenceRequest" }
+      responses:
+        "200":
+          description: Vendor-shaped embeddings.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /v1beta/{path}:
+    parameters:
+      - name: path
+        in: path
+        required: true
+        schema: { type: string }
+        description: |
+          `models` to list, or `models/{model}:{action}` for inference, where
+          action is `generateContent`, `streamGenerateContent`, `embedContent`
+          or `batchEmbedContents`. The model and action travel in the URL.
+        example: "models/claude-3-5-sonnet:generateContent"
+    get:
+      tags: [inference, models]
+      summary: Gemini-shaped discovery.
+      responses:
+        "200":
+          description: Gemini model list or a single model.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+        "404": { $ref: "#/components/responses/Error" }
+    post:
+      tags: [inference]
+      summary: Gemini generateContent / embedContent.
+      security: [{ inferenceKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { type: object, additionalProperties: true } }
+      responses:
+        "200":
+          description: Gemini-shaped response, or SSE for streamGenerateContent.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+            text/event-stream: { schema: { type: string } }
+        "400": { $ref: "#/components/responses/Error" }
+
+  # ---- auth ---------------------------------------------------------------
+  /auth/verify:
+    get:
+      tags: [auth]
+      summary: Complete an SSO magic-link login.
+      description: |
+        Served at the top level, not under `/admin/v1`: the IdP mails its link
+        as `{callback_base}/auth/verify?lt=…`, a fixed suffix we do not control.
+        The typed-code alternative is `POST /admin/v1/auth/sso/code`.
+
+        On success this sets the session cookie and redirects to `/`. A control
+        plane has no reason to call it — it exists for the browser flow.
+      security: []
+      parameters:
+        - name: lt
+          in: query
+          required: true
+          schema: { type: string }
+          description: The login token from the emailed link.
+      responses:
+        "303":
+          description: Signed in; session cookie set, redirect to `/`.
+          headers:
+            Location: { schema: { type: string } }
+            Set-Cookie: { schema: { type: string } }
+        "403":
+          description: SSO login is not enabled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/v1/auth/config:
+    get:
+      tags: [auth]
+      summary: Which login providers this deployment offers.
+      security: []
+      responses:
+        "200":
+          description: Auth config
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [providers]
+                properties:
+                  providers:
+                    type: array
+                    items: { type: string, examples: ["local", "sso"] }
+                  turnstile_sitekey: { type: [string, "null"] }
+              example: { providers: [local], turnstile_sitekey: null }
+
+  /admin/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Sign in; sets the session cookie.
+      description: |
+        On first run `serve` auto-creates `admin`/`admin` when no users exist.
+        Change it before binding to a network — see `gateway setup --password`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+      responses:
+        "200":
+          description: Signed in. Session cookie in `Set-Cookie`.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /admin/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Invalidate the current session.
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  /admin/v1/auth/me:
+    get:
+      tags: [auth]
+      summary: The signed-in principal.
+      responses:
+        "200":
+          description: Principal
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /admin/v1/auth/password:
+    put:
+      tags: [auth]
+      summary: Change your own password.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string, format: password }
+                new_password: { type: string, format: password }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /admin/v1/auth/sso/start:
+    post:
+      tags: [auth]
+      summary: Begin the SSO email flow.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                turnstile_token: { type: [string, "null"] }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /admin/v1/auth/sso/code:
+    post:
+      tags: [auth]
+      summary: Complete the SSO flow with a typed code.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code]
+              properties:
+                email: { type: string, format: email }
+                code: { type: string }
+      responses:
+        "200":
+          description: Signed in. Session cookie in `Set-Cookie`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  # ---- users --------------------------------------------------------------
+  /admin/v1/users:
+    get:
+      tags: [users]
+      summary: List login users (admin).
+      responses:
+        "200":
+          description: Users
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/User" }
+        "403": { $ref: "#/components/responses/Error" }
+    post:
+      tags: [users]
+      summary: Create a password user (admin).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+                role: { $ref: "#/components/schemas/Role" }
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserSummary" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /admin/v1/users/invite:
+    post:
+      tags: [users]
+      summary: Invite a user to sign in via the IdP (admin).
+      description: Requires the sso provider to be enabled. Idempotent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                role: { $ref: "#/components/schemas/Role" }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /admin/v1/users/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    delete:
+      tags: [users]
+      summary: Delete a user (admin).
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /admin/v1/users/{id}/role:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    put:
+      tags: [users]
+      summary: Set a user's role (admin).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { $ref: "#/components/schemas/Role" }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  /admin/v1/users/{id}/password:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    put:
+      tags: [users]
+      summary: Reset a user's password (admin).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string, format: password }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  # ---- models -------------------------------------------------------------
+  /admin/v1/models:
+    get:
+      tags: [models]
+      summary: The live deployment list.
+      responses:
+        "200":
+          description: Deployments
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Deployment" }
+    post:
+      tags: [models]
+      summary: Add a deployment. The router hot-reloads; no restart.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewDeployment" }
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /admin/v1/models/health:
+    get:
+      tags: [models]
+      summary: Health of every deployment.
+      responses:
+        "200":
+          description: Per-deployment health
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ModelHealth" }
+
+  /admin/v1/models/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    delete:
+      tags: [models]
+      summary: Remove a deployment (hot-reloads).
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  /admin/v1/models/{id}/health:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    post:
+      tags: [models]
+      summary: Check one deployment now.
+      responses:
+        "200":
+          description: Health
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModelHealth" }
+
+  # ---- aliases ------------------------------------------------------------
+  /admin/v1/aliases:
+    get:
+      tags: [models]
+      summary: List public-name aliases.
+      responses:
+        "200":
+          description: Aliases
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Alias" }
+    post:
+      tags: [models]
+      summary: Point an extra public name at a model.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [alias, target]
+              properties:
+                alias: { type: string }
+                target: { type: string, description: An existing `model_name`. }
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Alias" }
+
+  /admin/v1/aliases/{alias}:
+    parameters:
+      - name: alias
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [models]
+      summary: Remove an alias.
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  # ---- keys ---------------------------------------------------------------
+  /admin/v1/keys:
+    get:
+      tags: [keys]
+      summary: List virtual keys. A member sees only their own; an admin sees all.
+      description: The token itself is never returned — only `key_prefix`/`key_suffix`.
+      responses:
+        "200":
+          description: Keys
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ApiKey" }
+    post:
+      tags: [keys]
+      summary: Issue a virtual key. The token is shown exactly once.
+      description: |
+        A member may only create keys for themselves; `owner_user_id` from a
+        non-admin is ignored. Defaults to the `inference` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateKey" }
+      responses:
+        "200":
+          description: The key plus its one-time token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IssuedKey" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /admin/v1/keys/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    delete:
+      tags: [keys]
+      summary: Revoke a key.
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /admin/v1/keys/{id}/access:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    put:
+      tags: [keys]
+      summary: Replace a key's model/provider access policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [access]
+              properties:
+                access: { $ref: "#/components/schemas/AccessPolicy" }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  # ---- teams --------------------------------------------------------------
+  /admin/v1/teams:
+    get:
+      tags: [teams]
+      summary: List teams.
+      responses:
+        "200":
+          description: Teams
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Team" }
+    post:
+      tags: [teams]
+      summary: Create a team.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                access: { $ref: "#/components/schemas/AccessPolicy" }
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Team" }
+
+  /admin/v1/teams/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    delete:
+      tags: [teams]
+      summary: Delete a team.
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  /admin/v1/teams/{id}/access:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    put:
+      tags: [teams]
+      summary: Replace a team's access policy.
+      description: |
+        A key's effective access is its own grant merged with its team's —
+        deny wins, allow-lists are ceilings.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [access]
+              properties:
+                access: { $ref: "#/components/schemas/AccessPolicy" }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  /admin/v1/teams/{id}/members:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    get:
+      tags: [teams]
+      summary: List members.
+      responses:
+        "200":
+          description: Members
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/User" }
+    post:
+      tags: [teams]
+      summary: Add a member.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  /admin/v1/teams/{id}/members/{user_id}:
+    parameters:
+      - { $ref: "#/components/parameters/Id" }
+      - name: user_id
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [teams]
+      summary: Remove a member.
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  # ---- budgets / spend ----------------------------------------------------
+  /admin/v1/budgets:
+    get:
+      tags: [budgets]
+      summary: Budgets for one subject.
+      parameters:
+        - { $ref: "#/components/parameters/SubjectType" }
+        - { $ref: "#/components/parameters/SubjectId" }
+      responses:
+        "200":
+          description: Budgets
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Budget" }
+        "400":
+          description: Missing or unparseable subject query.
+    put:
+      tags: [budgets]
+      summary: Upsert a budget.
+      description: |
+        The body is the whole `Budget`, including `id`, `created_at` and
+        `updated_at` — the caller supplies them; the server does not fill them
+        in. Upsert is keyed on `id`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Budget" }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "403": { $ref: "#/components/responses/Error" }
+        "422":
+          description: Body is not a complete Budget.
+
+  /admin/v1/budgets/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    delete:
+      tags: [budgets]
+      summary: Delete a budget.
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  /admin/v1/spend:
+    get:
+      tags: [budgets]
+      summary: Spend rollup rows.
+      description: |
+        Local models normally report zero monetary cost; token and request
+        counts remain populated.
+      responses:
+        "200":
+          description: Spend rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SpendRow" }
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: session
+      description: Set by `POST /admin/v1/auth/login`.
+    adminKey:
+      type: http
+      scheme: bearer
+      description: An `admin`-scoped virtual key (`yb_…`). Machine auth for `/admin/v1`.
+    inferenceKey:
+      type: http
+      scheme: bearer
+      description: |
+        An `inference`-scoped virtual key (`yb_…`). Also accepted as `x-api-key`
+        (so native Anthropic SDKs work unchanged) or `x-gateway-key`.
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    SubjectType:
+      name: subject_type
+      in: query
+      required: true
+      schema: { $ref: "#/components/schemas/SubjectType" }
+    SubjectId:
+      name: subject_id
+      in: query
+      required: true
+      schema: { type: string }
+
+  responses:
+    Ok:
+      description: Success.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ok]
+            properties:
+              ok: { type: boolean, const: true }
+          example: { ok: true }
+    Error:
+      description: Error envelope.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Rate limited.
+      headers:
+        Retry-After:
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine code — match on this, not the message.
+              examples:
+                [not_found, bad_request, unauthorized, forbidden, conflict,
+                 budget_exceeded, rate_limited, no_eligible_provider, upstream,
+                 storage, crypto, config, wire, internal]
+            message: { type: string }
+      example: { error: { code: not_found, message: "not found: no route for /" } }
+
+    Role:
+      type: string
+      enum: [admin, member]
+      default: member
+
+    KeyScope:
+      type: string
+      enum: [inference, admin]
+      description: |
+        `inference` may call `/v1`; `admin` is machine auth for `/admin/v1`.
+        Disjoint — a key holding only `admin` cannot run inference.
+
+    SubjectType:
+      type: string
+      enum: [key, user, team]
+
+    Period:
+      type: string
+      enum: [day, week, month, total]
+      description: "`total` caps lifetime spend (no window)."
+
+    BudgetAction:
+      type: string
+      enum: [block, alert]
+
+    UpstreamFormat:
+      type: string
+      enum: [anthropic, openai_chat, openai_responses, gemini]
+      description: The adapter shape used to talk to the upstream.
+
+    Session:
+      type: object
+      required: [username, role]
+      properties:
+        username: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+      example: { username: admin, role: admin }
+
+    AccessPolicy:
+      type: object
+      description: |
+        Empty lists mean unrestricted. Deny wins over allow; allow-lists are
+        ceilings. A key's effective policy is its own merged with its team's.
+      properties:
+        allowed_models: { type: array, items: { type: string } }
+        denied_models: { type: array, items: { type: string } }
+        allowed_providers: { type: array, items: { type: string } }
+        denied_providers: { type: array, items: { type: string } }
+      example:
+        allowed_models: []
+        denied_models: []
+        allowed_providers: []
+        denied_providers: []
+
+    User:
+      type: object
+      required: [id, username, role, created_at]
+      properties:
+        id: { type: string }
+        username: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        created_at: { type: string, format: date-time }
+        last_login_at: { type: [string, "null"], format: date-time }
+
+    UserSummary:
+      type: object
+      required: [id, username, role]
+      properties:
+        id: { type: string }
+        username: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+
+    ApiKey:
+      type: object
+      required: [id, owner_user_id, key_prefix, key_suffix, scopes, access, created_at]
+      properties:
+        id: { type: string }
+        owner_user_id: { type: string }
+        team_id: { type: [string, "null"] }
+        key_prefix: { type: string, examples: ["yb_3d15cf44"] }
+        key_suffix: { type: string, examples: ["cc4f"] }
+        name: { type: [string, "null"] }
+        scopes:
+          type: array
+          items: { $ref: "#/components/schemas/KeyScope" }
+        access: { $ref: "#/components/schemas/AccessPolicy" }
+        rpm_limit: { type: [integer, "null"], format: int64, description: "0 or null = unlimited." }
+        tpm_limit: { type: [integer, "null"], format: int64 }
+        max_concurrent: { type: [integer, "null"], format: int64 }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: [string, "null"], format: date-time }
+        deleted_at: { type: [string, "null"], format: date-time }
+
+    CreateKey:
+      type: object
+      description: |
+        Every field is optional. Note there is no expiry: keys live until
+        revoked.
+      properties:
+        name: { type: [string, "null"] }
+        owner_user_id:
+          type: [string, "null"]
+          description: Admin only; ignored for a member, who always owns their own keys.
+        team_id: { type: [string, "null"] }
+        scopes:
+          type: array
+          items: { $ref: "#/components/schemas/KeyScope" }
+          default: [inference]
+        access: { $ref: "#/components/schemas/AccessPolicy" }
+        rpm_limit: { type: [integer, "null"], format: int64 }
+        tpm_limit: { type: [integer, "null"], format: int64 }
+        max_concurrent: { type: [integer, "null"], format: int64 }
+
+    IssuedKey:
+      type: object
+      required: [key, token]
+      properties:
+        key: { $ref: "#/components/schemas/ApiKey" }
+        token:
+          type: string
+          description: The bearer token, returned once and never again. Only its hash is stored.
+          examples: ["yb_7157f230189447aea03b251ca4a034703be700e37f714a098cfed31329df2755"]
+
+    Team:
+      type: object
+      required: [id, name, access, created_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        access: { $ref: "#/components/schemas/AccessPolicy" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        deleted_at: { type: [string, "null"], format: date-time }
+        created_by: { type: [string, "null"] }
+
+    ModelPrice:
+      type: object
+      properties:
+        input_per_1m: { type: number }
+        output_per_1m: { type: number }
+        cache_read_multiplier: { type: number }
+        cache_write_multiplier: { type: number }
+
+    Deployment:
+      type: object
+      required: [id, model_name, provider, upstream_model, upstream_format, weight, created_at]
+      properties:
+        id: { type: string }
+        model_name: { type: string, description: The public name clients request. }
+        provider: { type: string, description: Free-form attribution label. }
+        upstream_model: { type: string }
+        api_base: { type: [string, "null"] }
+        upstream_format: { $ref: "#/components/schemas/UpstreamFormat" }
+        weight: { type: integer }
+        pricing:
+          oneOf:
+            - { $ref: "#/components/schemas/ModelPrice" }
+            - { type: "null" }
+        health_check: { type: string, examples: [none] }
+        health_path: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        deleted_at: { type: [string, "null"], format: date-time }
+
+    NewDeployment:
+      type: object
+      required: [model_name, provider, upstream_model, upstream_format]
+      properties:
+        model_name: { type: string }
+        provider: { type: string }
+        upstream_model: { type: string }
+        upstream_format: { $ref: "#/components/schemas/UpstreamFormat" }
+        api_key:
+          type: [string, "null"]
+          description: |
+            The upstream provider key, stored on the deployment. Encrypted at
+            rest only when `[security] byok_key` is configured — otherwise it is
+            stored in plaintext.
+        api_base: { type: [string, "null"] }
+        weight: { type: integer, default: 1 }
+
+    Alias:
+      type: object
+      required: [alias, target, created_at]
+      properties:
+        alias: { type: string }
+        target: { type: string }
+        created_at: { type: string, format: date-time }
+
+    ModelHealth:
+      type: object
+      required: [deployment_id, model_name, healthy]
+      properties:
+        deployment_id: { type: string }
+        model_name: { type: string }
+        provider: { type: string }
+        upstream_format: { $ref: "#/components/schemas/UpstreamFormat" }
+        check: { type: string, examples: [none] }
+        healthy: { type: boolean }
+        latency_ms: { type: integer }
+        detail: { type: string }
+
+    Budget:
+      type: object
+      required:
+        [id, subject_type, subject_id, period, hard_limit_micros, action, enabled,
+         created_at, updated_at]
+      properties:
+        id: { type: string }
+        subject_type: { $ref: "#/components/schemas/SubjectType" }
+        subject_id: { type: string }
+        period: { $ref: "#/components/schemas/Period" }
+        hard_limit_micros:
+          type: integer
+          format: int64
+          description: Micros — 1 USD = 1_000_000. Not a float.
+        soft_limit_micros: { type: [integer, "null"], format: int64 }
+        action: { $ref: "#/components/schemas/BudgetAction" }
+        enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        deleted_at: { type: [string, "null"], format: date-time }
+
+    SpendRow:
+      type: object
+      properties:
+        subject_type: { $ref: "#/components/schemas/SubjectType" }
+        subject_id: { type: string }
+        period: { $ref: "#/components/schemas/Period" }
+        period_start: { type: string, format: date-time }
+        spend_micros: { type: integer, format: int64 }
+        request_count: { type: integer, format: int64 }
+        input_tokens: { type: integer, format: int64 }
+        output_tokens: { type: integer, format: int64 }
+
+    OpenAiModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object: { type: string, const: list }
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, object]
+            properties:
+              id: { type: string }
+              object: { type: string, const: model }
+              created: { type: integer }
+              owned_by: { type: string, const: gateway }
+      example:
+        object: list
+        data:
+          - { id: probe-model, object: model, created: 0, owned_by: gateway }
+
+    InferenceRequest:
+      type: object
+      description: |
+        The vendor's own request schema, passed through to the upstream. Only
+        `model` is interpreted by the gateway (for routing); `stream` selects
+        SSE where the dialect supports it.
+      required: [model]
+      additionalProperties: true
+      properties:
+        model:
+          type: string
+          description: A public `model_name` or an alias.
+        stream: { type: boolean, default: false }
