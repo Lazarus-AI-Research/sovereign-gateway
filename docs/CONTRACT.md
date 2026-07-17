@@ -119,3 +119,8 @@ carry `Retry-After`.
 - `scripts/check_openapi.sh` verifies `docs/openapi.yaml` against a live server:
   structure, coverage in both directions (every mounted route documented, every
   documented route mounted), and response shapes.
+- `scripts/smoke_multimodal_embed.py` drives the real binary against a stub
+  upstream and asserts an `input_audio` part and an interleaved image+text
+  message reach it byte-identical. The IR drops what it does not model, so the
+  multimodal superset needs a guard at this level, not only in `yb-wire`'s
+  round-trip tests.
