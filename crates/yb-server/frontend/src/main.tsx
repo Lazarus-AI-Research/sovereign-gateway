@@ -46,8 +46,6 @@ const FORMATS = ['openai_chat', 'openai_responses', 'anthropic', 'gemini', 'open
 const PERIODS = ['day', 'week', 'month', 'total'];
 const SUBJECTS = ['key', 'user', 'team'];
 
-const csvToList = (s: string): string[] => s.split(',').map((x) => x.trim()).filter(Boolean);
-const listToCsv = (l?: string[]): string => (l || []).join(', ');
 const usd = (micros: number) => '$' + (micros / 1e6).toFixed(2);
 const uuid = () => (crypto as any).randomUUID();
 const nowIso = () => new Date().toISOString();
@@ -205,22 +203,105 @@ function Login({ onAuth }: { onAuth: () => void }) {
   );
 }
 
-/** Edit an AccessPolicy as four comma-separated lists. */
-function AccessEditor({ value, onSave }: { value: any; onSave: (p: any) => void }) {
-  const [am, setAm] = useState(listToCsv(value.allowed_models));
-  const [dm, setDm] = useState(listToCsv(value.denied_models));
-  const [ap, setAp] = useState(listToCsv(value.allowed_providers));
-  const [dp, setDp] = useState(listToCsv(value.denied_providers));
+/** One suggestion from `GET /complete` — `value` is stored, `label` is shown. */
+type Sug = { value: string; label: string; hint: string };
+
+/**
+ * A list of values edited as removable pills, completed by the backend.
+ *
+ * `kind` names the vocabulary the server completes (`model`, `provider`,
+ * `user`). Values are stored verbatim, so for `user` a pill holds an id and
+ * `labelFor` supplies the username to display. `strict` refuses anything the
+ * server did not suggest — right for ids, wrong for access policies, where
+ * naming a model that isn't deployed yet is a legitimate thing to do.
+ */
+function TokenInput({ kind, value, onChange, placeholder, labelFor, strict }: {
+  kind: string; value: string[]; onChange: (v: string[]) => void;
+  placeholder?: string; labelFor?: (v: string) => string; strict?: boolean;
+}) {
+  const [q, setQ] = useState('');
+  const [sug, setSug] = useState<Sug[]>([]);
+  const [open, setOpen] = useState(false);
+  const [hi, setHi] = useState(0);
+
+  // Debounced, so a fast typist issues one request rather than one per
+  // keystroke; `dead` drops a slow reply that a newer query already superseded.
+  useEffect(() => {
+    if (!open) { setSug([]); return; }
+    let dead = false;
+    const t = setTimeout(() => {
+      api<Sug[]>('/complete?kind=' + kind + '&q=' + encodeURIComponent(q.trim()))
+        .then((r) => { if (!dead) { setSug((r || []).filter((s) => !value.includes(s.value))); setHi(0); } })
+        .catch(() => { if (!dead) setSug([]); });
+    }, 120);
+    return () => { dead = true; clearTimeout(t); };
+  }, [kind, q, open, value.join(' ')]);
+
+  const add = (v: string) => { if (v && !value.includes(v)) onChange([...value, v]); setQ(''); };
+  const rm = (v: string) => onChange(value.filter((x) => x !== v));
+  const onKey = (e: any) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (sug[hi]) add(sug[hi].value);
+      else if (!strict) add(q.trim());
+    } else if (e.key === 'ArrowDown') { e.preventDefault(); setHi((h) => Math.min(h + 1, sug.length - 1)); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setHi((h) => Math.max(h - 1, 0)); }
+    else if (e.key === 'Escape') { setOpen(false); }
+    // Backspace on an empty box deletes the last pill, as in every tag editor.
+    else if (e.key === 'Backspace' && !q && value.length) { rm(value[value.length - 1]); }
+  };
+
   return (
-    <div class="grid" style="margin-top:6px">
-      <input placeholder="allowed models (csv)" value={am} onInput={(e: any) => setAm(e.target.value)} />
-      <input placeholder="denied models (csv)" value={dm} onInput={(e: any) => setDm(e.target.value)} />
-      <input placeholder="allowed providers (csv)" value={ap} onInput={(e: any) => setAp(e.target.value)} />
-      <input placeholder="denied providers (csv)" value={dp} onInput={(e: any) => setDp(e.target.value)} />
-      <button class="btn" onClick={() => onSave({
-        allowed_models: csvToList(am), denied_models: csvToList(dm),
-        allowed_providers: csvToList(ap), denied_providers: csvToList(dp),
-      })}>Save access</button>
+    <div class="ac-wrap">
+      <div class="tok" onClick={(e: any) => { const i = e.currentTarget.querySelector('input'); if (i) i.focus(); }}>
+        {value.map((v) => (
+          <span key={v} class="pill">{labelFor ? labelFor(v) : v}
+            <button type="button" title="remove" onClick={(e: any) => { e.stopPropagation(); rm(v); }}>&times;</button>
+          </span>
+        ))}
+        <input value={q} placeholder={placeholder || 'type to search'}
+               onInput={(e: any) => { setQ(e.target.value); setOpen(true); }}
+               onFocus={() => setOpen(true)} onBlur={() => setOpen(false)} onKeyDown={onKey} />
+      </div>
+      {open && (sug.length > 0 || q.trim()) && (
+        <div class="ac">
+          {sug.map((s, i) => (
+            <div key={s.value} class={'opt' + (i === hi ? ' on' : '')} onMouseEnter={() => setHi(i)}
+                 onMouseDown={(e: any) => { e.preventDefault(); add(s.value); }}>
+              <span>{s.label}</span>{s.hint && <span class="mut">{s.hint}</span>}
+            </div>
+          ))}
+          {!sug.length && <div class="none">{strict ? 'no match' : 'no match — press Enter to add anyway'}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Edit an AccessPolicy as four pill lists with backend-completed typeahead. */
+function AccessEditor({ value, onSave }: { value: any; onSave: (p: any) => void }) {
+  const [p, setP] = useState<any>({
+    allowed_models: value.allowed_models || [],
+    denied_models: value.denied_models || [],
+    allowed_providers: value.allowed_providers || [],
+    denied_providers: value.denied_providers || [],
+  });
+  const field = (k: string, kind: string, label: string, note: string) => (
+    <div class="fld">
+      <span class="lbl">{label} — {note}</span>
+      <TokenInput kind={kind} value={p[k]} placeholder={'add a ' + kind}
+                  onChange={(v) => setP((s: any) => ({ ...s, [k]: v }))} />
+    </div>
+  );
+  return (
+    <div style="margin-top:6px">
+      <div class="grid2">
+        {field('allowed_models', 'model', 'allowed models', 'empty means every model')}
+        {field('denied_models', 'model', 'denied models', 'always wins')}
+        {field('allowed_providers', 'provider', 'allowed providers', 'empty means every provider')}
+        {field('denied_providers', 'provider', 'denied providers', 'always wins')}
+      </div>
+      <button class="btn" style="margin-top:10px" onClick={() => onSave(p)}>Save access</button>
     </div>
   );
 }
@@ -446,21 +527,25 @@ function UserDetail({ id, me }: { id: string; me: Me }) {
 
 function TeamMembers({ teamId, users }: { teamId: string; users: any[] }) {
   const [{ data }, reload] = useAsync<any[]>(() => api('/teams/' + teamId + '/members'), [teamId]);
-  const [uid, setUid] = useState('');
   const name = (id: string) => (users.find((u) => u.id === id) || {}).username || id;
-  const add = async () => { if (uid) { await api('/teams/' + teamId + '/members', { method: 'POST', body: { user_id: uid } }); setUid(''); reload(); } };
-  const del = async (id: string) => { await api('/teams/' + teamId + '/members/' + id, { method: 'DELETE' }); reload(); };
+  const current = (data || []).map((m: any) => m.user_id);
+  // The pill list is the desired membership; diffing it against the current
+  // rows lets adding a pill and removing one both flow through a single path.
+  const sync = async (next: string[]) => {
+    for (const id of next.filter((x) => !current.includes(x))) {
+      await api('/teams/' + teamId + '/members', { method: 'POST', body: { user_id: id } });
+    }
+    for (const id of current.filter((x) => !next.includes(x))) {
+      await api('/teams/' + teamId + '/members/' + id, { method: 'DELETE' });
+    }
+    reload();
+  };
   return (
     <Fragment>
-      <div class="mut" style="margin-top:8px">members:</div>
-      <div class="row" style="margin-top:4px">
-        {(data || []).map((m) => <span key={m.id} class="pill">{name(m.user_id)} <a onClick={() => del(m.user_id)} style="cursor:pointer;color:var(--bad)">×</a></span>)}
-        {(!data || !data.length) && <span class="mut">none</span>}
-      </div>
-      <div class="row" style="margin-top:8px">
-        <select value={uid} onChange={(e: any) => setUid(e.target.value)}><option value="">— user —</option>{users.map((u) => <option value={u.id}>{u.username}</option>)}</select>
-        <button class="ghost" onClick={add}>add member</button>
-      </div>
+      <h3 style="margin:14px 0 4px;font-size:14px">Members <span class="mut">(saved as you edit)</span></h3>
+      {/* strict: a pill holds a user id, so a hand-typed name would be meaningless. */}
+      <TokenInput kind="user" strict value={current} labelFor={name}
+                  onChange={sync} placeholder="add a member" />
     </Fragment>
   );
 }
@@ -501,7 +586,7 @@ function TeamDetail({ id }: { id: string }) {
       <div class="row"><h2 style="margin:0">Team <span class="mono">{t ? t.name : id}</span></h2><span class="sp" style="flex:1"></span>
         <button class="ghost del" onClick={del}>delete team</button></div>
       <h3 style="margin:14px 0 4px;font-size:14px">Model access <span class="mut">(deny wins; allow-list = ceiling)</span></h3>
-      {t && <AccessEditor value={t.access || {}} onSave={saveAccess} />}
+      {t && <AccessEditor key={id} value={t.access || {}} onSave={saveAccess} />}
       <TeamMembers teamId={id} users={users.data || []} />
       <BudgetEditor subjectType="team" subjectId={id} />
     </div>

@@ -590,3 +590,145 @@ async fn invite_provisions_local_user_with_role_and_password_create_is_blocked()
         .await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+// ---------------------------------------------------------------------------
+// Typeahead completion (`GET /complete`) behind the console's pill editors
+// ---------------------------------------------------------------------------
+
+/// Seed a deployment row so `/complete?kind=model` has something to find.
+async fn seed_dep(store: &dyn Store, model_name: &str, provider: &str) {
+    let dep = yb_core::DeploymentRecord {
+        id: new_id(),
+        model_name: model_name.into(),
+        provider: provider.into(),
+        upstream_model: model_name.into(),
+        api_base: None,
+        api_key: None,
+        upstream_format: WireFormat::OpenaiChat.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+        extra: Default::default(),
+        created_at: now(),
+        updated_at: now(),
+        deleted_at: None,
+    };
+    store.create_deployment(&dep).await.unwrap();
+}
+
+/// Log `user_id` in by minting a session row directly, returning the cookie
+/// header value — cheaper than driving the password login for an authz test.
+async fn session_cookie(store: &dyn Store, user_id: &str) -> String {
+    let token = new_id();
+    store
+        .create_session(&yb_core::model::Session {
+            token: token.clone(),
+            user_id: user_id.to_string(),
+            created_at: now(),
+            expires_at: now() + chrono::Duration::seconds(3600),
+        })
+        .await
+        .unwrap();
+    format!("yb_session={token}")
+}
+
+async fn get_json(app: &axum::Router, uri: &str, cookie: &str) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, v)
+}
+
+#[tokio::test]
+async fn complete_suggests_models_and_providers_that_exist() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "gpt-4o", "openai").await;
+    seed_dep(store.as_ref(), "gpt-4o", "azure").await;
+    seed_dep(store.as_ref(), "claude-sonnet", "anthropic").await;
+    // Four aliases, one more than a hint names before it summarizes the rest.
+    for alias in ["smart", "sonnet", "default", "big"] {
+        store
+            .upsert_alias(&yb_core::model::ModelAlias {
+                alias: alias.into(),
+                target: "claude-sonnet".into(),
+                created_at: now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    // The seeded user is a plain member — reading the catalog is enough.
+    let user = store.list_users().await.unwrap().pop().unwrap();
+    let cookie = session_cookie(store.as_ref(), &user.id).await;
+    let app = build_router(state);
+
+    // Empty query: everything, alphabetical, deduped across deployments. Note
+    // `my-model` is absent — `setup` puts it in the in-memory router only, and
+    // completion answers from the persisted deployment list, which is what an
+    // access policy is actually evaluated against.
+    let (status, v) = get_json(&app, "/admin/v1/complete?kind=model", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = v.as_array().unwrap().iter().map(|s| s["value"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["claude-sonnet", "gpt-4o"]);
+    // Both providers of gpt-4o show up as a hint; the alias annotates its target.
+    let hint = |name: &str| -> String {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["value"] == name)
+            .unwrap()["hint"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(hint("gpt-4o"), "azure, openai");
+    assert_eq!(
+        hint("claude-sonnet"),
+        "anthropic \u{b7} aka big, default, smart +1 more"
+    );
+
+    // Prefix filtering is case-insensitive.
+    let (_, v) = get_json(&app, "/admin/v1/complete?kind=model&q=GPT", &cookie).await;
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["value"], "gpt-4o");
+
+    // An alias finds its model, but the suggested value stays canonical — an
+    // access policy is matched against the model name, never the alias.
+    let (_, v) = get_json(&app, "/admin/v1/complete?kind=model&q=smart", &cookie).await;
+    assert_eq!(v[0]["value"], "claude-sonnet");
+
+    // Providers are distinct, with a deployment count as the hint.
+    let (_, v) = get_json(&app, "/admin/v1/complete?kind=provider", &cookie).await;
+    let provs: Vec<&str> = v.as_array().unwrap().iter().map(|s| s["value"].as_str().unwrap()).collect();
+    assert_eq!(provs, vec!["anthropic", "azure", "openai"]);
+    assert_eq!(v[0]["hint"], "1 deployment");
+
+    // Completing the user list is member-forbidden: it discloses the accounts.
+    let (status, _) = get_json(&app, "/admin/v1/complete?kind=user", &cookie).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // An unknown vocabulary is a request error, not an empty list.
+    let (status, v) = get_json(&app, "/admin/v1/complete?kind=nope", &cookie).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(v["error"]["message"].as_str().unwrap().contains("nope"));
+}
+
+#[tokio::test]
+async fn complete_requires_a_session() {
+    let (state, _token) = setup().await;
+    let app = build_router(state);
+    let (status, _) = get_json(&app, "/admin/v1/complete?kind=model", "yb_session=bogus").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

@@ -44,6 +44,28 @@
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .pill { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--mut); }
   .pill.admin { color:var(--acc); border-color:var(--acc); }
+  /* Token/pill input with a typeahead dropdown (see TokenInput in main.tsx). */
+  .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:10px; }
+  .fld { display:block; }
+  .fld > .lbl { display:block; font-size:11px; color:var(--mut); margin-bottom:4px; }
+  .ac-wrap { position:relative; }
+  .tok { display:flex; flex-wrap:wrap; gap:5px; align-items:center; min-height:36px; cursor:text;
+         background:var(--panel2); border:1px solid var(--line); border-radius:7px; padding:5px 6px; }
+  .tok:focus-within { border-color:var(--acc); }
+  .tok input { flex:1; min-width:96px; border:none; background:none; padding:2px 3px; outline:none; }
+  .tok .pill { display:inline-flex; align-items:center; gap:4px; font-size:12px; padding:2px 3px 2px 9px;
+               color:var(--fg); background:var(--panel); }
+  .tok .pill button { border:none; background:none; color:var(--mut); cursor:pointer; font:inherit;
+                      line-height:1; padding:1px 5px; border-radius:999px; }
+  .tok .pill button:hover { color:var(--bad); background:var(--panel2); }
+  .ac { position:absolute; left:0; right:0; top:calc(100% + 4px); z-index:30; max-height:220px; overflow:auto;
+        background:var(--panel2); border:1px solid var(--line); border-radius:7px; box-shadow:0 8px 24px rgba(0,0,0,.3); }
+  .ac .opt { display:flex; gap:10px; align-items:baseline; padding:6px 10px; cursor:pointer; font-size:13px; }
+  .ac .opt.on { background:var(--acc); color:var(--acc-fg); }
+  .ac .opt .mut { margin-left:auto; font-size:11px; text-align:right; max-width:60%;
+                  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ac .opt.on .mut { color:var(--acc-fg); opacity:.8; }
+  .ac .none { padding:6px 10px; font-size:12px; color:var(--mut); }
   .err { color:var(--bad); }
   .login { max-width:380px; margin:12vh auto; }
   .token { background:var(--token-bg); border:1px solid var(--token-line); color:var(--token-fg); padding:10px; border-radius:8px; word-break:break-all; }

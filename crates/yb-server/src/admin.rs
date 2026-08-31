@@ -24,6 +24,7 @@ use axum::routing::{delete, get, post, put};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 use yb_core::config::AuthProvider;
@@ -81,6 +82,8 @@ pub fn router() -> Router<AppState> {
         // budgets
         .route("/budgets", get(list_budgets).put(put_budget))
         .route("/budgets/:id", delete(delete_budget))
+        // typeahead completion for the console's pill editors
+        .route("/complete", get(complete))
         // spend
         .route("/spend", get(spend))
 }
@@ -233,6 +236,17 @@ fn respond_unit(r: yb_core::Result<()>) -> Response {
 }
 
 // ---- query / body DTOs ---------------------------------------------------
+
+/// `GET /complete` query: which vocabulary to complete, the (optional) prefix
+/// typed so far, and how many suggestions to return.
+#[derive(Deserialize)]
+struct CompleteQuery {
+    kind: String,
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
 
 #[derive(Deserialize)]
 struct SubjectQuery {
@@ -1015,6 +1029,172 @@ async fn delete_alias(
         return error_response(&e);
     }
     respond(Ok(json!({ "deleted": alias })))
+}
+
+// ---- typeahead completion ------------------------------------------------
+
+/// How many of a model's aliases a suggestion names before summarizing the rest.
+const ALIAS_HINT_MAX: usize = 3;
+
+/// One typeahead suggestion. `value` is what the console stores (a model name,
+/// a provider name, a user id); `label` is what it shows; `hint` is secondary
+/// context that helps disambiguate but is never stored.
+#[derive(Serialize)]
+struct Suggestion {
+    value: String,
+    label: String,
+    hint: String,
+}
+
+/// Rank `hay` against an already-lowercased `needle`: exact, prefix, substring,
+/// or no match. An empty needle matches everything at the lowest rank, so an
+/// unfiltered dropdown still opens with the alphabetical head of the list.
+fn rank(hay: &str, needle: &str) -> Option<u8> {
+    if needle.is_empty() {
+        return Some(3);
+    }
+    let h = hay.to_lowercase();
+    if h == needle {
+        Some(0)
+    } else if h.starts_with(needle) {
+        Some(1)
+    } else if h.contains(needle) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// `GET /complete?kind=…&q=…&limit=…` — suggest values that actually exist.
+///
+/// Backs the console's pill editors (access policies, team membership) so an
+/// operator picks a real model, provider, or user rather than typing a string
+/// that silently matches nothing. Matching is case-insensitive and ranked
+/// exact → prefix → substring, then alphabetical; an empty `q` returns the head
+/// of the list so clicking the field is enough to browse.
+///
+/// `model` deliberately suggests **canonical** model names, because that is what
+/// an [`AccessPolicy`] is matched against — aliases resolve to their target
+/// before the policy check, so offering an alias as a value would create a rule
+/// that never fires. Aliases still appear, as a hint on their target's row.
+///
+/// Authorization tracks what each list already discloses: `model` and
+/// `provider` restate `GET /models`, which any member may read, while `user`
+/// exposes the account list and keeps the `ManageMembers` bar.
+async fn complete(
+    principal: Principal,
+    State(state): State<AppState>,
+    Query(q): Query<CompleteQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+    let needle = q.q.trim().to_lowercase();
+    let mut hits: Vec<(u8, Suggestion)> = Vec::new();
+
+    match q.kind.as_str() {
+        "model" | "provider" => {
+            if let Err(r) = authz(&principal, Action::ReadCatalog) {
+                return r;
+            }
+            let deps = match state.store.list_deployments().await {
+                Ok(d) => d,
+                Err(e) => return error_response(&e),
+            };
+            if q.kind == "provider" {
+                // Distinct providers, hinted with how many deployments back them.
+                let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+                for d in &deps {
+                    *counts.entry(d.provider.clone()).or_default() += 1;
+                }
+                for (provider, n) in counts {
+                    if let Some(r) = rank(&provider, &needle) {
+                        let hint = format!("{n} deployment{}", if n == 1 { "" } else { "s" });
+                        hits.push((
+                            r,
+                            Suggestion {
+                                label: provider.clone(),
+                                value: provider,
+                                hint,
+                            },
+                        ));
+                    }
+                }
+            } else {
+                let aliases = state.store.list_aliases().await.unwrap_or_default();
+                let mut by_model: BTreeMap<String, (BTreeSet<String>, Vec<String>)> =
+                    BTreeMap::new();
+                for d in &deps {
+                    by_model
+                        .entry(d.model_name.clone())
+                        .or_default()
+                        .0
+                        .insert(d.provider.clone());
+                }
+                for a in &aliases {
+                    if let Some(e) = by_model.get_mut(&a.target) {
+                        e.1.push(a.alias.clone());
+                    }
+                }
+                for (model, (providers, mut names)) in by_model {
+                    // An alias is a legitimate way to *find* a model, so match on
+                    // it too — but the suggested value stays the canonical name.
+                    let r = rank(&model, &needle).or_else(|| {
+                        names.iter().filter_map(|a| rank(a, &needle)).min()
+                    });
+                    let Some(r) = r else { continue };
+                    names.sort();
+                    let mut hint = providers.into_iter().collect::<Vec<_>>().join(", ");
+                    if !names.is_empty() {
+                        // A popular model can carry dozens of aliases; a dropdown
+                        // row has space for a reminder, not the whole list.
+                        let shown = names.len().min(ALIAS_HINT_MAX);
+                        hint.push_str(" · aka ");
+                        hint.push_str(&names[..shown].join(", "));
+                        if names.len() > shown {
+                            hint.push_str(&format!(" +{} more", names.len() - shown));
+                        }
+                    }
+                    hits.push((
+                        r,
+                        Suggestion {
+                            label: model.clone(),
+                            value: model,
+                            hint,
+                        },
+                    ));
+                }
+            }
+        }
+        "user" => {
+            if let Err(r) = authz(&principal, Action::ManageMembers) {
+                return r;
+            }
+            let users = match state.store.list_users().await {
+                Ok(u) => u,
+                Err(e) => return error_response(&e),
+            };
+            for u in users {
+                if let Some(r) = rank(&u.username, &needle) {
+                    hits.push((
+                        r,
+                        Suggestion {
+                            value: u.id,
+                            label: u.username,
+                            hint: u.role.as_str().to_string(),
+                        },
+                    ));
+                }
+            }
+        }
+        other => {
+            return error_response(&Error::BadRequest(format!(
+                "unknown completion kind {other:?} (expected model, provider, or user)"
+            )))
+        }
+    }
+
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.label.cmp(&b.1.label)));
+    hits.truncate(limit);
+    Json(hits.into_iter().map(|(_, s)| s).collect::<Vec<_>>()).into_response()
 }
 
 // ---- keys ----------------------------------------------------------------
