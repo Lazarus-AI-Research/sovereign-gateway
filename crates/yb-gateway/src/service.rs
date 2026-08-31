@@ -602,6 +602,22 @@ impl RecordCtx {
             .or_else(|| builtin_price(&self.deployment.model_name))
             .unwrap_or_else(|| ModelPrice::new(0.0, 0.0));
 
+        // A successful turn that reports no tokens is billed at zero and is
+        // invisible to spend tracking. That is always an upstream or translation
+        // fault, never a real result, so say so loudly rather than quietly
+        // writing a zero row — this is how a whole provider silently stops
+        // billing (an OpenAI-compatible stream omits usage entirely unless
+        // `stream_options.include_usage` is set, for instance).
+        if !is_error && (200..300).contains(&status) && usage.is_empty() {
+            tracing::warn!(
+                provider = %self.deployment.provider,
+                model = %self.deployment.model_name,
+                upstream_model = %self.deployment.upstream_model,
+                request_id = %self.request_id,
+                "upstream reported no token usage; this turn is recorded as unbilled"
+            );
+        }
+
         let input = usage.input_tokens as i64;
         let output = usage.output_tokens as i64;
         let cache_read = usage.cache_read_tokens as i64;
@@ -692,10 +708,7 @@ impl RecordCtx {
 /// Field-wise max merge of a usage delta into the running total. Works whether a
 /// format reports usage incrementally or cumulatively.
 fn merge_usage(acc: &mut Usage, u: &Usage) {
-    acc.input_tokens = acc.input_tokens.max(u.input_tokens);
-    acc.output_tokens = acc.output_tokens.max(u.output_tokens);
-    acc.cache_read_tokens = acc.cache_read_tokens.max(u.cache_read_tokens);
-    acc.cache_write_tokens = acc.cache_write_tokens.max(u.cache_write_tokens);
+    acc.merge(u);
 }
 
 /// Maximum silence between upstream stream chunks before the turn is treated as

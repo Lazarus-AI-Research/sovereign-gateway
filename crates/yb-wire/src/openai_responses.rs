@@ -535,7 +535,13 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
         }],
         Some("response.completed") | Some("response.incomplete") => {
             let mut out = Vec::new();
-            if let Some(u) = v.get("response").and_then(|r| r.get("usage")) {
+            // An interim `response.*` event can carry `"usage": null`; parsing
+            // that would push an all-zero delta over a real one.
+            if let Some(u) = v
+                .get("response")
+                .and_then(|r| r.get("usage"))
+                .filter(|u| !u.is_null())
+            {
                 out.push(StreamEvent::UsageDelta { usage: parse_usage(Some(u)) });
             }
             out.push(StreamEvent::Done {
@@ -647,7 +653,9 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
                         "item_id": id, "output_index": index, "delta": partial_json}));
                 }
             }
-            StreamEvent::UsageDelta { usage } => state.usage = Some(*usage),
+            StreamEvent::UsageDelta { usage } => {
+                state.usage.get_or_insert_default().merge(usage);
+            }
             StreamEvent::Done { .. } => {
                 close_open(&mut out, state);
                 let resp = state.response_obj("completed", json!(state.done_items.clone()));

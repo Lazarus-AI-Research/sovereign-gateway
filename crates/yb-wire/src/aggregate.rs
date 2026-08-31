@@ -60,14 +60,7 @@ impl Aggregator {
                     t.json.push_str(partial_json);
                 }
             }
-            StreamEvent::UsageDelta { usage } => {
-                self.usage.input_tokens = self.usage.input_tokens.max(usage.input_tokens);
-                self.usage.output_tokens = self.usage.output_tokens.max(usage.output_tokens);
-                self.usage.cache_read_tokens =
-                    self.usage.cache_read_tokens.max(usage.cache_read_tokens);
-                self.usage.cache_write_tokens =
-                    self.usage.cache_write_tokens.max(usage.cache_write_tokens);
-            }
+            StreamEvent::UsageDelta { usage } => self.usage.merge(usage),
             StreamEvent::Done { stop_reason } => self.stop_reason = Some(stop_reason.clone()),
         }
     }
