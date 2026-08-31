@@ -444,7 +444,7 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
             let mut out = vec![StreamEvent::MessageStart {
                 model: opt_str(msg, "model").unwrap_or_default().to_string(),
             }];
-            if let Some(u) = msg.get("usage") {
+            if let Some(u) = msg.get("usage").filter(|u| !u.is_null()) {
                 out.push(StreamEvent::UsageDelta { usage: parse_usage(Some(u)) });
             }
             out
@@ -555,17 +555,9 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
             }
             StreamEvent::UsageDelta { usage } => {
                 // Anthropic reports input tokens once (on message_start) and
-                // output tokens cumulatively; accumulate the latest values.
-                if usage.input_tokens > 0 {
-                    state.usage.input_tokens = usage.input_tokens;
-                }
-                if usage.output_tokens > 0 {
-                    state.usage.output_tokens = usage.output_tokens;
-                }
-                state.usage.cache_read_tokens =
-                    state.usage.cache_read_tokens.max(usage.cache_read_tokens);
-                state.usage.cache_write_tokens =
-                    state.usage.cache_write_tokens.max(usage.cache_write_tokens);
+                // output tokens cumulatively, so the largest report per field is
+                // the turn's total — see [`Usage::merge`].
+                state.usage.merge(usage);
             }
             StreamEvent::Done { stop_reason } => {
                 ensure_started(&mut out, state);

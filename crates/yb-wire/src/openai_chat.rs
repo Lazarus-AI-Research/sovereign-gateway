@@ -133,6 +133,13 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     }
     if opts.stream {
         body.insert("stream".into(), json!(true));
+        // An OpenAI-compatible server sends no usage at all in streaming mode
+        // unless this is set — the token counts simply never arrive. The gateway
+        // always streams upstream (it aggregates for non-streaming clients), so
+        // without this every request through a Chat Completions upstream would
+        // bill and report zero. Asking for usage costs nothing when the server
+        // would have sent it anyway.
+        body.insert("stream_options".into(), json!({"include_usage": true}));
     }
 
     let effort = opts
@@ -637,7 +644,9 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
                     None,
                 );
             }
-            StreamEvent::UsageDelta { usage } => state.usage = Some(*usage),
+            StreamEvent::UsageDelta { usage } => {
+                state.usage.get_or_insert_default().merge(usage);
+            }
             StreamEvent::Done { stop_reason } => {
                 ensure_started(&mut out, state);
                 write_chunk(&mut out, state, json!({}), Some(stop_to_finish(stop_reason)));
@@ -670,4 +679,59 @@ fn write_chunk(out: &mut String, state: &EmitState, delta: Value, finish_reason:
     out.push_str("data: ");
     out.push_str(&chunk.to_string());
     out.push_str("\n\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::ChatRequest;
+
+    fn emit(stream: bool) -> Value {
+        let opts = EmitOptions { stream, ..EmitOptions::new("m") };
+        let (body, _) = emit_request(&ChatRequest::default(), &opts).unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[test]
+    fn a_streaming_request_asks_for_usage() {
+        // An OpenAI-compatible server reports no tokens at all in streaming mode
+        // unless `stream_options.include_usage` is set. The gateway always
+        // streams upstream, so omitting this silently zeroes every token count
+        // and every cost derived from one.
+        let v = emit(true);
+        assert_eq!(v["stream"], json!(true));
+        assert_eq!(v["stream_options"]["include_usage"], json!(true));
+
+        // A non-streaming body must not carry the option: the field is only
+        // meaningful alongside `stream`, and strict servers reject it without.
+        let v = emit(false);
+        assert!(v.get("stream").is_none());
+        assert!(v.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn usage_survives_a_chunk_that_carries_no_choices() {
+        // The usage chunk arrives last, after the chunk bearing `finish_reason`,
+        // and carries an empty `choices` array. Parsing must not skip it.
+        let line = r#"data: {"choices":[],"usage":{"prompt_tokens":41,"completion_tokens":30}}"#;
+        let events = decode_sse(line, &mut SseState::default());
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::UsageDelta { usage } => Some(*usage),
+            _ => None,
+        });
+        let usage = usage.expect("a usage-only chunk yields a UsageDelta");
+        assert_eq!(usage.input_tokens, 41);
+        assert_eq!(usage.output_tokens, 30);
+    }
+
+    #[test]
+    fn a_null_usage_field_yields_no_delta() {
+        // Some servers put `"usage": null` on interim chunks. Parsing that as a
+        // report would push an all-zero delta.
+        let line = r#"data: {"choices":[],"usage":null}"#;
+        let events = decode_sse(line, &mut SseState::default());
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::UsageDelta { .. })));
+    }
 }

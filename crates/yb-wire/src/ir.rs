@@ -265,6 +265,34 @@ pub struct Usage {
     pub cache_write_tokens: u32,
 }
 
+impl Usage {
+    /// Fold another report into this one, keeping the larger count per field.
+    ///
+    /// Upstreams report usage in different rhythms: Anthropic sends input once
+    /// and output cumulatively, Gemini repeats a growing total on every chunk,
+    /// and an OpenAI stream sends one final tally — but several also emit
+    /// interim events carrying a null or zeroed usage object. Taking the
+    /// maximum makes every one of those orders converge on the true total, and
+    /// makes a stray zero incapable of erasing a real count.
+    pub fn merge(&mut self, other: &Usage) {
+        self.input_tokens = self.input_tokens.max(other.input_tokens);
+        self.output_tokens = self.output_tokens.max(other.output_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
+    }
+
+    /// Whether any token was reported at all.
+    ///
+    /// A 200 with nothing here means the turn is unbilled and invisible to spend
+    /// tracking, which is worth surfacing rather than silently recording zero.
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_write_tokens == 0
+    }
+}
+
 /// A single normalized streaming event. Translators decode upstream SSE into a
 /// sequence of these and re-encode them into the client's native SSE dialect.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -284,4 +312,31 @@ pub enum StreamEvent {
     UsageDelta { usage: Usage },
     /// Stream finished with a stop reason.
     Done { stop_reason: StopReason },
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::Usage;
+
+    #[test]
+    fn merging_keeps_the_largest_report_per_field() {
+        let mut u = Usage::default();
+        assert!(u.is_empty());
+
+        // Anthropic's rhythm: input once, output growing.
+        u.merge(&Usage { input_tokens: 41, output_tokens: 0, ..Default::default() });
+        u.merge(&Usage { input_tokens: 41, output_tokens: 30, ..Default::default() });
+        assert_eq!((u.input_tokens, u.output_tokens), (41, 30));
+        assert!(!u.is_empty());
+
+        // A trailing zeroed report must not erase a real count — this is the
+        // failure that silently zeroes a turn's bill.
+        u.merge(&Usage::default());
+        assert_eq!((u.input_tokens, u.output_tokens), (41, 30));
+
+        // Cache fields fold the same way.
+        u.merge(&Usage { cache_read_tokens: 7, ..Default::default() });
+        u.merge(&Usage { cache_read_tokens: 0, cache_write_tokens: 3, ..Default::default() });
+        assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (7, 3));
+    }
 }

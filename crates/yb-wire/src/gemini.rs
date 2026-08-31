@@ -408,7 +408,7 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
             }
         }
         if let Some(reason) = opt_str(candidate, "finishReason") {
-            if let Some(u) = v.get("usageMetadata") {
+            if let Some(u) = v.get("usageMetadata").filter(|u| !u.is_null()) {
                 out.push(StreamEvent::UsageDelta { usage: parse_usage(Some(u)) });
             }
             out.push(StreamEvent::Done {
@@ -470,7 +470,9 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
                     args.push_str(partial_json);
                 }
             }
-            StreamEvent::UsageDelta { usage } => state.usage = Some(*usage),
+            StreamEvent::UsageDelta { usage } => {
+                state.usage.get_or_insert_default().merge(usage);
+            }
             StreamEvent::Done { stop_reason } => {
                 state.flush_tool(&mut out);
                 let u = state.usage.unwrap_or_default();
