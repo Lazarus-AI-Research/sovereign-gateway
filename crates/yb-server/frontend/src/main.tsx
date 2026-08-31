@@ -51,6 +51,38 @@ const uuid = () => (crypto as any).randomUUID();
 const nowIso = () => new Date().toISOString();
 const isUnrestricted = (a: any) => !a || !(a.allowed_models?.length || a.denied_models?.length || a.allowed_providers?.length || a.denied_providers?.length);
 
+/**
+ * How a key's access reads once its team is taken into account.
+ *
+ * The key's own policy is only half the answer: at request time the gateway
+ * merges it with the team's (deny wins, allow-lists intersect), so a key with
+ * an empty policy inside a restricted team is not unrestricted at all — it
+ * inherits the team's ceiling. Calling that "unrestricted", as this column
+ * used to, is the one reading that is never true.
+ *
+ * `team` is undefined for a member, who cannot list teams; inheritance still
+ * applies, so the label says the team is involved and the tooltip admits the
+ * policy itself isn't visible.
+ */
+const accessLabel = (key: any, team: any): { text: string; title: string } => {
+  const k = !isUnrestricted(key.access);
+  if (!key.team_id) {
+    return k
+      ? { text: 'restricted', title: 'limited by this key\u2019s own policy' }
+      : { text: 'unrestricted', title: 'every model and provider' };
+  }
+  if (!team) {
+    return k
+      ? { text: 'key + team', title: 'this key\u2019s policy, narrowed by its team\u2019s (not visible to you)' }
+      : { text: 'team', title: 'inherited from the team (policy not visible to you)' };
+  }
+  const t = !isUnrestricted(team.access);
+  if (k && t) return { text: 'key + team', title: 'this key\u2019s policy, narrowed by ' + team.name + '\u2019s' };
+  if (k) return { text: 'restricted', title: 'limited by this key\u2019s own policy; ' + team.name + ' adds nothing' };
+  if (t) return { text: 'team', title: 'inherited from ' + team.name + ' \u2014 this key adds no limits of its own' };
+  return { text: 'unrestricted', title: 'every model and provider' };
+};
+
 type Me = { username: string; role: string };
 
 function Login({ onAuth }: { onAuth: () => void }) {
@@ -638,10 +670,13 @@ function Keys({ admin }: { admin: boolean }) {
               <td>{k.name || '—'}{(k.scopes || []).includes('admin') && <span class="pill admin" style="margin-left:6px">admin</span>}</td><td class="mono">{k.key_prefix}…{k.key_suffix}</td>
               <td class="mut">{k.team_id ? teamName(k.team_id) : '—'}</td>
               {admin && <td class="mut">{userName(k.owner_user_id)}</td>}
-              <td class="mut">{isUnrestricted(k.access) ? 'unrestricted' : 'restricted'}</td>
+              <td class="mut">{(() => {
+                const l = accessLabel(k, (teams.data || []).find((t) => t.id === k.team_id));
+                return <span title={l.title}>{l.text}</span>;
+              })()}</td>
               <td class="row"><button class="ghost" onClick={() => setEditing(editing === k.id ? '' : k.id)}>access</button><button class="ghost del" onClick={() => del(k.id)}>revoke</button></td>
             </tr>
-            {editing === k.id && <tr><td colSpan={admin ? 6 : 5}><AccessEditor value={k.access || {}} onSave={(p) => saveAccess(k.id, p)} /></td></tr>}
+            {editing === k.id && <tr><td colSpan={admin ? 6 : 5}><AccessEditor key={k.id} value={k.access || {}} onSave={(p) => saveAccess(k.id, p)} /></td></tr>}
           </Fragment>
         ))}</tbody>
       </table>

@@ -33,7 +33,7 @@ use yb_core::config::DeploymentMode;
 use yb_core::principal::KeyAuth;
 use yb_core::ratelimit::Limits;
 use yb_core::spend::{BudgetAction, SubjectType};
-use yb_core::{EmbedFormat, UpstreamFormat, new_id, now, Error, WireFormat};
+use yb_core::{AccessPolicy, EmbedFormat, UpstreamFormat, new_id, now, Error, WireFormat};
 use yb_gateway::{GatewayResponse, RequestCtx};
 
 pub use state::AppState;
@@ -136,13 +136,63 @@ async fn metrics(State(state): State<AppState>) -> Response {
     }
 }
 
-/// The distinct public model names currently configured (from the DB
-/// deployments), in stable order. Discovery endpoints render these per shape.
-async fn model_names(state: &AppState) -> Vec<String> {
+/// Effective model/provider access for a caller: the key's own grant merged
+/// with its team's (deny wins; a non-empty allow list is a ceiling). This is
+/// what grants access "by team".
+///
+/// Discovery and inference must not compute this differently — a catalog built
+/// from the key's grant alone would advertise everything the team forbids, so
+/// both paths share this one function.
+async fn effective_access(state: &AppState, keyauth: &KeyAuth) -> AccessPolicy {
+    let mut access = keyauth.api_key.access.clone();
+    if let Some(team_id) = &keyauth.api_key.team_id {
+        if let Ok(Some(team)) = state.store.get_team(team_id).await {
+            access = access.merge(&team.access);
+        }
+    }
+    access
+}
+
+/// The effective access policy behind a discovery request: the caller's key
+/// merged with its team's, exactly as the inference path computes it.
+///
+/// Discovery used to take no credential at all. It cannot both stay that way
+/// and be filtered — "the models this caller may see" is undefined without
+/// knowing who is asking, and leaving the anonymous path unfiltered would
+/// invert the protection: a restricted key would see one model while anyone
+/// with no key at all still read the full catalog. So a model list now costs
+/// the same credential as a completion, and answers with the same policy.
+async fn discovery_access(state: &AppState, headers: &HeaderMap) -> Result<AccessPolicy, Error> {
+    let Some(token) = bearer_token(headers) else {
+        return Err(Error::Unauthorized("missing bearer credential".into()));
+    };
+    let Some(keyauth) = state.store.verify_api_key(&hex_sha256(&token)).await? else {
+        return Err(Error::Unauthorized("invalid api key".into()));
+    };
+    if !keyauth.api_key.has_scope(yb_core::KeyScope::Inference) {
+        return Err(Error::Forbidden(
+            "this key lacks the inference scope".into(),
+        ));
+    }
+    Ok(effective_access(state, &keyauth).await)
+}
+
+/// The distinct public model names `access` can actually reach, in stable
+/// order. Discovery endpoints render these per shape.
+///
+/// A model is listed only if at least one of its deployments survives the
+/// policy whole — both the model name and that deployment's provider — which
+/// is the same test [`yb_gateway`] applies when picking an upstream. Checking
+/// only the model name would keep advertising a model whose sole provider is
+/// denied, and every call to it would come back "no eligible provider".
+async fn model_names(state: &AppState, access: &AccessPolicy) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     let mut names = Vec::new();
     if let Ok(deployments) = state.store.list_deployments().await {
         for d in deployments {
+            if !access.permits_model(&d.model_name) || !access.permits_provider(&d.provider) {
+                continue;
+            }
             if seen.insert(d.model_name.clone()) {
                 names.push(d.model_name);
             }
@@ -152,18 +202,26 @@ async fn model_names(state: &AppState) -> Vec<String> {
 }
 
 /// `GET /v1/models` and `/openai/v1/models` — OpenAI-shaped model list.
-async fn models_openai(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let data: Vec<_> = model_names(&state)
+async fn models_openai(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let access = match discovery_access(&state, &headers).await {
+        Ok(a) => a,
+        Err(e) => return error_response(&e),
+    };
+    let data: Vec<_> = model_names(&state, &access)
         .await
         .into_iter()
         .map(|id| json!({ "id": id, "object": "model", "created": 0, "owned_by": "gateway" }))
         .collect();
-    Json(json!({ "object": "list", "data": data }))
+    Json(json!({ "object": "list", "data": data })).into_response()
 }
 
 /// `GET /anthropic/v1/models` — Anthropic-shaped model list.
-async fn models_anthropic(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let ids = model_names(&state).await;
+async fn models_anthropic(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let access = match discovery_access(&state, &headers).await {
+        Ok(a) => a,
+        Err(e) => return error_response(&e),
+    };
+    let ids = model_names(&state, &access).await;
     let data: Vec<_> = ids
         .iter()
         .map(|id| json!({ "type": "model", "id": id, "display_name": id, "created_at": "1970-01-01T00:00:00Z" }))
@@ -174,11 +232,12 @@ async fn models_anthropic(State(state): State<AppState>) -> Json<serde_json::Val
         "first_id": ids.first(),
         "last_id": ids.last(),
     }))
+    .into_response()
 }
 
 /// `GET /v1beta/models` and `/gemini/v1beta/models` — Gemini-shaped model list.
-async fn models_gemini(state: &AppState) -> serde_json::Value {
-    let models: Vec<_> = model_names(state)
+async fn models_gemini(state: &AppState, access: &AccessPolicy) -> serde_json::Value {
+    let models: Vec<_> = model_names(state, access)
         .await
         .into_iter()
         .map(|id| {
@@ -194,23 +253,43 @@ async fn models_gemini(state: &AppState) -> serde_json::Value {
 
 /// `GET /v1beta/*path` — Gemini discovery. Handles `models` (list); any other
 /// GET shape is reported as not-found.
-async fn gemini_models(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+async fn gemini_models(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let p = path.trim_end_matches('/');
-    if p == "models" || p == "v1beta/models" {
-        return Json(models_gemini(&state).await).into_response();
+    let is_list = p == "models" || p == "v1beta/models";
+    let single = p.strip_prefix("models/").filter(|id| !id.contains(':'));
+    if !is_list && single.is_none() {
+        return error_response(&Error::NotFound(format!(
+            "Gemini discovery path /v1beta/{path}"
+        )));
     }
-    // A single-model GET (`models/<id>`) — return that model if configured.
-    if let Some(id) = p.strip_prefix("models/") {
-        if !id.contains(':') && model_names(&state).await.iter().any(|m| m == id) {
-            return Json(json!({
-                "name": format!("models/{id}"),
-                "baseModelId": id,
-                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
-            }))
-            .into_response();
-        }
+    // Resolve the caller only once a shape is recognised, so an unknown path
+    // still reads as not-found rather than as an authentication problem.
+    let access = match discovery_access(&state, &headers).await {
+        Ok(a) => a,
+        Err(e) => return error_response(&e),
+    };
+    if is_list {
+        return Json(models_gemini(&state, &access).await).into_response();
     }
-    error_response(&Error::NotFound(format!("Gemini discovery path /v1beta/{path}")))
+    // A single-model GET (`models/<id>`) — return it only if it is one this
+    // caller may see; a model hidden from the list must not be confirmable by
+    // fetching it directly.
+    let id = single.unwrap_or_default();
+    if model_names(&state, &access).await.iter().any(|m| m == id) {
+        return Json(json!({
+            "name": format!("models/{id}"),
+            "baseModelId": id,
+            "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+        }))
+        .into_response();
+    }
+    error_response(&Error::NotFound(format!(
+        "Gemini discovery path /v1beta/{path}"
+    )))
 }
 
 // ---- inference handlers --------------------------------------------------
@@ -388,14 +467,7 @@ async fn run_inference(
     let trace_id = header_str(&headers, "x-trace-id")
         .or_else(|| header_str(&headers, "traceparent"));
 
-    // Effective model/provider access = the key's grant merged with its team's
-    // (deny wins; allow-lists are ceilings). This grants access "by team".
-    let mut access = keyauth.api_key.access.clone();
-    if let Some(team_id) = &keyauth.api_key.team_id {
-        if let Ok(Some(team)) = state.store.get_team(team_id).await {
-            access = access.merge(&team.access);
-        }
-    }
+    let access = effective_access(&state, &keyauth).await;
 
     let ctx = RequestCtx {
         api_key: Some(keyauth.api_key.clone()),

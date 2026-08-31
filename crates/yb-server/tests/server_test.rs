@@ -732,3 +732,202 @@ async fn complete_requires_a_session() {
     let (status, _) = get_json(&app, "/admin/v1/complete?kind=model", "yb_session=bogus").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+// ---------------------------------------------------------------------------
+// Model discovery (`GET /v1/models` and its per-shape siblings)
+// ---------------------------------------------------------------------------
+
+/// Issue a key for the seeded user under `access`, returning its plaintext token.
+async fn key_with(store: &dyn Store, access: AccessPolicy, team_id: Option<String>) -> String {
+    let user = store.list_users().await.unwrap().pop().unwrap();
+    issue_api_key(
+        store,
+        &user.id,
+        Some("scoped".into()),
+        team_id,
+        Default::default(),
+        access,
+        LimitColumns::default(),
+    )
+    .await
+    .unwrap()
+    .token
+}
+
+/// `GET uri` bearing `token`, returning the status and parsed body.
+async fn get_as(app: &axum::Router, uri: &str, token: &str) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// The `id`s in an OpenAI-shaped model list.
+fn openai_ids(v: &Value) -> Vec<String> {
+    v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn model_discovery_lists_only_what_the_key_may_call() {
+    let (state, token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "gpt-4o", "openai").await;
+    seed_dep(store.as_ref(), "claude-sonnet", "anthropic").await;
+
+    // A key restricted to one model, and one with no restrictions at all.
+    let scoped = key_with(
+        store.as_ref(),
+        AccessPolicy {
+            allowed_models: vec!["gpt-4o".into()],
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let app = build_router(state);
+
+    let (status, v) = get_as(&app, "/v1/models", &scoped).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(openai_ids(&v), vec!["gpt-4o"]);
+
+    // The unrestricted key still sees the whole catalog — filtering is a
+    // policy consequence, not a blanket narrowing.
+    let (_, v) = get_as(&app, "/v1/models", &token).await;
+    let all = openai_ids(&v);
+    assert!(all.contains(&"claude-sonnet".to_string()), "{all:?}");
+    assert!(all.contains(&"gpt-4o".to_string()), "{all:?}");
+
+    // Every shape answers with the same set, in its own JSON.
+    let (_, v) = get_as(&app, "/anthropic/v1/models", &scoped).await;
+    let ids: Vec<&str> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["gpt-4o"]);
+
+    let (_, v) = get_as(&app, "/v1beta/models", &scoped).await;
+    let names: Vec<&str> = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["baseModelId"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["gpt-4o"]);
+}
+
+#[tokio::test]
+async fn a_model_whose_only_provider_is_denied_is_not_listed() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "gpt-4o", "openai").await;
+    seed_dep(store.as_ref(), "claude-sonnet", "anthropic").await;
+
+    // The model itself is permitted; its sole provider is not. Listing it
+    // would advertise a model whose every call dies at "no eligible provider".
+    let token = key_with(
+        store.as_ref(),
+        AccessPolicy {
+            denied_providers: vec!["anthropic".into()],
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let app = build_router(state);
+
+    let (_, v) = get_as(&app, "/v1/models", &token).await;
+    let ids = openai_ids(&v);
+    assert!(ids.contains(&"gpt-4o".to_string()));
+    assert!(!ids.contains(&"claude-sonnet".to_string()), "{ids:?}");
+}
+
+#[tokio::test]
+async fn discovery_applies_the_team_policy_too() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "gpt-4o", "openai").await;
+    seed_dep(store.as_ref(), "claude-sonnet", "anthropic").await;
+
+    // The key grants everything; its team is the ceiling. A catalog built from
+    // the key alone would advertise the two models the team forbids.
+    let team = yb_core::model::Team {
+        id: new_id(),
+        name: "locked".into(),
+        access: AccessPolicy {
+            allowed_models: vec!["claude-sonnet".into()],
+            ..Default::default()
+        },
+        created_at: now(),
+        updated_at: now(),
+        deleted_at: None,
+        created_by: None,
+    };
+    store.create_team(&team).await.unwrap();
+    let token = key_with(store.as_ref(), AccessPolicy::default(), Some(team.id.clone())).await;
+    let app = build_router(state);
+
+    let (_, v) = get_as(&app, "/v1/models", &token).await;
+    assert_eq!(openai_ids(&v), vec!["claude-sonnet"]);
+}
+
+#[tokio::test]
+async fn a_hidden_model_cannot_be_confirmed_by_fetching_it_directly() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "gpt-4o", "openai").await;
+    seed_dep(store.as_ref(), "claude-sonnet", "anthropic").await;
+    let token = key_with(
+        store.as_ref(),
+        AccessPolicy {
+            allowed_models: vec!["gpt-4o".into()],
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let app = build_router(state);
+
+    let (status, _) = get_as(&app, "/v1beta/models/gpt-4o", &token).await;
+    assert_eq!(status, StatusCode::OK);
+    // Omitting it from the list but serving it here would leak the catalog one
+    // guess at a time.
+    let (status, _) = get_as(&app, "/v1beta/models/claude-sonnet", &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn model_discovery_needs_a_credential() {
+    let (state, _token) = setup().await;
+    let app = build_router(state);
+
+    // Entitlement is undefined without a caller, so an anonymous list is not
+    // "everything" — it is rejected, like inference.
+    for uri in ["/v1/models", "/anthropic/v1/models", "/v1beta/models"] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+
+    let (status, _) = get_as(&app, "/v1/models", "not-a-real-key").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
