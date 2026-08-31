@@ -259,6 +259,7 @@ mod tests {
         DeploymentRecord {
             id: "d1".into(),
             model_id: "m1".into(),
+            provider_id: "p1".into(),
             model_name: "m".into(),
             provider: "p".into(),
             upstream_model: "um".into(),

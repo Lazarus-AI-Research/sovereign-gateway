@@ -69,6 +69,9 @@ pub fn router() -> Router<AppState> {
         .route("/deployments/health", get(health_all_models))
         .route("/deployments/:id", delete(delete_deployment))
         .route("/deployments/:id/health", post(health_one_model))
+        // providers (an endpoint, its credentials, its deployments)
+        .route("/providers", get(list_providers).post(create_provider))
+        .route("/providers/:id", put(update_provider).delete(delete_provider))
         // model aliases (extra public name -> model)
         .route("/aliases", get(list_aliases).post(create_alias))
         .route("/aliases/:alias", delete(delete_alias))
@@ -841,18 +844,19 @@ async fn guard_last_admin(state: &AppState, id: &str, losing_admin: bool) -> Res
     Ok(())
 }
 
-// ---- models (the live deployment list) -----------------------------------
+// ---- deployments (one model's upstream fan-out) ---------------------------
 
-/// Request body to create a deployment via `POST /models`.
+/// Request body to create a deployment via `POST /deployments`.
+///
+/// No `api_base` or `api_key`: those describe the endpoint, so they live on the
+/// provider this body names. Setting them here would be silently ignored, which
+/// is worse than not offering them.
 #[derive(Debug, Deserialize)]
 struct CreateModelBody {
     model_name: String,
+    /// The provider to serve this through, by name.
     provider: String,
     upstream_model: String,
-    #[serde(default)]
-    api_base: Option<String>,
-    #[serde(default)]
-    api_key: Option<String>,
     /// The upstream wire format — the deployment's only "adapter shape"
     /// (a chat dialect like `openai_chat`, or an embeddings dialect like
     /// `cohere_embed`).
@@ -868,13 +872,163 @@ struct CreateModelBody {
     /// URL for http_ok checks (absolute, or relative to api_base's origin).
     #[serde(default)]
     health_path: Option<String>,
-    /// Open-ended per-deployment extras, e.g.
+}
+
+/// Create or edit a provider: one endpoint, its credentials, and the extras
+/// that describe its edge.
+#[derive(Deserialize)]
+struct ProviderBody {
+    name: String,
+    #[serde(default)]
+    api_base: Option<String>,
+    /// Omit to leave an existing credential untouched — the API never reads a
+    /// key back out, so an edit round-trip must not blank one by omission.
+    #[serde(default)]
+    api_key: Option<String>,
     /// `{"cloudflare_access": true, "headers": {"X-Tenant": "acme"}}`. The
     /// Cloudflare service token itself is file-owned
     /// (`[upstream.cloudflare_access]`) and cannot be set, read, or overridden
     /// through this API — only the flag selecting it can.
     #[serde(default)]
     extra: yb_core::Extra,
+}
+
+/// Render a provider without ever disclosing its credential.
+fn provider_json(p: &yb_core::ProviderRecord) -> serde_json::Value {
+    json!({
+        "id": p.id,
+        "name": p.name,
+        "api_base": p.api_base,
+        // The key itself never leaves the server; the console only needs to
+        // know whether one is set.
+        "has_api_key": p.api_key.as_deref().is_some_and(|k| !k.is_empty()),
+        "extra": p.extra,
+        "created_at": p.created_at,
+        "updated_at": p.updated_at,
+    })
+}
+
+/// `GET /providers` — list providers with a deployment count (member+).
+async fn list_providers(principal: Principal, State(state): State<AppState>) -> Response {
+    if let Err(r) = authz(&principal, Action::ReadCatalog) {
+        return r;
+    }
+    let providers = match state.store.list_providers().await {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
+    };
+    let deployments = match state.store.list_deployments().await {
+        Ok(d) => d,
+        Err(e) => return error_response(&e),
+    };
+    let out: Vec<serde_json::Value> = providers
+        .iter()
+        .map(|p| {
+            let mut v = provider_json(p);
+            v["deployment_count"] =
+                json!(deployments.iter().filter(|d| d.provider_id == p.id).count());
+            v
+        })
+        .collect();
+    respond(Ok(out))
+}
+
+/// `POST /providers` — add a provider (admin only).
+async fn create_provider(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<ProviderBody>,
+) -> Response {
+    if let Err(r) = authz(&principal, Action::EditConfig) {
+        return r;
+    }
+    let name = match validate_public_name(&body.name) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    if let Ok(Some(_)) = state.store.get_provider_by_name(&name).await {
+        return error_response(&Error::Conflict(format!("provider \"{name}\" already exists")));
+    }
+    let created = match state.store.ensure_provider(&name).await {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
+    };
+    let updated = match state
+        .store
+        .update_provider(
+            &created.id,
+            &name,
+            body.api_base.as_deref(),
+            body.api_key.as_deref(),
+            &body.extra,
+        )
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
+    };
+    if let Err(e) = state.reload_models().await {
+        return error_response(&e);
+    }
+    respond(Ok(provider_json(&updated)))
+}
+
+/// `PUT /providers/:id` — edit a provider and hot-reload (admin only).
+///
+/// Renaming here needs no alias, unlike a model: a provider name is not on the
+/// wire, and policies reference it by id.
+async fn update_provider(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ProviderBody>,
+) -> Response {
+    if let Err(r) = authz(&principal, Action::EditConfig) {
+        return r;
+    }
+    let name = match validate_public_name(&body.name) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    if let Ok(None) = state.store.get_provider(&id).await {
+        return error_response(&Error::NotFound("provider".into()));
+    }
+    let updated = match state
+        .store
+        .update_provider(
+            &id,
+            &name,
+            body.api_base.as_deref(),
+            body.api_key.as_deref().filter(|k| !k.is_empty()),
+            &body.extra,
+        )
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
+    };
+    if let Err(e) = state.reload_models().await {
+        return error_response(&e);
+    }
+    respond(Ok(provider_json(&updated)))
+}
+
+/// `DELETE /providers/:id` — remove a provider with no deployments (admin only).
+async fn delete_provider(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authz(&principal, Action::EditConfig) {
+        return r;
+    }
+    if let Err(e) = state.store.delete_provider(&id).await {
+        return error_response(&e);
+    }
+    if let Err(e) = state.reload_models().await {
+        return error_response(&e);
+    }
+    respond(Ok(json!({ "deleted": id })))
 }
 
 /// `GET /deployments` — list the live deployments (member+).
@@ -1035,18 +1189,19 @@ async fn create_deployment(
         Ok(n) => n,
         Err(r) => return r,
     };
+    let provider_name = match validate_public_name(&body.provider) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
     let dep = yb_core::NewDeployment {
         model_name,
-        provider: body.provider,
+        provider_name,
         upstream_model: body.upstream_model,
-        api_base: body.api_base,
-        api_key: body.api_key,
         upstream_format: body.upstream_format,
         weight: body.weight.unwrap_or(1),
         pricing: body.pricing,
         health_check: body.health_check,
         health_path: body.health_path,
-        extra: body.extra.clone(),
     };
     let created = match state.store.create_deployment(&dep).await {
         Ok(d) => d,
@@ -1264,19 +1419,29 @@ async fn complete(
                 Err(e) => return error_response(&e),
             };
             if q.kind == "provider" {
-                // Distinct providers, hinted with how many deployments back them.
-                let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-                for d in &deps {
-                    *counts.entry(d.provider.clone()).or_default() += 1;
-                }
-                for (provider, n) in counts {
-                    if let Some(r) = rank(&provider, &needle) {
-                        let hint = format!("{n} deployment{}", if n == 1 { "" } else { "s" });
+                // Providers, hinted with how many deployments they back. Listed
+                // from the provider table rather than the deployments, so one
+                // configured but not yet used is still completable — the same
+                // reason models are.
+                let providers = match state.store.list_providers().await {
+                    Ok(p) => p,
+                    Err(e) => return error_response(&e),
+                };
+                for p in providers {
+                    if let Some(r) = rank(&p.name, &needle) {
+                        let n = deps.iter().filter(|d| d.provider_id == p.id).count();
+                        let mut hint =
+                            format!("{n} deployment{}", if n == 1 { "" } else { "s" });
+                        if let Some(base) = p.api_base.as_deref() {
+                            hint.push_str(" \u{b7} ");
+                            hint.push_str(base);
+                        }
                         hits.push((
                             r,
                             Suggestion {
-                                label: provider.clone(),
-                                value: provider,
+                                label: p.name,
+                                // The id, because that is what a policy stores.
+                                value: p.id,
                                 hint,
                             },
                         ));

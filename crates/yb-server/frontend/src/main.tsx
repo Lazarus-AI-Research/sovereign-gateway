@@ -49,7 +49,7 @@ const SUBJECTS = ['key', 'user', 'team'];
 const usd = (micros: number) => '$' + (micros / 1e6).toFixed(2);
 const uuid = () => (crypto as any).randomUUID();
 const nowIso = () => new Date().toISOString();
-const isUnrestricted = (a: any) => !a || !(a.allowed_model_ids?.length || a.denied_model_ids?.length || a.allowed_providers?.length || a.denied_providers?.length);
+const isUnrestricted = (a: any) => !a || !(a.allowed_model_ids?.length || a.denied_model_ids?.length || a.allowed_provider_ids?.length || a.denied_provider_ids?.length);
 
 /**
  * How a key's access reads once its team is taken into account.
@@ -315,22 +315,25 @@ function AccessEditor({ value, onSave }: { value: any; onSave: (p: any) => void 
   const [p, setP] = useState<any>({
     allowed_model_ids: value.allowed_model_ids || [],
     denied_model_ids: value.denied_model_ids || [],
-    allowed_providers: value.allowed_providers || [],
-    denied_providers: value.denied_providers || [],
+    allowed_provider_ids: value.allowed_provider_ids || [],
+    denied_provider_ids: value.denied_provider_ids || [],
   });
   // Models are stored as ids, so the pills need a name to show. A model the
   // list no longer has renders as an explicit "unknown" rather than as a
   // plausible-looking name — a dangling reference should be visible, which is
   // the whole reason policies hold ids instead of names.
   const [{ data: models }] = useAsync<any[]>(() => api('/models'));
+  const [{ data: provs }] = useAsync<any[]>(() => api('/providers'));
   const nameOf = (id: string) => (models || []).find((m) => m.id === id)?.name
     || 'unknown model (' + id.slice(0, 8) + '…)';
+  const provNameOf = (id: string) => (provs || []).find((p) => p.id === id)?.name
+    || 'unknown provider (' + id.slice(0, 8) + '…)';
   const field = (k: string, kind: string, label: string, note: string) => (
     <div class="fld">
       <span class="lbl">{label} — {note}</span>
       <TokenInput kind={kind} value={p[k]} placeholder={'add a ' + kind}
-                  strict={kind === 'model'}
-                  labelFor={kind === 'model' ? nameOf : undefined}
+                  strict
+                  labelFor={kind === 'model' ? nameOf : provNameOf}
                   onChange={(v) => setP((s: any) => ({ ...s, [k]: v }))} />
     </div>
   );
@@ -339,8 +342,8 @@ function AccessEditor({ value, onSave }: { value: any; onSave: (p: any) => void 
       <div class="grid2">
         {field('allowed_model_ids', 'model', 'allowed models', 'empty means every model')}
         {field('denied_model_ids', 'model', 'denied models', 'always wins')}
-        {field('allowed_providers', 'provider', 'allowed providers', 'empty means every provider')}
-        {field('denied_providers', 'provider', 'denied providers', 'always wins')}
+        {field('allowed_provider_ids', 'provider', 'allowed providers', 'empty means every provider')}
+        {field('denied_provider_ids', 'provider', 'denied providers', 'always wins')}
       </div>
       <button class="btn" style="margin-top:10px" onClick={() => onSave(p)}>Save access</button>
     </div>
@@ -456,27 +459,130 @@ function ModelName({ model, admin, onRenamed }: { model: any; admin: boolean; on
   );
 }
 
+/**
+ * Providers: one upstream endpoint, its credential, and the deployments served
+ * through it.
+ *
+ * The credential is write-only by design — the API returns `has_api_key` and
+ * never the key, so an edit that leaves the field blank keeps the stored one
+ * rather than blanking it. The placeholder says which of those is happening.
+ */
+function Providers({ admin }: { admin: boolean }) {
+  const [{ data, error }, reload] = useAsync<any[]>(() => api('/providers'));
+  const blank = { name: '', api_base: '', api_key: '', extra: { cloudflare_access: false } };
+  const [f, setF] = useState<any>(blank);
+  const [editing, setEditing] = useState<string>('');
+  const [msg, setMsg] = useState('');
+  const [open, setOpen] = useState(false);
+
+  const edit = (p: any) => {
+    // api_key is intentionally blank: it is never sent to the browser.
+    setF({ name: p.name, api_base: p.api_base || '', api_key: '', extra: p.extra || {} });
+    setEditing(p.id); setMsg(''); setOpen(true);
+  };
+  const add = () => { setF(blank); setEditing(''); setMsg(''); setOpen(true); };
+  const save = async () => {
+    setMsg('');
+    const body: any = { name: f.name.trim(), extra: f.extra };
+    body.api_base = f.api_base.trim() || null;
+    if (f.api_key.trim()) body.api_key = f.api_key.trim();
+    try {
+      if (editing) await api('/providers/' + encodeURIComponent(editing), { method: 'PUT', body });
+      else await api('/providers', { method: 'POST', body });
+      setOpen(false); reload();
+    } catch (e: any) { setMsg(e.message); }
+  };
+  const del = async (p: any) => {
+    if (!confirm('Delete provider “' + p.name + '”?')) return;
+    try { await api('/providers/' + encodeURIComponent(p.id), { method: 'DELETE' }); reload(); }
+    catch (e: any) { alert(e.message); }
+  };
+
+  return (
+    <Fragment>
+      <div class="card">
+        <div class="row"><h2 style="margin:0">Providers <span class="mut">— an endpoint, its credentials, and the models it serves</span></h2>
+          <span class="sp" style="flex:1"></span>
+          {admin && <button class="btn" onClick={add}>+ Add provider</button>}</div>
+        {error && <p class="err" style="margin-top:10px">{error}</p>}
+        {!data || !data.length
+          ? <p class="empty">No providers yet. {admin ? 'Add one, then give it deployments.' : 'Ask an admin.'}</p>
+          : (
+            <div class="tablewrap">
+              <table style="margin-top:10px">
+                <thead><tr><th>name</th><th>api_base</th><th>credential</th><th>edge</th><th>deployments</th>{admin && <th></th>}</tr></thead>
+                <tbody>{data.map((p) => (
+                  <tr key={p.id}>
+                    <td class="nowrap">{p.name}</td>
+                    <td class="mono mut">{p.api_base || <span class="mut">format default</span>}</td>
+                    <td>{p.has_api_key
+                          ? <span class="pill">key set</span>
+                          : <span class="mut">none</span>}</td>
+                    <td>
+                      <div class="pills">
+                        {p.extra?.cloudflare_access
+                          && <span class="pill" title="Sends the configured Cloudflare Access service token">CF Access</span>}
+                        {Object.keys(p.extra?.headers || {}).length > 0
+                          && <span class="pill mono" title={Object.keys(p.extra.headers).join(', ')}>
+                               +{Object.keys(p.extra.headers).length} hdr</span>}
+                        {!p.extra?.cloudflare_access && !Object.keys(p.extra?.headers || {}).length
+                          && <span class="mut">—</span>}
+                      </div>
+                    </td>
+                    <td class="mut">{p.deployment_count}</td>
+                    {admin && <td class="nowrap">
+                      <button class="ghost" onClick={() => edit(p)}>edit</button>{' '}
+                      <button class="ghost del" onClick={() => del(p)}>delete</button>
+                    </td>}
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          )}
+      </div>
+      {admin && open && (
+        <Modal title={editing ? 'Edit provider' : 'Add a provider'} onClose={() => setOpen(false)}>
+          <div class="grid">
+            <input placeholder="name (e.g. openai)" value={f.name}
+                   onInput={(e: any) => setF((s: any) => ({ ...s, name: e.target.value }))} />
+            <input placeholder="api_base (blank = format default)" value={f.api_base}
+                   onInput={(e: any) => setF((s: any) => ({ ...s, api_base: e.target.value }))} />
+            <input type="password" value={f.api_key}
+                   placeholder={editing ? 'api_key (blank = keep current)' : 'api_key'}
+                   onInput={(e: any) => setF((s: any) => ({ ...s, api_key: e.target.value }))} />
+          </div>
+          <label class="row" style="margin-top:10px;gap:8px;cursor:pointer">
+            <input type="checkbox" checked={!!f.extra.cloudflare_access}
+                   onChange={(e: any) => setF((s: any) => ({ ...s, extra: { ...s.extra, cloudflare_access: e.target.checked } }))} />
+            <span>Behind Cloudflare Access
+              <span class="mut"> — send the service token from <span class="mono">[upstream.cloudflare_access]</span></span></span>
+          </label>
+          <div class="row" style="margin-top:12px">
+            <button class="btn" onClick={save}>{editing ? 'Save provider' : 'Add provider'}</button>
+            {msg && <span class="err">{msg}</span>}
+          </div>
+        </Modal>
+      )}
+    </Fragment>
+  );
+}
+
 function Models({ admin }: { admin: boolean }) {
   // Two lists: the model entities (what a rename acts on) and the deployments
   // (the upstream fan-out). The table groups the second under the first.
   const [{ loading, data, error }, reload] = useAsync<any[]>(() => api('/deployments'));
   const [{ data: modelData }, reloadModels] = useAsync<any[]>(() => api('/models'));
-  const blank = { model_name: '', provider: '', upstream_model: '', upstream_format: 'openai_chat', api_base: '', api_key: '', extra: { cloudflare_access: false } };
+  // api_base / api_key / extra are the provider's now, so the deployment form
+  // is just: which model, through which provider, speaking which format.
+  const blank = { model_name: '', provider: '', upstream_model: '', upstream_format: 'openai_chat' };
+  const [{ data: providerData }] = useAsync<any[]>(() => api('/providers'));
   const [f, setF] = useState<any>(blank);
   const [msg, setMsg] = useState('');
   const upd = (k: string, v: string) => setF((s: any) => ({ ...s, [k]: v }));
-  // `extra` is an open object on the deployment row; this edits one key of it.
-  // The Cloudflare credential itself is server-side config and is never entered
-  // or displayed here — only the flag that selects it.
-  const updExtra = (k: string, v: any) =>
-    setF((s: any) => ({ ...s, extra: { ...s.extra, [k]: v } }));
   const add = async () => {
     setMsg('');
     try {
-      const body: any = { ...f };
-      if (!body.api_base) delete body.api_base;
-      if (!body.api_key) delete body.api_key;
-      await api('/deployments', { method: 'POST', body });
+      await api('/deployments', { method: 'POST', body: { ...f } });
       setF(blank); setShowAdd(false); reload(); reloadModels();
     } catch (e: any) { setMsg(e.message); }
   };
@@ -496,6 +602,7 @@ function Models({ admin }: { admin: boolean }) {
   const delAlias = async (a: string) => { if (confirm('Remove alias “' + a + '”?')) { await api('/aliases/' + encodeURIComponent(a), { method: 'DELETE' }); reloadAliases(); } };
   return (
     <Fragment>
+      <Providers admin={admin} />
       <div class="card">
         <div class="row"><h2 style="margin:0">Models <span class="mut">— each public name, with the deployments behind it</span></h2>
           <span class="sp" style="flex:1"></span>
@@ -506,11 +613,11 @@ function Models({ admin }: { admin: boolean }) {
           : (
             <div class="tablewrap">
               <table style="margin-top:10px">
-                <thead><tr><th>provider</th><th>upstream_model</th><th>format</th><th>api_base</th><th>headers</th>{admin && <th></th>}</tr></thead>
+                <thead><tr><th>provider</th><th>upstream_model</th><th>format</th><th>api_base</th>{admin && <th></th>}</tr></thead>
                 {modelData.map((model) => (
                   <tbody key={model.id}>
                     <tr class="grp">
-                      <td colSpan={admin ? 6 : 5}>
+                      <td colSpan={admin ? 5 : 4}>
                         <div class="pills">
                           <ModelName model={model} admin={admin} onRenamed={afterRename} />
                           {aliasesFor(model.id).map((a) => (
@@ -525,23 +632,12 @@ function Models({ admin }: { admin: boolean }) {
                         <td class="nowrap">{m.provider}</td>
                         <td class="mono nowrap">{m.upstream_model}</td>
                         <td><span class="pill">{m.upstream_format}</span></td>
-                        <td class="mono mut">{m.api_base || '—'}</td>
-                        <td>
-                          <div class="pills">
-                            {m.extra?.cloudflare_access
-                              && <span class="pill" title="Sends the configured Cloudflare Access service token">CF Access</span>}
-                            {Object.keys(m.extra?.headers || {}).length > 0
-                              && <span class="pill mono" title={Object.keys(m.extra.headers).join(', ')}>
-                                   +{Object.keys(m.extra.headers).length} hdr</span>}
-                            {!m.extra?.cloudflare_access && !Object.keys(m.extra?.headers || {}).length
-                              && <span class="mut">—</span>}
-                          </div>
-                        </td>
+                        <td class="mono mut">{m.api_base || <span class="mut">format default</span>}</td>
                         {admin && <td><button class="ghost del" onClick={() => del(m.id)}>delete</button></td>}
                       </tr>
                     ))}
                     {!deploymentsFor(model.id).length && (
-                      <tr><td colSpan={admin ? 6 : 5} class="mut" style="padding-left:18px">
+                      <tr><td colSpan={admin ? 5 : 4} class="mut" style="padding-left:18px">
                         no deployments — this model is not routable
                       </td></tr>
                     )}
@@ -555,19 +651,19 @@ function Models({ admin }: { admin: boolean }) {
         <Modal title="Add a deployment" onClose={() => setShowAdd(false)}>
           <div class="grid">
             <input placeholder="model_name (public)" value={f.model_name} onInput={(e: any) => upd('model_name', e.target.value)} />
-            <input placeholder="provider label" value={f.provider} onInput={(e: any) => upd('provider', e.target.value)} />
+            <select value={f.provider} onChange={(e: any) => upd('provider', e.target.value)}>
+              <option value="">— provider —</option>
+              {(providerData || []).map((p) => <option value={p.name}>{p.name}</option>)}
+            </select>
             <input placeholder="upstream_model" value={f.upstream_model} onInput={(e: any) => upd('upstream_model', e.target.value)} />
             <select value={f.upstream_format} onChange={(e: any) => upd('upstream_format', e.target.value)}>{FORMATS.map((k) => <option>{k}</option>)}</select>
-            <input placeholder="api_base (optional)" value={f.api_base} onInput={(e: any) => upd('api_base', e.target.value)} />
-            <input placeholder="api_key (optional, literal)" value={f.api_key} onInput={(e: any) => upd('api_key', e.target.value)} />
           </div>
-          <label class="row" style="margin-top:10px;gap:8px;cursor:pointer">
-            <input type="checkbox" checked={!!f.extra.cloudflare_access}
-                   onChange={(e: any) => updExtra('cloudflare_access', e.target.checked)} />
-            <span>Behind Cloudflare Access
-              <span class="mut"> — send the service token from <span class="mono">[upstream.cloudflare_access]</span></span></span>
-          </label>
-          <div class="row" style="margin-top:12px"><button class="btn" onClick={add}>Add model</button>{msg && <span class="err">{msg}</span>}</div>
+          <p class="mut" style="margin:10px 0 0;font-size:12px">
+            The endpoint, credential and edge settings come from the provider —
+            add or edit those in the Providers card above. One endpoint can serve
+            several formats, which is why the format is set here.
+          </p>
+          <div class="row" style="margin-top:12px"><button class="btn" onClick={add}>Add deployment</button>{msg && <span class="err">{msg}</span>}</div>
         </Modal>
       )}
     </Fragment>
@@ -772,7 +868,7 @@ function Keys({ admin }: { admin: boolean }) {
               })()}</td>
               <td class="row"><button class="ghost" onClick={() => setEditing(editing === k.id ? '' : k.id)}>access</button><button class="ghost del" onClick={() => del(k.id)}>revoke</button></td>
             </tr>
-            {editing === k.id && <tr><td colSpan={admin ? 6 : 5}><AccessEditor key={k.id} value={k.access || {}} onSave={(p) => saveAccess(k.id, p)} /></td></tr>}
+            {editing === k.id && <tr><td colSpan={admin ? 5 : 4}><AccessEditor key={k.id} value={k.access || {}} onSave={(p) => saveAccess(k.id, p)} /></td></tr>}
           </Fragment>
         ))}</tbody>
       </table>

@@ -240,12 +240,23 @@ async fn run_import(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("no [[model]] entries in {models_path}; nothing to import");
         return Ok(());
     }
+    let provider_count = seed_providers(store.as_ref(), &models.providers).await?;
+    let hoisted = hoist_legacy_deployment_credentials(store.as_ref(), &models.models).await?;
     let inserted = seed_models(store.as_ref(), &models.models).await?;
     let alias_count = seed_aliases(store.as_ref(), &models.models).await?;
     println!(
         "imported {inserted} new deployment(s) into the database; {} already present ({total} in file)",
         total - inserted
     );
+    if provider_count > 0 {
+        println!("configured {provider_count} provider(s)");
+    }
+    if hoisted > 0 {
+        println!(
+            "hoisted credentials for {hoisted} provider(s) off their deployments \
+             — declare them in [[provider]] blocks instead"
+        );
+    }
     if alias_count > 0 {
         println!("seeded {alias_count} model alias(es)");
     }
@@ -433,16 +444,13 @@ async fn seed_models(
         for dc in &mc.deployments {
             let rec = NewDeployment {
                 model_name: mc.model_name.clone(),
-                provider: dc.provider.clone(),
+                provider_name: dc.provider.clone(),
                 upstream_model: dc.upstream_model.clone(),
-                api_base: dc.api_base.clone(),
-                api_key: dc.api_key.clone(),
                 upstream_format: dc.upstream_format,
                 weight: dc.weight,
                 pricing: dc.pricing,
                 health_check: dc.health_check,
                 health_path: dc.health_path.clone(),
-                extra: dc.extra.clone(),
             };
             if store.seed_deployment(&rec).await? {
                 inserted += 1;
@@ -450,6 +458,80 @@ async fn seed_models(
         }
     }
     Ok(inserted)
+}
+
+/// Upsert each `[[provider]]` block: the endpoint, its credential, its extras.
+///
+/// Run before the models, so a deployment naming a provider finds it already
+/// configured rather than creating a credential-less stub.
+async fn seed_providers(
+    store: &dyn Store,
+    providers: &[yb_core::config::ProviderConfig],
+) -> Result<usize, Box<dyn std::error::Error>> {
+    for pc in providers {
+        if pc.name.trim().is_empty() {
+            return Err("a [[provider]] block is missing its name".into());
+        }
+        let existing = store.ensure_provider(&pc.name).await?;
+        store
+            .update_provider(
+                &existing.id,
+                &pc.name,
+                pc.api_base.as_deref(),
+                pc.api_key.as_deref(),
+                &pc.extra,
+            )
+            .await?;
+    }
+    Ok(providers.len())
+}
+
+/// Hoist credentials that a pre-provider models file still carries on its
+/// deployments up onto the provider they name.
+///
+/// `api_base`/`api_key`/`extra` moved from the deployment to the provider. A
+/// file written before that keeps working: the first deployment naming a
+/// provider donates its settings, and a later disagreement is reported rather
+/// than silently dropped.
+async fn hoist_legacy_deployment_credentials(
+    store: &dyn Store,
+    models: &[ModelConfig],
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut hoisted: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+        std::collections::HashMap::new();
+    for mc in models {
+        for dc in &mc.deployments {
+            if dc.api_base.is_none() && dc.api_key.is_none() && dc.extra.is_empty() {
+                continue;
+            }
+            let provider = store.ensure_provider(&dc.provider).await?;
+            // Already configured explicitly by a [[provider]] block, or by an
+            // earlier deployment: leave it alone.
+            if provider.api_base.is_some() || provider.api_key.is_some() {
+                if let Some((base, key)) = hoisted.get(&dc.provider) {
+                    if base != &dc.api_base || key != &dc.api_key {
+                        eprintln!(
+                            "warning: deployments of provider \"{}\" disagree on api_base/api_key; \
+                             keeping the first. Move them to a [[provider]] block.",
+                            dc.provider
+                        );
+                    }
+                }
+                continue;
+            }
+            store
+                .update_provider(
+                    &provider.id,
+                    &dc.provider,
+                    dc.api_base.as_deref(),
+                    dc.api_key.as_deref(),
+                    &dc.extra,
+                )
+                .await?;
+            hoisted.insert(dc.provider.clone(), (dc.api_base.clone(), dc.api_key.clone()));
+        }
+    }
+    Ok(hoisted.len())
 }
 
 /// Upsert each model's declared `aliases` into the `model_aliases` table

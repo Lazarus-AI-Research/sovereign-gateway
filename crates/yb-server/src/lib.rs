@@ -190,7 +190,7 @@ async fn model_names(state: &AppState, access: &AccessPolicy) -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(deployments) = state.store.list_deployments().await {
         for d in deployments {
-            if !access.permits_model(&d.model_id) || !access.permits_provider(&d.provider) {
+            if !access.permits_model(&d.model_id) || !access.permits_provider(&d.provider_id) {
                 continue;
             }
             if seen.insert(d.model_name.clone()) {
@@ -476,7 +476,7 @@ async fn run_inference(
         request_id,
         trace_id,
         excluded_model_ids: Default::default(),
-        excluded_providers: Default::default(),
+        excluded_provider_ids: Default::default(),
         access,
     };
 

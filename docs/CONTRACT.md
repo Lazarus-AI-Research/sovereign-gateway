@@ -34,11 +34,9 @@ Re-exported from `yb_core`:
   excluded_providers,preferred_models,rpm_limit:Option<i64>,tpm_limit,max_concurrent,
   created_at,updated_at,deleted_at:Option<Timestamp>,created_by:Option<String>}`,
   `NewInstallation{external_id,name,created_by:Option<String>}`,
-  `AccessPolicy{allowed_model_ids,denied_model_ids,allowed_providers,denied_providers:Vec<String>}`
-  with `is_unrestricted()`, `permits_model(&str)` (a model **id**), `permits_provider(&str)`.
-  Models are held by id and providers by name: a model is an entity with a stable
-  id, a provider is a free-form label. Holding ids is what keeps a rule matching
-  after a model is renamed.
+  `AccessPolicy{allowed_model_ids,denied_model_ids,allowed_provider_ids,denied_provider_ids:Vec<String>}`
+  with `is_unrestricted()`, `permits_model(&str)`, `permits_provider(&str)` — both
+  take **ids**, which is what keeps a rule matching after a rename.
   `ApiKey{id,installation_id,hash:String,key_prefix,key_suffix,name:Option<String>,
   owner_user_id:Option<Id>,team_id:Option<Id>,access:AccessPolicy,rpm_limit,tpm_limit,
   max_concurrent:Option<i64>,created_at,last_used_at,deleted_at}` + `fingerprint()`.
@@ -59,7 +57,9 @@ Re-exported from `yb_core`:
   `ModelRecord{id,name,created_at,updated_at}` — the public model entity; one
   model has N deployments and N aliases, and `name` is mutable via
   `Store::rename_model`, which leaves the old name behind as an alias.
-  `Deployment{model_id,model_name,provider:String,kind:ProviderKind,upstream_model,
+  `ProviderRecord{id,name,api_base,api_key,extra,…}` — one upstream endpoint,
+  its credential, and its edge settings, shared by every deployment through it.
+  `Deployment{model_id,model_name,provider_id,provider:String,kind:ProviderKind,upstream_model,
   api_base:Option<String>,api_key_env:Option<String>,upstream_format:WireFormat,
   weight:u32,pricing:Option<ModelPrice>}`,
   `RouteRequest{requested_model,estimated_input_tokens:u32,has_tools,has_images:bool,

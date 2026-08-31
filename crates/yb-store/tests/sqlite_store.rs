@@ -282,7 +282,7 @@ async fn teams_and_memberships() {
         .update_team_access(
             &team.id,
             &AccessPolicy {
-                allowed_providers: vec!["anthropic".into()],
+                allowed_provider_ids: vec!["anthropic".into()],
                 ..Default::default()
             },
         )
@@ -465,15 +465,12 @@ fn new_dep(model_name: &str, provider: &str) -> yb_core::NewDeployment {
     use yb_core::routing::WireFormat;
     yb_core::NewDeployment {
         model_name: model_name.into(),
-        provider: provider.into(),
+        provider_name: provider.into(),
         upstream_model: "gpt-4o".into(),
-        api_base: None,
-        api_key: None,
         upstream_format: WireFormat::OpenaiChat.into(),
         weight: 2,
         health_check: Default::default(),
         health_path: None,
-        extra: Default::default(),
         pricing: Some(yb_core::catalog::ModelPrice::new(2.5, 10.0)),
     }
 }
@@ -505,24 +502,81 @@ async fn deployments_seed_create_and_list() {
     assert!(store.get_deployment(&dep2.id).await.unwrap().is_none());
 }
 
-/// `api_base = NULL` is the common case in a models file, and `NULL != NULL`,
-/// so a unique index without COALESCE would not dedupe it — every `gateway
-/// import` would insert a second copy of every such deployment.
+/// Two deployments through one provider share its endpoint and credential —
+/// the duplication that moving them off the deployment row removes.
 #[tokio::test]
-async fn seed_deployment_dedupes_when_api_base_is_null() {
+async fn deployments_share_one_provider_row() {
+    let (store, _db) = fresh_store().await;
+    store.seed_deployment(&new_dep("gpt-4o", "openai")).await.unwrap();
+    let mut second = new_dep("text-embedding-3-small", "openai");
+    second.upstream_model = "text-embedding-3-small".into();
+    store.seed_deployment(&second).await.unwrap();
+
+    let providers = store.list_providers().await.unwrap();
+    assert_eq!(providers.len(), 1, "one endpoint, not one per deployment");
+
+    // Configure it once; both deployments read the same base and key.
+    store
+        .update_provider(&providers[0].id, "openai", Some("https://api.example/v1"),
+                         Some("sk-shared"), &Default::default())
+        .await
+        .unwrap();
+    let deps = store.list_deployments().await.unwrap();
+    assert_eq!(deps.len(), 2);
+    for d in &deps {
+        assert_eq!(d.provider_id, providers[0].id);
+        assert_eq!(d.api_base.as_deref(), Some("https://api.example/v1"));
+        assert_eq!(d.api_key.as_deref(), Some("sk-shared"));
+    }
+}
+
+/// Seeding stays idempotent on (model, provider, upstream model).
+#[tokio::test]
+async fn seed_deployment_is_idempotent() {
     let (store, _db) = fresh_store().await;
     let dep = new_dep("gpt-4o", "openai");
-    assert!(dep.api_base.is_none());
-
     assert!(store.seed_deployment(&dep).await.unwrap());
     assert!(!store.seed_deployment(&dep).await.unwrap());
     assert_eq!(store.list_deployments().await.unwrap().len(), 1);
+}
 
-    // And a set api_base is still its own identity.
-    let mut with_base = new_dep("gpt-4o", "openai");
-    with_base.api_base = Some("https://example.test/v1".into());
-    assert!(store.seed_deployment(&with_base).await.unwrap());
-    assert_eq!(store.list_deployments().await.unwrap().len(), 2);
+/// A provider backing live deployments cannot be deleted out from under them.
+#[tokio::test]
+async fn a_provider_in_use_cannot_be_deleted() {
+    let (store, _db) = fresh_store().await;
+    store.seed_deployment(&new_dep("gpt-4o", "openai")).await.unwrap();
+    let p = store.get_provider_by_name("openai").await.unwrap().unwrap();
+
+    let err = store.delete_provider(&p.id).await.unwrap_err();
+    assert!(matches!(err, yb_core::Error::Conflict(_)), "got {err:?}");
+
+    // Once its deployments are gone, it can be removed.
+    for d in store.list_deployments().await.unwrap() {
+        store.delete_deployment(&d.id).await.unwrap();
+    }
+    store.delete_provider(&p.id).await.unwrap();
+    assert!(store.list_providers().await.unwrap().is_empty());
+}
+
+/// An edit that omits the key keeps the stored one. The admin API never reads a
+/// credential back out, so a round-trip through the console must not be able to
+/// blank one by omission.
+#[tokio::test]
+async fn omitting_the_api_key_on_update_keeps_it() {
+    let (store, _db) = fresh_store().await;
+    let p = store.ensure_provider("openai").await.unwrap();
+    store.update_provider(&p.id, "openai", None, Some("sk-secret"), &Default::default())
+        .await
+        .unwrap();
+
+    // Rename and change the base, sending no key.
+    let after = store
+        .update_provider(&p.id, "openai-prod", Some("https://x.test/v1"), None, &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(after.name, "openai-prod");
+    assert_eq!(after.api_base.as_deref(), Some("https://x.test/v1"));
+    assert_eq!(after.api_key.as_deref(), Some("sk-secret"), "the key must survive");
 }
 
 /// Two deployments of one public name are the load-balancing fan-out: one
@@ -608,6 +662,34 @@ async fn rename_back_consumes_its_own_alias() {
     assert_eq!(aliases[0].target, "a");
 }
 
+/// A public name is either a model's or an alias's, never both.
+///
+/// Found the hard way: rename `luna` -> `nova` (leaving `luna` as an alias),
+/// then re-run `gateway import` with a file that still says `luna`. Without
+/// this guard `ensure_model` happily created a second model called `luna`, and
+/// because a concrete model shadows an alias in `Snapshot::canonical`, the
+/// alias silently stopped resolving to `nova`.
+#[tokio::test]
+async fn a_model_cannot_be_created_over_an_existing_alias() {
+    let (store, _db) = fresh_store().await;
+    store.seed_deployment(&new_dep("luna", "openai")).await.unwrap();
+    let m = store.get_model_by_name("luna").await.unwrap().unwrap();
+    store.rename_model(&m.id, "nova").await.unwrap();
+
+    // "luna" is now an alias of "nova" — re-importing the stale name must fail
+    // loudly rather than shadow it.
+    let err = store.ensure_model("luna").await.unwrap_err();
+    assert!(matches!(err, yb_core::Error::Conflict(_)), "got {err:?}");
+    assert!(err.to_string().contains("nova"), "the error should name the target: {err}");
+
+    // And the alias still resolves.
+    assert_eq!(store.list_models().await.unwrap().len(), 1);
+    let aliases = store.list_aliases().await.unwrap();
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].alias, "luna");
+    assert_eq!(aliases[0].target, "nova");
+}
+
 /// Aliases store the model id, so a rename retargets every one of them with no
 /// write to the alias table at all.
 #[tokio::test]
@@ -657,66 +739,60 @@ async fn embed_format_deployment_roundtrips() {
     let (store, _db) = fresh_store().await;
     let dep = yb_core::NewDeployment {
         model_name: "embedding-omni-default".into(),
-        provider: "runtime".into(),
+        provider_name: "runtime".into(),
         upstream_model: "LCO-Embedding-Omni".into(),
-        api_base: Some("http://runtime:8000/v1".into()),
-        api_key: None,
         upstream_format: EmbedFormat::OpenaiEmbed.into(),
         weight: 1,
         pricing: None,
         health_check: Default::default(),
         health_path: None,
-        extra: Default::default(),
     };
     store.create_deployment(&dep).await.unwrap();
     let all = store.list_deployments().await.unwrap();
     assert_eq!(all[0].upstream_format, UpstreamFormat::Embed(EmbedFormat::OpenaiEmbed));
 }
 
-/// The extra-header flags are a JSON object on the row: they round-trip, and a
-/// row written before the column existed (NULL/blank) decodes to "no extras"
-/// rather than failing the whole list query.
+/// The edge flags are a JSON object on the *provider* row now: they round-trip
+/// onto every deployment served through it, and a row written before the column
+/// existed (NULL/blank) decodes to "no extras" rather than failing the whole
+/// list query.
 #[tokio::test]
-async fn deployment_extra_roundtrip_and_lenient_decode() {
-    use yb_core::routing::{Extra, WireFormat};
+async fn provider_extra_roundtrip_and_lenient_decode() {
+    use yb_core::routing::Extra;
     let (store, _db) = fresh_store().await;
-    let dep = yb_core::NewDeployment {
-        model_name: "lambda0".into(),
-        provider: "vllm".into(),
-        upstream_model: "Qwen3.8-27B".into(),
-        api_base: Some("https://lambda0.example/v1".into()),
-        api_key: Some("sk-origin".into()),
-        upstream_format: WireFormat::OpenaiChat.into(),
-        weight: 1,
-        pricing: None,
-        health_check: Default::default(),
-        health_path: None,
-        extra: Extra {
-            cloudflare_access: true,
-            headers: [("X-Tenant".to_string(), "acme".to_string())].into_iter().collect(),
-            ..Default::default()
-        },
-    };
-    let created = store.create_deployment(&dep).await.unwrap();
+    store.seed_deployment(&new_dep("lambda0", "vllm")).await.unwrap();
+    let p = store.get_provider_by_name("vllm").await.unwrap().unwrap();
+    store
+        .update_provider(
+            &p.id,
+            "vllm",
+            Some("https://lambda0.example/v1"),
+            Some("sk-origin"),
+            &Extra {
+                cloudflare_access: true,
+                headers: [("X-Tenant".to_string(), "acme".to_string())].into_iter().collect(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
-    let got = store.get_deployment(&created.id).await.unwrap().unwrap();
+    // The deployment reads the provider's edge settings through the join.
+    let got = store.list_deployments().await.unwrap().pop().unwrap();
     assert!(got.extra.cloudflare_access);
     assert_eq!(got.extra.headers.get("X-Tenant").map(String::as_str), Some("acme"));
-    assert!(!got.extra.is_empty());
-    // The projection onto the routing value carries the flag.
     assert!(got.to_deployment().extra.cloudflare_access);
 
-    // Decoding is lenient: a blank or unrecognised value degrades to "no extra
-    // headers" instead of failing the whole list query, so one bad row can never
-    // take the model list down.
+    // Decoding is lenient: a blank or unrecognised value degrades to "no extras"
+    // instead of failing the query, so one bad row cannot take the list down.
     for bad in ["", "   ", "not json"] {
-        sqlx::query("UPDATE deployments SET extra = ? WHERE id = ?")
+        sqlx::query("UPDATE providers SET extra = ? WHERE id = ?")
             .bind(bad)
-            .bind(&created.id)
+            .bind(&p.id)
             .execute(store.pool())
             .await
             .unwrap();
-        let got = store.get_deployment(&created.id).await.unwrap().unwrap();
+        let got = store.get_provider(&p.id).await.unwrap().unwrap();
         assert!(got.extra.is_empty(), "value {bad:?} should decode to default");
         assert_eq!(store.list_deployments().await.unwrap().len(), 1);
     }

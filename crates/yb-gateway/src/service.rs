@@ -143,7 +143,8 @@ pub struct RequestCtx {
     /// Model **ids** excluded by policy, so a rename cannot un-exclude one.
     pub excluded_model_ids: BTreeSet<String>,
     /// Provider attribution names excluded for this caller (denylist).
-    pub excluded_providers: BTreeSet<String>,
+    /// Provider **ids** excluded by policy.
+    pub excluded_provider_ids: BTreeSet<String>,
     /// The effective model/provider access grant for this caller — the key's
     /// policy merged with its team's. Deny wins, allow-lists are ceilings.
     pub access: AccessPolicy,
@@ -497,13 +498,13 @@ impl Gateway {
         let mut excluded_model_ids: BTreeSet<String> = ctx.excluded_model_ids.clone();
         excluded_model_ids.extend(ctx.access.denied_model_ids.iter().cloned());
 
-        let mut denied_providers: BTreeSet<String> = ctx.excluded_providers.clone();
-        denied_providers.extend(ctx.access.denied_providers.iter().cloned());
+        let mut denied_provider_ids: BTreeSet<String> = ctx.excluded_provider_ids.clone();
+        denied_provider_ids.extend(ctx.access.denied_provider_ids.iter().cloned());
 
-        let enabled_providers = if ctx.access.allowed_providers.is_empty() {
+        let enabled_provider_ids = if ctx.access.allowed_provider_ids.is_empty() {
             None
         } else {
-            Some(ctx.access.allowed_providers.iter().cloned().collect())
+            Some(ctx.access.allowed_provider_ids.iter().cloned().collect())
         };
 
         RouteRequest {
@@ -516,8 +517,8 @@ impl Gateway {
                 .flat_map(|m| &m.content)
                 .any(|c| matches!(c, ContentBlock::Image { .. })),
             excluded_model_ids,
-            enabled_providers,
-            denied_providers,
+            enabled_provider_ids,
+            denied_provider_ids,
             preferred_models: Vec::new(),
         }
     }
@@ -530,12 +531,12 @@ impl Gateway {
             .into_iter()
             .filter(|d| {
                 if !ctx.access.permits_model(&d.model_id)
-                    || !ctx.access.permits_provider(&d.provider)
+                    || !ctx.access.permits_provider(&d.provider_id)
                 {
                     return false;
                 }
                 !ctx.excluded_model_ids.contains(&d.model_id)
-                    && !ctx.excluded_providers.contains(&d.provider)
+                    && !ctx.excluded_provider_ids.contains(&d.provider_id)
             })
             .collect()
     }

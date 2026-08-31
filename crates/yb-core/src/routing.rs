@@ -173,6 +173,32 @@ pub struct ModelRecord {
     pub updated_at: crate::ids::Timestamp,
 }
 
+/// A provider: one upstream endpoint, its credentials, and the deployments
+/// served through it.
+///
+/// `api_base` and `api_key` live here rather than on each deployment because
+/// they describe the *endpoint*, not the binding — two models behind one OpenAI
+/// account are one base and one key, not two copies of each. `extra` is the
+/// same story: the Cloudflare Access flag and literal headers are edge concerns
+/// of the endpoint.
+///
+/// `upstream_format` deliberately does **not** live here: one endpoint can
+/// serve several wire formats (OpenAI serves `openai_chat` and `openai_embed`
+/// from the same base), so the format belongs to the deployment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderRecord {
+    pub id: crate::ids::Id,
+    pub name: String,
+    pub api_base: Option<String>,
+    /// The upstream credential. Never serialized back out.
+    #[serde(default, skip_serializing)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub extra: Extra,
+    pub created_at: crate::ids::Timestamp,
+    pub updated_at: crate::ids::Timestamp,
+}
+
 /// The fields a caller supplies to create a deployment.
 ///
 /// The model is **named**, not id'd: every producer of a new deployment — the
@@ -183,16 +209,16 @@ pub struct ModelRecord {
 #[derive(Debug, Clone)]
 pub struct NewDeployment {
     pub model_name: String,
-    pub provider: String,
+    /// The provider is named, not id'd, for the same reason the model is: every
+    /// producer speaks the human name and the store resolves it. `api_base`,
+    /// `api_key` and `extra` are not here — they belong to the provider.
+    pub provider_name: String,
     pub upstream_model: String,
-    pub api_base: Option<String>,
-    pub api_key: Option<String>,
     pub upstream_format: UpstreamFormat,
     pub weight: u32,
     pub pricing: Option<ModelPrice>,
     pub health_check: HealthCheck,
     pub health_path: Option<String>,
-    pub extra: Extra,
 }
 
 /// One concrete upstream binding for a public model name.
@@ -204,7 +230,9 @@ pub struct Deployment {
     /// Public model name clients request (e.g. `gpt-4o`). Joined from
     /// `models.name`, so it follows a rename with no write here.
     pub model_name: String,
-    /// Attribution name for the provider (e.g. `openai`, `openrouter`).
+    /// The provider this deployment is served through. Stable across renames.
+    pub provider_id: crate::ids::Id,
+    /// The provider's current name (e.g. `openai`), joined at read time.
     pub provider: String,
     /// Model id sent upstream (may differ from `model_name`).
     pub upstream_model: String,
@@ -240,6 +268,9 @@ pub struct DeploymentRecord {
     /// The model's current public name, joined from `models.name` at read time
     /// rather than stored here — which is what lets a rename be one `UPDATE`.
     pub model_name: String,
+    /// The provider this deployment is served through.
+    pub provider_id: crate::ids::Id,
+    /// The provider's current name, joined from `providers.name` at read time.
     pub provider: String,
     pub upstream_model: String,
     pub api_base: Option<String>,
@@ -268,6 +299,7 @@ impl DeploymentRecord {
         Deployment {
             model_id: self.model_id.clone(),
             model_name: self.model_name.clone(),
+            provider_id: self.provider_id.clone(),
             provider: self.provider.clone(),
             upstream_model: self.upstream_model.clone(),
             api_base: self.api_base.clone(),
@@ -292,10 +324,10 @@ pub struct RouteRequest {
     /// Model ids excluded by installation/key/team policy. Ids, not names, so
     /// that renaming a model cannot silently stop a deny from matching.
     pub excluded_model_ids: BTreeSet<String>,
-    /// If `Some`, only these providers are enabled (allowlist ceiling).
-    pub enabled_providers: Option<BTreeSet<String>>,
-    /// Providers explicitly denied.
-    pub denied_providers: BTreeSet<String>,
+    /// If `Some`, only these provider **ids** are enabled (allowlist ceiling).
+    pub enabled_provider_ids: Option<BTreeSet<String>>,
+    /// Provider **ids** explicitly denied.
+    pub denied_provider_ids: BTreeSet<String>,
     /// Preferred public model names in rank order (best first).
     pub preferred_models: Vec<String>,
 }
