@@ -430,29 +430,39 @@ function Models({ admin }: { admin: boolean }) {
         {loading ? <p class="empty">Loading…</p> : !data || !data.length
           ? <p class="empty">No models. {admin ? 'Click “Add deployment” or run ' : 'Ask an admin, or run '}<span class="mono">gateway import</span>.</p>
           : (
-            <table style="margin-top:10px">
-              <thead><tr><th>model_name</th><th>provider</th><th>upstream_model</th><th>format</th><th>aliases</th><th>api_base</th><th>headers</th>{admin && <th></th>}</tr></thead>
-              <tbody>{data.map((m) => (
-                <tr key={m.id}>
-                  <td class="mono">{m.model_name}</td><td>{m.provider}</td>
-                  <td class="mono">{m.upstream_model}</td>
-                  <td><span class="pill">{m.upstream_format}</span></td>
-                  <td>{aliasesFor(m.model_name).map((a) => (
-                        <span key={a.alias} class="pill mono">{a.alias}{admin && <a onClick={() => delAlias(a.alias)} style="cursor:pointer;color:var(--bad)"> ×</a>}</span>
-                      ))}
-                      {admin && <a onClick={() => addAlias(m.model_name)} style="cursor:pointer" class="mut">+ alias</a>}</td>
-                  <td class="mono mut">{m.api_base || '—'}</td>
-                  <td>{m.extra?.cloudflare_access
-                        && <span class="pill" title="Sends the configured Cloudflare Access service token">CF Access</span>}
-                      {Object.keys(m.extra?.headers || {}).length > 0
-                        && <span class="pill mono" title={Object.keys(m.extra.headers).join(', ')}>
-                             +{Object.keys(m.extra.headers).length} hdr</span>}
-                      {!m.extra?.cloudflare_access && !Object.keys(m.extra?.headers || {}).length
-                        && <span class="mut">—</span>}</td>
-                  {admin && <td><button class="ghost del" onClick={() => del(m.id)}>delete</button></td>}
-                </tr>
-              ))}</tbody>
-            </table>
+            <div class="tablewrap">
+              <table style="margin-top:10px">
+                <thead><tr><th>model_name</th><th>provider</th><th>upstream_model</th><th>format</th><th>aliases</th><th>api_base</th><th>headers</th>{admin && <th></th>}</tr></thead>
+                <tbody>{data.map((m) => (
+                  <tr key={m.id}>
+                    <td class="mono nowrap">{m.model_name}</td><td class="nowrap">{m.provider}</td>
+                    <td class="mono nowrap">{m.upstream_model}</td>
+                    <td><span class="pill">{m.upstream_format}</span></td>
+                    <td>
+                      <div class="pills">
+                        {aliasesFor(m.model_name).map((a) => (
+                          <span key={a.alias} class="pill mono">{a.alias}{admin && <a class="x" title="Remove alias" onClick={() => delAlias(a.alias)}>×</a>}</span>
+                        ))}
+                        {admin && <a onClick={() => addAlias(m.model_name)} style="cursor:pointer" class="mut">+ alias</a>}
+                      </div>
+                    </td>
+                    <td class="mono mut">{m.api_base || '—'}</td>
+                    <td>
+                      <div class="pills">
+                        {m.extra?.cloudflare_access
+                          && <span class="pill" title="Sends the configured Cloudflare Access service token">CF Access</span>}
+                        {Object.keys(m.extra?.headers || {}).length > 0
+                          && <span class="pill mono" title={Object.keys(m.extra.headers).join(', ')}>
+                               +{Object.keys(m.extra.headers).length} hdr</span>}
+                        {!m.extra?.cloudflare_access && !Object.keys(m.extra?.headers || {}).length
+                          && <span class="mut">—</span>}
+                      </div>
+                    </td>
+                    {admin && <td><button class="ghost del" onClick={() => del(m.id)}>delete</button></td>}
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
           )}
       </div>
       {admin && showAdd && (
