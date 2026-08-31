@@ -158,10 +158,51 @@ impl Extra {
     }
 }
 
+/// A public model: the entity a client names, an alias points at, and an access
+/// policy references.
+///
+/// One model has N deployments (the load-balancing fan-out) and N aliases. The
+/// `name` is the public string clients send on the wire and is mutable — see
+/// `Store::rename_model`. `id` is what every other row stores, so a rename is a
+/// single `UPDATE` and can never silently break a policy or an alias.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelRecord {
+    pub id: crate::ids::Id,
+    pub name: String,
+    pub created_at: crate::ids::Timestamp,
+    pub updated_at: crate::ids::Timestamp,
+}
+
+/// The fields a caller supplies to create a deployment.
+///
+/// The model is **named**, not id'd: every producer of a new deployment — the
+/// admin API body, the import file, a test — speaks the human name, and the
+/// store resolves it to a model row (creating one if the name is new). Kept
+/// distinct from [`DeploymentRecord`] so a write can never carry a `model_id`
+/// and a `model_name` that disagree.
+#[derive(Debug, Clone)]
+pub struct NewDeployment {
+    pub model_name: String,
+    pub provider: String,
+    pub upstream_model: String,
+    pub api_base: Option<String>,
+    pub api_key: Option<String>,
+    pub upstream_format: UpstreamFormat,
+    pub weight: u32,
+    pub pricing: Option<ModelPrice>,
+    pub health_check: HealthCheck,
+    pub health_path: Option<String>,
+    pub extra: Extra,
+}
+
 /// One concrete upstream binding for a public model name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deployment {
-    /// Public model name clients request (e.g. `gpt-4o`).
+    /// The model this deployment backs. Stable across renames — everything
+    /// internal (access policy, alias targets, dedupe) keys on this.
+    pub model_id: crate::ids::Id,
+    /// Public model name clients request (e.g. `gpt-4o`). Joined from
+    /// `models.name`, so it follows a rename with no write here.
     pub model_name: String,
     /// Attribution name for the provider (e.g. `openai`, `openrouter`).
     pub provider: String,
@@ -194,6 +235,10 @@ pub struct Deployment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentRecord {
     pub id: crate::ids::Id,
+    /// The model this deployment backs.
+    pub model_id: crate::ids::Id,
+    /// The model's current public name, joined from `models.name` at read time
+    /// rather than stored here — which is what lets a rename be one `UPDATE`.
     pub model_name: String,
     pub provider: String,
     pub upstream_model: String,
@@ -221,6 +266,7 @@ impl DeploymentRecord {
     /// Project the storage row onto the routing-time [`Deployment`] value.
     pub fn to_deployment(&self) -> Deployment {
         Deployment {
+            model_id: self.model_id.clone(),
             model_name: self.model_name.clone(),
             provider: self.provider.clone(),
             upstream_model: self.upstream_model.clone(),
@@ -234,19 +280,6 @@ impl DeploymentRecord {
             extra: self.extra.clone(),
         }
     }
-
-    /// The natural key used for idempotent seeding (model + provider + upstream
-    /// model + api base). Two file-seeded deployments with the same natural key
-    /// are the same row.
-    pub fn natural_key(&self) -> String {
-        format!(
-            "{}\u{0}{}\u{0}{}\u{0}{}",
-            self.model_name,
-            self.provider,
-            self.upstream_model,
-            self.api_base.as_deref().unwrap_or("")
-        )
-    }
 }
 
 /// The pure-value description of an inbound turn used to resolve deployments.
@@ -256,8 +289,9 @@ pub struct RouteRequest {
     pub estimated_input_tokens: u32,
     pub has_tools: bool,
     pub has_images: bool,
-    /// Models excluded by installation/key/team policy.
-    pub excluded_models: BTreeSet<String>,
+    /// Model ids excluded by installation/key/team policy. Ids, not names, so
+    /// that renaming a model cannot silently stop a deny from matching.
+    pub excluded_model_ids: BTreeSet<String>,
     /// If `Some`, only these providers are enabled (allowlist ceiling).
     pub enabled_providers: Option<BTreeSet<String>>,
     /// Providers explicitly denied.

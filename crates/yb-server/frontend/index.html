@@ -49,6 +49,17 @@
   .pills { display:flex; flex-wrap:wrap; align-items:center; gap:5px; }
   .nowrap { white-space:nowrap; }
   .tablewrap { overflow-x:auto; }
+  /* Model group header: one row per model, its deployments listed beneath. */
+  tr.grp > td { background:var(--panel2); border-top:1px solid var(--line); padding:9px 10px; }
+  .pencil { margin-left:2px; cursor:pointer; opacity:.45; font-size:12px; text-decoration:none; }
+  .pencil:hover { opacity:1; }
+  .inline-edit { display:inline-flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .inline-edit input { padding:4px 8px; font-size:13px; min-width:220px; }
+  .inline-edit .ok, .inline-edit .no { cursor:pointer; font-weight:600; text-decoration:none; }
+  .inline-edit .ok { color:var(--ok); }
+  .inline-edit .no { color:var(--mut); }
+  .inline-edit .no:hover { color:var(--bad); }
+  .inline-edit .hint { flex-basis:100%; font-size:11px; }
   /* Token/pill input with a typeahead dropdown (see TokenInput in main.tsx). */
   .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:10px; }
   .fld { display:block; }

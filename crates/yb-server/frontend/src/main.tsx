@@ -49,7 +49,7 @@ const SUBJECTS = ['key', 'user', 'team'];
 const usd = (micros: number) => '$' + (micros / 1e6).toFixed(2);
 const uuid = () => (crypto as any).randomUUID();
 const nowIso = () => new Date().toISOString();
-const isUnrestricted = (a: any) => !a || !(a.allowed_models?.length || a.denied_models?.length || a.allowed_providers?.length || a.denied_providers?.length);
+const isUnrestricted = (a: any) => !a || !(a.allowed_model_ids?.length || a.denied_model_ids?.length || a.allowed_providers?.length || a.denied_providers?.length);
 
 /**
  * How a key's access reads once its team is taken into account.
@@ -313,23 +313,32 @@ function TokenInput({ kind, value, onChange, placeholder, labelFor, strict }: {
 /** Edit an AccessPolicy as four pill lists with backend-completed typeahead. */
 function AccessEditor({ value, onSave }: { value: any; onSave: (p: any) => void }) {
   const [p, setP] = useState<any>({
-    allowed_models: value.allowed_models || [],
-    denied_models: value.denied_models || [],
+    allowed_model_ids: value.allowed_model_ids || [],
+    denied_model_ids: value.denied_model_ids || [],
     allowed_providers: value.allowed_providers || [],
     denied_providers: value.denied_providers || [],
   });
+  // Models are stored as ids, so the pills need a name to show. A model the
+  // list no longer has renders as an explicit "unknown" rather than as a
+  // plausible-looking name — a dangling reference should be visible, which is
+  // the whole reason policies hold ids instead of names.
+  const [{ data: models }] = useAsync<any[]>(() => api('/models'));
+  const nameOf = (id: string) => (models || []).find((m) => m.id === id)?.name
+    || 'unknown model (' + id.slice(0, 8) + '…)';
   const field = (k: string, kind: string, label: string, note: string) => (
     <div class="fld">
       <span class="lbl">{label} — {note}</span>
       <TokenInput kind={kind} value={p[k]} placeholder={'add a ' + kind}
+                  strict={kind === 'model'}
+                  labelFor={kind === 'model' ? nameOf : undefined}
                   onChange={(v) => setP((s: any) => ({ ...s, [k]: v }))} />
     </div>
   );
   return (
     <div style="margin-top:6px">
       <div class="grid2">
-        {field('allowed_models', 'model', 'allowed models', 'empty means every model')}
-        {field('denied_models', 'model', 'denied models', 'always wins')}
+        {field('allowed_model_ids', 'model', 'allowed models', 'empty means every model')}
+        {field('denied_model_ids', 'model', 'denied models', 'always wins')}
         {field('allowed_providers', 'provider', 'allowed providers', 'empty means every provider')}
         {field('denied_providers', 'provider', 'denied providers', 'always wins')}
       </div>
@@ -388,8 +397,70 @@ function BudgetEditor({ subjectType, subjectId }: { subjectType: string; subject
   );
 }
 
+/**
+ * A model's canonical name, renamed in place.
+ *
+ * The pencil lives on the model group header, not on a deployment row: a rename
+ * is a property of the model, so N deployments of one model still offer exactly
+ * one. The server leaves the old name behind as an alias, so a success reloads
+ * the alias list too — the old name reappearing as a pill is the visible proof
+ * that clients still sending it keep resolving.
+ *
+ * Enter commits, Escape cancels. Deliberately *not* commit-on-blur: clicking
+ * anywhere on the page should never rename a model, and pairing commit-on-blur
+ * with a visible cancel button is the classic trap where clicking cancel blurs
+ * first and commits.
+ */
+function ModelName({ model, admin, onRenamed }: { model: any; admin: boolean; onRenamed: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [v, setV] = useState(model.name);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const open = () => { setV(model.name); setErr(''); setEditing(true); };
+  const cancel = () => { setEditing(false); setErr(''); };
+  const save = async () => {
+    const name = v.trim();
+    if (!name || name === model.name) { cancel(); return; }
+    setBusy(true); setErr('');
+    try {
+      await api('/models/' + encodeURIComponent(model.id) + '/name', { method: 'PUT', body: { name } });
+      setEditing(false);
+      onRenamed();
+    } catch (e: any) {
+      // Stay open on failure so a "that name is taken" is fixable in place.
+      setErr(e.message);
+    } finally { setBusy(false); }
+  };
+
+  if (!editing) {
+    return (
+      <span class="mono">{model.name}
+        {admin && <a class="pencil" title="Rename this model" onClick={open}>✎</a>}
+      </span>
+    );
+  }
+  return (
+    <span class="inline-edit">
+      <input class="mono" autofocus value={v} disabled={busy}
+             onInput={(e: any) => setV(e.target.value)}
+             onKeyDown={(e: any) => {
+               if (e.key === 'Enter') { e.preventDefault(); save(); }
+               else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+             }} />
+      <a class="ok" title="Save" onClick={save}>✓</a>
+      <a class="no" title="Cancel" onClick={cancel}>✕</a>
+      {err ? <span class="err hint">{err}</span>
+           : <span class="mut hint">Enter to save · Esc to cancel</span>}
+    </span>
+  );
+}
+
 function Models({ admin }: { admin: boolean }) {
-  const [{ loading, data, error }, reload] = useAsync<any[]>(() => api('/models'));
+  // Two lists: the model entities (what a rename acts on) and the deployments
+  // (the upstream fan-out). The table groups the second under the first.
+  const [{ loading, data, error }, reload] = useAsync<any[]>(() => api('/deployments'));
+  const [{ data: modelData }, reloadModels] = useAsync<any[]>(() => api('/models'));
   const blank = { model_name: '', provider: '', upstream_model: '', upstream_format: 'openai_chat', api_base: '', api_key: '', extra: { cloudflare_access: false } };
   const [f, setF] = useState<any>(blank);
   const [msg, setMsg] = useState('');
@@ -405,62 +476,77 @@ function Models({ admin }: { admin: boolean }) {
       const body: any = { ...f };
       if (!body.api_base) delete body.api_base;
       if (!body.api_key) delete body.api_key;
-      await api('/models', { method: 'POST', body });
-      setF(blank); setShowAdd(false); reload();
+      await api('/deployments', { method: 'POST', body });
+      setF(blank); setShowAdd(false); reload(); reloadModels();
     } catch (e: any) { setMsg(e.message); }
   };
   const [showAdd, setShowAdd] = useState(false);
-  const del = async (id: string) => { if (confirm('Delete this deployment?')) { await api('/models/' + id, { method: 'DELETE' }); reload(); } };
+  const del = async (id: string) => { if (confirm('Delete this deployment?')) { await api('/deployments/' + id, { method: 'DELETE' }); reload(); reloadModels(); } };
   const [{ data: aliasData }, reloadAliases] = useAsync<any[]>(() => api('/aliases'));
-  const aliasesFor = (name: string) => (aliasData || []).filter((a) => a.target === name);
+  const aliasesFor = (modelId: string) => (aliasData || []).filter((a) => a.model_id === modelId);
   const addAlias = async (target: string) => {
     const a = prompt('New alias for ' + target + ':');
     if (!a) return;
     try { await api('/aliases', { method: 'POST', body: { alias: a.trim(), target } }); reloadAliases(); }
     catch (e: any) { alert(e.message); }
   };
+  // A rename leaves the old name behind as an alias, so both lists move.
+  const afterRename = () => { reloadModels(); reloadAliases(); reload(); };
+  const deploymentsFor = (modelId: string) => (data || []).filter((d) => d.model_id === modelId);
   const delAlias = async (a: string) => { if (confirm('Remove alias “' + a + '”?')) { await api('/aliases/' + encodeURIComponent(a), { method: 'DELETE' }); reloadAliases(); } };
   return (
     <Fragment>
       <div class="card">
-        <div class="row"><h2 style="margin:0">Models <span class="mut">— the live deployment list (DB-backed)</span></h2>
+        <div class="row"><h2 style="margin:0">Models <span class="mut">— each public name, with the deployments behind it</span></h2>
           <span class="sp" style="flex:1"></span>
           {admin && <button class="btn" onClick={() => { setMsg(''); setShowAdd(true); }}>+ Add deployment</button>}</div>
         {error && <p class="err" style="margin-top:10px">{error}</p>}
-        {loading ? <p class="empty">Loading…</p> : !data || !data.length
+        {loading ? <p class="empty">Loading…</p> : !modelData || !modelData.length
           ? <p class="empty">No models. {admin ? 'Click “Add deployment” or run ' : 'Ask an admin, or run '}<span class="mono">gateway import</span>.</p>
           : (
             <div class="tablewrap">
               <table style="margin-top:10px">
-                <thead><tr><th>model_name</th><th>provider</th><th>upstream_model</th><th>format</th><th>aliases</th><th>api_base</th><th>headers</th>{admin && <th></th>}</tr></thead>
-                <tbody>{data.map((m) => (
-                  <tr key={m.id}>
-                    <td class="mono nowrap">{m.model_name}</td><td class="nowrap">{m.provider}</td>
-                    <td class="mono nowrap">{m.upstream_model}</td>
-                    <td><span class="pill">{m.upstream_format}</span></td>
-                    <td>
-                      <div class="pills">
-                        {aliasesFor(m.model_name).map((a) => (
-                          <span key={a.alias} class="pill mono">{a.alias}{admin && <a class="x" title="Remove alias" onClick={() => delAlias(a.alias)}>×</a>}</span>
-                        ))}
-                        {admin && <a onClick={() => addAlias(m.model_name)} style="cursor:pointer" class="mut">+ alias</a>}
-                      </div>
-                    </td>
-                    <td class="mono mut">{m.api_base || '—'}</td>
-                    <td>
-                      <div class="pills">
-                        {m.extra?.cloudflare_access
-                          && <span class="pill" title="Sends the configured Cloudflare Access service token">CF Access</span>}
-                        {Object.keys(m.extra?.headers || {}).length > 0
-                          && <span class="pill mono" title={Object.keys(m.extra.headers).join(', ')}>
-                               +{Object.keys(m.extra.headers).length} hdr</span>}
-                        {!m.extra?.cloudflare_access && !Object.keys(m.extra?.headers || {}).length
-                          && <span class="mut">—</span>}
-                      </div>
-                    </td>
-                    {admin && <td><button class="ghost del" onClick={() => del(m.id)}>delete</button></td>}
-                  </tr>
-                ))}</tbody>
+                <thead><tr><th>provider</th><th>upstream_model</th><th>format</th><th>api_base</th><th>headers</th>{admin && <th></th>}</tr></thead>
+                {modelData.map((model) => (
+                  <tbody key={model.id}>
+                    <tr class="grp">
+                      <td colSpan={admin ? 6 : 5}>
+                        <div class="pills">
+                          <ModelName model={model} admin={admin} onRenamed={afterRename} />
+                          {aliasesFor(model.id).map((a) => (
+                            <span key={a.alias} class="pill mono">{a.alias}{admin && <a class="x" title="Remove alias" onClick={() => delAlias(a.alias)}>×</a>}</span>
+                          ))}
+                          {admin && <a onClick={() => addAlias(model.name)} style="cursor:pointer" class="mut">+ alias</a>}
+                        </div>
+                      </td>
+                    </tr>
+                    {deploymentsFor(model.id).map((m) => (
+                      <tr key={m.id}>
+                        <td class="nowrap">{m.provider}</td>
+                        <td class="mono nowrap">{m.upstream_model}</td>
+                        <td><span class="pill">{m.upstream_format}</span></td>
+                        <td class="mono mut">{m.api_base || '—'}</td>
+                        <td>
+                          <div class="pills">
+                            {m.extra?.cloudflare_access
+                              && <span class="pill" title="Sends the configured Cloudflare Access service token">CF Access</span>}
+                            {Object.keys(m.extra?.headers || {}).length > 0
+                              && <span class="pill mono" title={Object.keys(m.extra.headers).join(', ')}>
+                                   +{Object.keys(m.extra.headers).length} hdr</span>}
+                            {!m.extra?.cloudflare_access && !Object.keys(m.extra?.headers || {}).length
+                              && <span class="mut">—</span>}
+                          </div>
+                        </td>
+                        {admin && <td><button class="ghost del" onClick={() => del(m.id)}>delete</button></td>}
+                      </tr>
+                    ))}
+                    {!deploymentsFor(model.id).length && (
+                      <tr><td colSpan={admin ? 6 : 5} class="mut" style="padding-left:18px">
+                        no deployments — this model is not routable
+                      </td></tr>
+                    )}
+                  </tbody>
+                ))}
               </table>
             </div>
           )}

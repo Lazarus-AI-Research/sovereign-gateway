@@ -596,8 +596,7 @@ async fn invite_provisions_local_user_with_role_and_password_create_is_blocked()
 
 /// Seed a deployment row so `/complete?kind=model` has something to find.
 async fn seed_dep(store: &dyn Store, model_name: &str, provider: &str) {
-    let dep = yb_core::DeploymentRecord {
-        id: new_id(),
+    let dep = yb_core::NewDeployment {
         model_name: model_name.into(),
         provider: provider.into(),
         upstream_model: model_name.into(),
@@ -609,11 +608,14 @@ async fn seed_dep(store: &dyn Store, model_name: &str, provider: &str) {
         health_check: Default::default(),
         health_path: None,
         extra: Default::default(),
-        created_at: now(),
-        updated_at: now(),
-        deleted_at: None,
     };
     store.create_deployment(&dep).await.unwrap();
+}
+
+/// The model id behind a public name, for tests that must speak ids (an access
+/// policy) while reading like they speak names.
+async fn model_id(store: &dyn Store, name: &str) -> String {
+    store.get_model_by_name(name).await.unwrap().expect("model exists").id
 }
 
 /// Log `user_id` in by minting a session row directly, returning the cookie
@@ -658,15 +660,9 @@ async fn complete_suggests_models_and_providers_that_exist() {
     seed_dep(store.as_ref(), "gpt-4o", "azure").await;
     seed_dep(store.as_ref(), "claude-sonnet", "anthropic").await;
     // Four aliases, one more than a hint names before it summarizes the rest.
+    let sonnet_id = model_id(store.as_ref(), "claude-sonnet").await;
     for alias in ["smart", "sonnet", "default", "big"] {
-        store
-            .upsert_alias(&yb_core::model::ModelAlias {
-                alias: alias.into(),
-                target: "claude-sonnet".into(),
-                created_at: now(),
-            })
-            .await
-            .unwrap();
+        store.upsert_alias(alias, &sonnet_id).await.unwrap();
     }
 
     // The seeded user is a plain member — reading the catalog is enough.
@@ -680,14 +676,16 @@ async fn complete_suggests_models_and_providers_that_exist() {
     // access policy is actually evaluated against.
     let (status, v) = get_json(&app, "/admin/v1/complete?kind=model", &cookie).await;
     assert_eq!(status, StatusCode::OK);
-    let names: Vec<&str> = v.as_array().unwrap().iter().map(|s| s["value"].as_str().unwrap()).collect();
+    // `value` is the model id now (that is what a policy stores); the name is
+    // the label.
+    let names: Vec<&str> = v.as_array().unwrap().iter().map(|s| s["label"].as_str().unwrap()).collect();
     assert_eq!(names, vec!["claude-sonnet", "gpt-4o"]);
     // Both providers of gpt-4o show up as a hint; the alias annotates its target.
     let hint = |name: &str| -> String {
         v.as_array()
             .unwrap()
             .iter()
-            .find(|s| s["value"] == name)
+            .find(|s| s["label"] == name)
             .unwrap()["hint"]
             .as_str()
             .unwrap()
@@ -700,14 +698,18 @@ async fn complete_suggests_models_and_providers_that_exist() {
     );
 
     // Prefix filtering is case-insensitive.
+    let gpt_id = model_id(store.as_ref(), "gpt-4o").await;
     let (_, v) = get_json(&app, "/admin/v1/complete?kind=model&q=GPT", &cookie).await;
     assert_eq!(v.as_array().unwrap().len(), 1);
-    assert_eq!(v[0]["value"], "gpt-4o");
+    assert_eq!(v[0]["label"], "gpt-4o");
+    assert_eq!(v[0]["value"], gpt_id);
 
-    // An alias finds its model, but the suggested value stays canonical — an
-    // access policy is matched against the model name, never the alias.
+    // An alias finds its model, but the suggested value is the model id — an
+    // access policy is matched against the model, never the alias, and holding
+    // the id is what keeps that rule matching after a rename.
     let (_, v) = get_json(&app, "/admin/v1/complete?kind=model&q=smart", &cookie).await;
-    assert_eq!(v[0]["value"], "claude-sonnet");
+    assert_eq!(v[0]["label"], "claude-sonnet");
+    assert_eq!(v[0]["value"], sonnet_id);
 
     // Providers are distinct, with a deployment count as the hint.
     let (_, v) = get_json(&app, "/admin/v1/complete?kind=provider", &cookie).await;
@@ -754,6 +756,189 @@ async fn key_with(store: &dyn Store, access: AccessPolicy, team_id: Option<Strin
     .token
 }
 
+/// `PUT uri` with `body`, authenticated by a session cookie.
+async fn put_json(
+    app: &axum::Router,
+    uri: &str,
+    cookie: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// A session cookie for a freshly created admin, for the mutation endpoints.
+async fn admin_cookie(store: &dyn Store) -> String {
+    let admin = User {
+        id: new_id(),
+        username: format!("admin-{}", new_id()),
+        password_hash: "x".into(),
+        role: Role::Admin,
+        rpm_limit: None,
+        tpm_limit: None,
+        max_concurrent: None,
+        created_at: now(),
+        last_login_at: None,
+        deleted_at: None,
+    };
+    store.create_user(&admin).await.unwrap();
+    session_cookie(store, &admin.id).await
+}
+
+/// The headline behaviour: renaming leaves the old name working.
+///
+/// A rename that simply dropped the old name would be a silent outage for every
+/// client that hardcoded it, so the store inserts the old name as an alias in
+/// the same transaction. This asserts it end to end, through the router.
+#[tokio::test]
+async fn rename_keeps_the_old_name_routable() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "gpt-4o", "openai").await;
+    state.reload_models().await.unwrap();
+    let id = model_id(store.as_ref(), "gpt-4o").await;
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state.clone());
+
+    let (status, body) = put_json(
+        &app,
+        &format!("/admin/v1/models/{id}/name"),
+        &cookie,
+        json!({ "name": "gpt-4o-2024" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["name"], "gpt-4o-2024");
+    assert_eq!(body["id"], id, "rename must not change the model's identity");
+
+    // Discovery shows only the new name...
+    let (_, v) = get_json(&app, "/admin/v1/models", &cookie).await;
+    let names: Vec<&str> = v.as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["gpt-4o-2024"]);
+
+    // ...while the old one survives as an alias, pointing at the same model.
+    let aliases = store.list_aliases().await.unwrap();
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].alias, "gpt-4o");
+    assert_eq!(aliases[0].target, "gpt-4o-2024");
+
+    // And the router resolves both, with no restart.
+    let snap_resolves = |name: &str| {
+        use yb_core::Router as _;
+        let mut rq = yb_core::RouteRequest::default();
+        rq.requested_model = name.to_string();
+        state.router.resolve(&rq).is_ok()
+    };
+    assert!(snap_resolves("gpt-4o-2024"), "the new name must route");
+    assert!(snap_resolves("gpt-4o"), "the old name must still route via the alias");
+}
+
+/// The security regression this whole normalization exists for.
+///
+/// Under the old name-based policy this test fails: `denied_models: ["gpt-4o"]`
+/// silently stops matching the instant the model is renamed, so the key gains
+/// access to a model it was explicitly forbidden — no error, no log line.
+/// Holding the id makes the deny survive.
+#[tokio::test]
+async fn a_deny_survives_a_rename() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "gpt-4o", "openai").await;
+    seed_dep(store.as_ref(), "claude-sonnet", "anthropic").await;
+    state.reload_models().await.unwrap();
+
+    let denied_id = model_id(store.as_ref(), "gpt-4o").await;
+    let token = key_with(
+        store.as_ref(),
+        AccessPolicy {
+            denied_model_ids: vec![denied_id.clone()],
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state.clone());
+
+    // Denied before the rename.
+    let (_, v) = get_as(&app, "/v1/models", &token).await;
+    let listed = |v: &Value| -> Vec<String> {
+        v["data"].as_array().unwrap().iter()
+            .map(|m| m["id"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(listed(&v), vec!["claude-sonnet".to_string()]);
+
+    let (status, _) = put_json(
+        &app,
+        &format!("/admin/v1/models/{denied_id}/name"),
+        &cookie,
+        json!({ "name": "gpt-4o-renamed" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Still denied after it — under both its new and its old name.
+    let (_, v) = get_as(&app, "/v1/models", &token).await;
+    assert_eq!(
+        listed(&v),
+        vec!["claude-sonnet".to_string()],
+        "a renamed model must stay denied — this is the bug ids exist to prevent"
+    );
+}
+
+#[tokio::test]
+async fn rename_rejects_bad_input_and_non_admins() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "gpt-4o", "openai").await;
+    seed_dep(store.as_ref(), "claude-sonnet", "anthropic").await;
+    let id = model_id(store.as_ref(), "gpt-4o").await;
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state);
+
+    // A name another model already holds.
+    let (status, _) = put_json(&app, &format!("/admin/v1/models/{id}/name"), &cookie,
+                               json!({ "name": "claude-sonnet" })).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Blank, and whitespace-only, are both rejected.
+    for bad in ["", "   "] {
+        let (status, _) = put_json(&app, &format!("/admin/v1/models/{id}/name"), &cookie,
+                                   json!({ "name": bad })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "name {bad:?} should be rejected");
+    }
+
+    // An unknown model.
+    let (status, _) = put_json(&app, "/admin/v1/models/nope/name", &cookie,
+                               json!({ "name": "whatever" })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A plain member may read the catalog but not rename.
+    let member = store.list_users().await.unwrap().into_iter()
+        .find(|u| u.role == Role::Member).expect("seeded member");
+    let member_cookie = session_cookie(store.as_ref(), &member.id).await;
+    let (status, _) = put_json(&app, &format!("/admin/v1/models/{id}/name"), &member_cookie,
+                               json!({ "name": "member-rename" })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Nothing above changed the name.
+    assert_eq!(model_id(store.as_ref(), "gpt-4o").await, id);
+}
+
 /// `GET uri` bearing `token`, returning the status and parsed body.
 async fn get_as(app: &axum::Router, uri: &str, token: &str) -> (StatusCode, Value) {
     let resp = app
@@ -793,7 +978,7 @@ async fn model_discovery_lists_only_what_the_key_may_call() {
     let scoped = key_with(
         store.as_ref(),
         AccessPolicy {
-            allowed_models: vec!["gpt-4o".into()],
+            allowed_model_ids: vec![model_id(store.as_ref(), "gpt-4o").await],
             ..Default::default()
         },
         None,
@@ -871,7 +1056,7 @@ async fn discovery_applies_the_team_policy_too() {
         id: new_id(),
         name: "locked".into(),
         access: AccessPolicy {
-            allowed_models: vec!["claude-sonnet".into()],
+            allowed_model_ids: vec![model_id(store.as_ref(), "claude-sonnet").await],
             ..Default::default()
         },
         created_at: now(),
@@ -896,7 +1081,7 @@ async fn a_hidden_model_cannot_be_confirmed_by_fetching_it_directly() {
     let token = key_with(
         store.as_ref(),
         AccessPolicy {
-            allowed_models: vec!["gpt-4o".into()],
+            allowed_model_ids: vec![model_id(store.as_ref(), "gpt-4o").await],
             ..Default::default()
         },
         None,

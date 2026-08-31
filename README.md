@@ -87,11 +87,20 @@ TOKEN=$(curl -s -b cookies.txt -X POST localhost:8080/admin/v1/keys \
   -H 'content-type: application/json' \
   -d '{"name":"prod"}' | jq -r .token)
 
-# Manage models at runtime (router hot-reloads, no restart):
-curl -s -b cookies.txt localhost:8080/admin/v1/models
-curl -s -b cookies.txt -X POST localhost:8080/admin/v1/models \
+# Manage models at runtime (router hot-reloads, no restart).
+# A model is the public name clients request; a deployment is one concrete
+# upstream behind it. One model can have several deployments — that is the
+# load-balancing fan-out.
+curl -s -b cookies.txt localhost:8080/admin/v1/models        # the entities
+curl -s -b cookies.txt localhost:8080/admin/v1/deployments   # their upstreams
+curl -s -b cookies.txt -X POST localhost:8080/admin/v1/deployments \
   -H 'content-type: application/json' \
   -d '{"model_name":"gpt-4o","provider":"openai","upstream_model":"gpt-4o","upstream_format":"openai_chat","api_key":"sk-..."}'
+
+# Rename a model. The old name is kept as an alias automatically, so clients
+# that still send it keep working.
+curl -s -b cookies.txt -X PUT localhost:8080/admin/v1/models/$MODEL_ID/name \
+  -H 'content-type: application/json' -d '{"name":"gpt-4o-2024"}'
 
 # Aliases: extra public names that resolve to a model (e.g. "gpt-4" -> "gpt-4o").
 curl -s -b cookies.txt -X POST localhost:8080/admin/v1/aliases \
@@ -127,7 +136,7 @@ Add `"stream": true` (or call `:streamGenerateContent` for Gemini) for SSE.
 
 ## Offline smoke test
 
-`scripts/smoke_sqlite.sh` writes a throwaway serve config and a separate models file (SQLite, the offline `upstream.mode = "mock"` canned upstream, and reqlog), boots the binary, and asserts: boot, health, the seed model imported into the DB, a runtime model add via `/admin/v1/models`, admin key issuance, all four inference surfaces, a telemetry row, and a parquet reqlog shard. Fully offline — no environment variables, no provider keys. It cleans up after itself and is safe to re-run:
+`scripts/smoke_sqlite.sh` writes a throwaway serve config and a separate models file (SQLite, the offline `upstream.mode = "mock"` canned upstream, and reqlog), boots the binary, and asserts: boot, health, the seed model imported into the DB, a runtime deployment add via `/admin/v1/deployments`, admin key issuance, all four inference surfaces, a telemetry row, and a parquet reqlog shard. Fully offline — no environment variables, no provider keys. It cleans up after itself and is safe to re-run:
 
 ```sh
 ./scripts/smoke_sqlite.sh

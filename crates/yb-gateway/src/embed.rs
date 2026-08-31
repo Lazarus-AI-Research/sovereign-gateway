@@ -184,8 +184,8 @@ impl Gateway {
 /// Distill the caller's policy into a [`RouteRequest`] for an embeddings turn —
 /// same policy math as chat, with embed-appropriate signals.
 fn build_embed_route_request(req: &EmbedRequest, ctx: &RequestCtx) -> RouteRequest {
-    let mut excluded_models = ctx.excluded_models.clone();
-    excluded_models.extend(ctx.access.denied_models.iter().cloned());
+    let mut excluded_model_ids = ctx.excluded_model_ids.clone();
+    excluded_model_ids.extend(ctx.access.denied_model_ids.iter().cloned());
 
     let mut denied_providers = ctx.excluded_providers.clone();
     denied_providers.extend(ctx.access.denied_providers.iter().cloned());
@@ -211,7 +211,7 @@ fn build_embed_route_request(req: &EmbedRequest, ctx: &RequestCtx) -> RouteReque
         estimated_input_tokens: (chars / 4).min(u32::MAX as usize) as u32,
         has_tools: false,
         has_images: req.inputs.iter().any(|i| i.has_image()),
-        excluded_models,
+        excluded_model_ids,
         enabled_providers,
         denied_providers,
         preferred_models: Vec::new(),

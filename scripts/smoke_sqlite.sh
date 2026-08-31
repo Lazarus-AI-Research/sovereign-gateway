@@ -8,8 +8,8 @@
 # proves the full lifecycle works with no network and no provider API keys:
 #
 #   1. binary boots and /health returns ok
-#   2. the seed model from the config is in the DB (GET /admin/v1/models)
-#   3. a model is added at runtime via POST /admin/v1/models (router hot-reload)
+#   2. the seed model from the config is in the DB (GET /admin/v1/deployments)
+#   3. a deployment is added at runtime via POST /admin/v1/deployments (hot-reload)
 #   4. a virtual key (yb_...) is issued via the admin API for the admin user (a DB write)
 #   5. all four inference surfaces are exercised with that key:
 #        POST /v1/messages                            (Anthropic Messages)
@@ -150,18 +150,18 @@ pass "authenticated as $(jq -r '.username' <<<"$ME") (role=$(jq -r '.role' <<<"$
 
 # ---- 3. the seed model is in the DB; add another at runtime ----------------
 
-say "listing models (GET /admin/v1/models) — proves the file model was seeded into the DB"
-MODELS="$(curl -fsS "$BASE/admin/v1/models" -b "$JAR")" || fail "list models failed"
+say "listing deployments (GET /admin/v1/deployments) — proves the file model was seeded into the DB"
+MODELS="$(curl -fsS "$BASE/admin/v1/deployments" -b "$JAR")" || fail "list deployments failed"
 COUNT="$(jq 'length' <<<"$MODELS")"
 [[ "$COUNT" -ge 1 ]] || fail "expected >=1 seeded model, got: $MODELS"
 pass "$COUNT model(s) in DB: $(jq -r '[.[].model_name]|join(",")' <<<"$MODELS")"
 
-say "adding a model at runtime (POST /admin/v1/models) — hot-reloads the router"
-curl -fsS -X POST "$BASE/admin/v1/models" \
+say "adding a deployment at runtime (POST /admin/v1/deployments) — hot-reloads the router"
+curl -fsS -X POST "$BASE/admin/v1/deployments" \
   -b "$JAR" -H 'content-type: application/json' \
   -d '{"model_name":"runtime-added","provider":"openai","upstream_model":"gpt-4o","upstream_format":"openai_chat"}' \
   >/dev/null || fail "create model failed"
-COUNT2="$(curl -fsS "$BASE/admin/v1/models" -b "$JAR" | jq 'length')"
+COUNT2="$(curl -fsS "$BASE/admin/v1/deployments" -b "$JAR" | jq 'length')"
 [[ "$COUNT2" -eq $((COUNT + 1)) ]] || fail "model count did not grow after add ($COUNT -> $COUNT2)"
 pass "model count $COUNT -> $COUNT2 (DB-backed, no restart)"
 
