@@ -44,6 +44,35 @@ fn enc_enum<T: serde::Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_default()
 }
 
+/// The explicit column list for `deployments` reads.
+///
+/// Deliberately not `SELECT *`. `migrate` adds columns to already-deployed
+/// databases with `ALTER TABLE`, which appends them at the end, so a migrated
+/// database and a freshly created one order their columns differently. Worse, a
+/// star select against a table altered earlier in the same process can panic
+/// inside sqlx: the cached column metadata and the live statement's column count
+/// disagree, and the row is indexed with the wrong one. Naming the columns keeps
+/// reads pinned to the shape this code expects.
+const DEPLOYMENT_COLS: &str = "id, model_name, provider, upstream_model, api_base, api_key, \
+     upstream_format, weight, pricing, health_check, health_path, extra, natural_key, \
+     created_at, updated_at, deleted_at";
+
+/// Encode a deployment's `extra` object as JSON (`{}` when empty).
+fn enc_extra(x: &yb_core::Extra) -> String {
+    serde_json::to_string(x).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Decode the `extra` column. A NULL/blank/unparseable value means "no extras"
+/// rather than a hard error, so one bad row cannot take down the whole model
+/// list.
+fn dec_extra(raw: Option<String>) -> yb_core::Extra {
+    raw.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
 /// Encode optional pricing as JSON text (`None` → SQL NULL).
 fn enc_pricing(p: &Option<yb_core::catalog::ModelPrice>) -> Option<String> {
     p.as_ref().map(|p| serde_json::to_string(p).unwrap_or_default())
@@ -72,6 +101,7 @@ fn map_deployment(row: &SqliteRow) -> Result<DeploymentRecord> {
         ))
         .map_err(storage_err)?,
         health_path: row.get("health_path"),
+        extra: dec_extra(row.get("extra")),
         created_at: parse_ts(&row.get::<String, _>("created_at"))?,
         updated_at: parse_ts(&row.get::<String, _>("updated_at"))?,
         deleted_at: parse_ts_opt(row.get("deleted_at"))?,
@@ -239,6 +269,7 @@ impl Store for SqliteStore {
             "ALTER TABLE api_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'inference'",
             "ALTER TABLE deployments ADD COLUMN health_check TEXT NOT NULL DEFAULT 'none'",
             "ALTER TABLE deployments ADD COLUMN health_path TEXT",
+            "ALTER TABLE deployments ADD COLUMN extra TEXT NOT NULL DEFAULT '{}'",
         ] {
             let _ = sqlx::raw_sql(ddl).execute(&self.pool).await;
         }
@@ -870,10 +901,10 @@ impl Store for SqliteStore {
 
     // ---- deployments (the live model list) ----------------------------
     async fn list_deployments(&self) -> Result<Vec<DeploymentRecord>> {
-        let rows = sqlx::query(
-            "SELECT * FROM deployments WHERE deleted_at IS NULL \
-             ORDER BY model_name, provider, upstream_model",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {DEPLOYMENT_COLS} FROM deployments WHERE deleted_at IS NULL \
+             ORDER BY model_name, provider, upstream_model"
+        ))
         .fetch_all(&self.pool)
         .await
         .map_err(storage_err)?;
@@ -881,7 +912,9 @@ impl Store for SqliteStore {
     }
 
     async fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
-        let row = sqlx::query("SELECT * FROM deployments WHERE id = ? AND deleted_at IS NULL")
+        let row = sqlx::query(&format!(
+            "SELECT {DEPLOYMENT_COLS} FROM deployments WHERE id = ? AND deleted_at IS NULL"
+        ))
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -893,8 +926,8 @@ impl Store for SqliteStore {
         sqlx::query(
             "INSERT INTO deployments (id, model_name, provider, upstream_model, \
              api_base, api_key, upstream_format, weight, pricing, health_check, health_path, \
-             natural_key, created_at, updated_at, deleted_at) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
+             extra, natural_key, created_at, updated_at, deleted_at) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
         )
         .bind(&dep.id)
         .bind(&dep.model_name)
@@ -907,6 +940,7 @@ impl Store for SqliteStore {
         .bind(enc_pricing(&dep.pricing))
         .bind(dep.health_check.as_str())
         .bind(&dep.health_path)
+        .bind(enc_extra(&dep.extra))
         .bind(dep.natural_key())
         .bind(ts(&dep.created_at))
         .bind(ts(&dep.updated_at))

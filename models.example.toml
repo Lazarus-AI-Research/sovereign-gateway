@@ -18,6 +18,7 @@ model_name = "gpt-4o"            # the public name clients request
   # health_check = "none"        # none | http_ok | models_list | probe — independent of upstream_format
   # health_path = "/health"      # for http_ok: absolute URL, or path on api_base's origin
   # api_base = "https://api.openai.com/v1"        # optional override
+  # extra = { cloudflare_access = true }          # see the vLLM example below
   # pricing = { input_per_1m = 2.5, output_per_1m = 10.0 }   # optional USD/1M overrides
 
 [[model]]
@@ -52,3 +53,36 @@ model_name = "voyage-multimodal-3"
   upstream_model = "voyage-multimodal-3"
   upstream_format = "voyage_embed"
   api_key = "pa-..."
+
+# ---------------------------------------------------------------------------
+# `extra` — an open string→value object stored on the deployment row, for knobs
+# that are per-deployment rather than per-format. Unrecognized keys are kept
+# verbatim, so it is additive and needs no migration. Two keys are understood:
+#
+#   cloudflare_access = true    send the Cloudflare Access service token from
+#                               [upstream.cloudflare_access] in gateway.toml, so
+#                               the call passes a Zero Trust edge policy. The
+#                               flag selects the credential; the credential
+#                               itself is file-owned and never stored here.
+#   headers = { ... }           literal headers to add to every upstream call.
+#
+# Precedence is by decreasing authority: the wire format's own auth first, then
+# the file-owned service token, then these literal headers. A name already set
+# is never overwritten, so a deployment row cannot forge the service token or
+# slip a second Authorization past the origin.
+#
+# Below: an OpenAI-compatible (vLLM) server behind Cloudflare Access. Both
+# credentials are required — the service token to get past the edge, and api_key
+# for the origin's own auth.
+# ---------------------------------------------------------------------------
+[[model]]
+model_name = "qwen3-27b"
+  [[model.deployments]]
+  provider = "vllm"
+  upstream_model = "Qwen3.8-27B"
+  upstream_format = "openai_chat"
+  api_base = "https://vllm.example.com/v1"
+  api_key = "..."                # the origin's key, behind the edge
+  extra = { cloudflare_access = true, headers = { "X-Tenant" = "acme" } }
+  health_check = "http_ok"
+  health_path = "/health"

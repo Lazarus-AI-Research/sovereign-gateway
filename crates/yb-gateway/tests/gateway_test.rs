@@ -262,6 +262,7 @@ fn test_router() -> DeploymentRouter {
             pricing: None, // falls back to the built-in gpt-4o price
             health_check: Default::default(),
             health_path: None,
+            extra: Default::default(),
         }],
     }];
     DeploymentRouter::from_models(models, HashMap::new(), HashMap::new(), Strategy::Simple)
@@ -463,6 +464,7 @@ fn embed_router() -> DeploymentRouter {
                 pricing: None,
                 health_check: Default::default(),
                 health_path: None,
+                extra: Default::default(),
             }],
         },
         ModelConfig {
@@ -478,6 +480,7 @@ fn embed_router() -> DeploymentRouter {
                 pricing: None,
                 health_check: Default::default(),
                 health_path: None,
+                extra: Default::default(),
             }],
         },
     ];

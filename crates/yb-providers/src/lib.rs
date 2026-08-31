@@ -30,8 +30,9 @@ use futures::Stream;
 
 pub use http::HttpClient;
 pub use mock::{MockBody, MockClient};
-pub use route::{
-    auth_headers, build_embed_url, build_url, embed_auth_headers, is_model_not_found, is_retryable,
+pub use route::{append_headers, 
+    auth_headers, build_embed_url, build_url, cloudflare_access_headers, embed_auth_headers,
+    is_model_not_found, is_retryable,
 };
 
 /// A boxed, owned byte stream as returned by a streaming upstream response.

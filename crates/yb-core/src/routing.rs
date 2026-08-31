@@ -3,7 +3,7 @@
 use crate::catalog::ModelPrice;
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The wire protocol a **chat** surface or upstream speaks. Chat and embedding
 /// formats are disjoint types — there is no translation between them — so this
@@ -119,6 +119,45 @@ impl HealthCheck {
     }
 }
 
+/// Open-ended per-deployment extras: a `string → value` JSON object stored on
+/// the deployment row, so new knobs are additive and need no migration.
+///
+/// Two keys are understood today:
+///
+/// - `cloudflare_access` (bool) — present the Cloudflare Access service token so
+///   the request passes a Zero Trust edge policy. The flag only selects *which*
+///   credential to send; the credential itself lives in `gateway.toml`
+///   (`[upstream.cloudflare_access]`), is immutable at runtime, and is never
+///   stored here, returned by the admin API, or editable in the UI.
+/// - `headers` (string map) — literal request headers to add.
+///
+/// Any other key is preserved verbatim, so a value written by a newer build
+/// survives a round-trip through an older one.
+///
+/// ```toml
+/// extra = { cloudflare_access = true, headers = { "X-Tenant" = "acme" } }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Extra {
+    /// Send the `CF-Access-Client-Id` / `CF-Access-Client-Secret` service-token
+    /// pair from `[upstream.cloudflare_access]`.
+    pub cloudflare_access: bool,
+    /// Literal headers to add to every upstream call for this deployment. These
+    /// are applied *last* and never displace auth (see `append_headers`).
+    pub headers: BTreeMap<String, String>,
+    /// Keys this build does not interpret, kept so they round-trip intact.
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Extra {
+    /// Whether nothing is set — the common case, stored as `{}`.
+    pub fn is_empty(&self) -> bool {
+        !self.cloudflare_access && self.headers.is_empty() && self.rest.is_empty()
+    }
+}
+
 /// One concrete upstream binding for a public model name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deployment {
@@ -144,6 +183,9 @@ pub struct Deployment {
     /// URL for `http_ok` checks: absolute, or relative to `api_base`'s origin.
     #[serde(default)]
     pub health_path: Option<String>,
+    /// Open-ended per-deployment extras (see [`Extra`]).
+    #[serde(default)]
+    pub extra: Extra,
 }
 
 /// A persisted deployment row: the live model list lives in the database, so a
@@ -167,6 +209,9 @@ pub struct DeploymentRecord {
     pub health_check: HealthCheck,
     #[serde(default)]
     pub health_path: Option<String>,
+    /// Open-ended per-deployment extras (see [`Extra`]).
+    #[serde(default)]
+    pub extra: Extra,
     pub created_at: crate::ids::Timestamp,
     pub updated_at: crate::ids::Timestamp,
     pub deleted_at: Option<crate::ids::Timestamp>,
@@ -186,6 +231,7 @@ impl DeploymentRecord {
             pricing: self.pricing,
             health_check: self.health_check,
             health_path: self.health_path.clone(),
+            extra: self.extra.clone(),
         }
     }
 

@@ -132,6 +132,48 @@ pub fn embed_auth_headers(fmt: EmbedFormat, api_key: &str) -> Vec<(String, Strin
     }
 }
 
+/// The Cloudflare Access service-token header pair.
+///
+/// Cloudflare Zero Trust fronts an origin and rejects unauthenticated traffic at
+/// the edge with a `403`. A *service token* — a client id and secret issued by
+/// Cloudflare — is presented in these two headers so machine-to-machine calls
+/// satisfy the application policy.
+///
+/// This is edge auth and is **orthogonal** to the deployment's own upstream
+/// credential: both are sent, and the origin still applies its own auth (a vLLM
+/// server behind Access still wants its `Authorization: Bearer …`).
+pub fn cloudflare_access_headers(client_id: &str, client_secret: &str) -> Vec<(String, String)> {
+    vec![
+        ("cf-access-client-id".to_string(), client_id.to_string()),
+        (
+            "cf-access-client-secret".to_string(),
+            client_secret.to_string(),
+        ),
+    ]
+}
+
+/// Append `extra` to `headers`, skipping any header whose name is already
+/// present (compared case-insensitively).
+///
+/// The skip is the point: extras are attacker-adjacent in a way auth is not —
+/// they come from a database row an admin can edit, while the wire-format auth
+/// headers and the Cloudflare service token come from the deployment's own
+/// credential and from `gateway.toml`. Appending blindly would let a row inject
+/// a second `authorization` (ambiguous to the origin) or a forged
+/// `cf-access-client-id`. First writer wins, so callers should push in order of
+/// decreasing authority: wire auth, then the file-owned service token, then the
+/// deployment's literal headers.
+pub fn append_headers(headers: &mut Vec<(String, String)>, extra: Vec<(String, String)>) {
+    for (name, value) in extra {
+        let dup = headers
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(&name));
+        if !dup {
+            headers.push((name, value));
+        }
+    }
+}
+
 /// Whether an upstream HTTP `status` is worth retrying on the next candidate.
 ///
 /// Covers transient server-side and back-pressure conditions: any 5xx, plus

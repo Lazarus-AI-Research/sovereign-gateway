@@ -56,7 +56,8 @@ impl Gateway {
             detail: None,
         };
 
-        let request = match build_check_request(dep) {
+        let extra = self.extra_headers(&dep.extra, &dep.model_name);
+        let request = match build_check_request(dep, extra) {
             Ok(Some(r)) => r,
             Ok(None) => {
                 // No check configured: report as healthy-by-assumption.
@@ -99,12 +100,16 @@ impl Gateway {
 /// is configured. `Err` carries a configuration problem (reported unhealthy).
 fn build_check_request(
     dep: &DeploymentRecord,
+    extra: Vec<(String, String)>,
 ) -> std::result::Result<Option<UpstreamRequest>, String> {
     let api_key = dep.api_key.clone().unwrap_or_default();
-    let auth = match dep.upstream_format {
+    let mut auth = match dep.upstream_format {
         UpstreamFormat::Chat(f) => auth_headers(f, &api_key),
         UpstreamFormat::Embed(f) => embed_auth_headers(f, &api_key),
     };
+    // Edge headers (e.g. Cloudflare Access) apply to every check method — a
+    // backend behind Zero Trust 403s the probe otherwise.
+    yb_providers::append_headers(&mut auth, extra);
 
     match dep.health_check {
         HealthCheck::None => Ok(None),
@@ -263,6 +268,7 @@ mod tests {
             pricing: None,
             health_check: check,
             health_path: path.map(str::to_string),
+            extra: Default::default(),
             created_at: yb_core::now(),
             updated_at: yb_core::now(),
             deleted_at: None,
@@ -277,7 +283,7 @@ mod tests {
             HealthCheck::HttpOk,
             Some("/health"),
         );
-        let r = build_check_request(&d).unwrap().unwrap();
+        let r = build_check_request(&d, Vec::new()).unwrap().unwrap();
         assert_eq!(r.url, "http://host:8000/health");
         assert_eq!(r.method, HttpMethod::Get);
     }
@@ -285,28 +291,53 @@ mod tests {
     #[test]
     fn models_list_urls_per_family() {
         let d = dep(WireFormat::OpenaiChat.into(), Some("http://host:8000/v1"), HealthCheck::ModelsList, None);
-        assert_eq!(build_check_request(&d).unwrap().unwrap().url, "http://host:8000/v1/models");
+        assert_eq!(build_check_request(&d, Vec::new()).unwrap().unwrap().url, "http://host:8000/v1/models");
         let d = dep(EmbedFormat::OllamaEmbed.into(), Some("http://host:11434"), HealthCheck::ModelsList, None);
-        assert_eq!(build_check_request(&d).unwrap().unwrap().url, "http://host:11434/api/tags");
+        assert_eq!(build_check_request(&d, Vec::new()).unwrap().unwrap().url, "http://host:11434/api/tags");
         let d = dep(EmbedFormat::VoyageEmbed.into(), None, HealthCheck::ModelsList, None);
-        assert!(build_check_request(&d).is_err());
+        assert!(build_check_request(&d, Vec::new()).is_err());
     }
 
     #[test]
     fn probe_builds_dialect_request() {
         let d = dep(WireFormat::Anthropic.into(), None, HealthCheck::Probe, None);
-        let r = build_check_request(&d).unwrap().unwrap();
+        let r = build_check_request(&d, Vec::new()).unwrap().unwrap();
         assert_eq!(r.url, "https://api.anthropic.com/v1/messages");
         assert_eq!(r.method, HttpMethod::Post);
         assert!(!r.body.is_empty());
         let d = dep(EmbedFormat::CohereEmbed.into(), None, HealthCheck::Probe, None);
-        let r = build_check_request(&d).unwrap().unwrap();
+        let r = build_check_request(&d, Vec::new()).unwrap().unwrap();
         assert_eq!(r.url, "https://api.cohere.com/v2/embed");
+    }
+
+    /// Edge headers must be present on every check shape, and must not displace
+    /// the deployment's own upstream auth.
+    #[test]
+    fn extra_headers_reach_every_check_method() {
+        let cf = vec![
+            ("cf-access-client-id".to_string(), "cid".to_string()),
+            ("cf-access-client-secret".to_string(), "sec".to_string()),
+        ];
+        let has_cf = |r: &UpstreamRequest| {
+            r.headers.iter().any(|(k, v)| k == "cf-access-client-id" && v == "cid")
+                && r.headers.iter().any(|(k, _)| k == "cf-access-client-secret")
+        };
+
+        let d = dep(WireFormat::OpenaiChat.into(), Some("http://h:8000/v1"), HealthCheck::HttpOk, Some("/health"));
+        let r = build_check_request(&d, cf.clone()).unwrap().unwrap();
+        assert!(has_cf(&r));
+        assert!(r.headers.iter().any(|(k, v)| k == "authorization" && v == "Bearer k"));
+
+        let d = dep(WireFormat::OpenaiChat.into(), Some("http://h:8000/v1"), HealthCheck::ModelsList, None);
+        assert!(has_cf(&build_check_request(&d, cf.clone()).unwrap().unwrap()));
+
+        let d = dep(WireFormat::OpenaiChat.into(), Some("http://h:8000/v1"), HealthCheck::Probe, None);
+        assert!(has_cf(&build_check_request(&d, cf).unwrap().unwrap()));
     }
 
     #[test]
     fn none_means_no_request() {
         let d = dep(WireFormat::OpenaiChat.into(), None, HealthCheck::None, None);
-        assert!(build_check_request(&d).unwrap().is_none());
+        assert!(build_check_request(&d, Vec::new()).unwrap().is_none());
     }
 }

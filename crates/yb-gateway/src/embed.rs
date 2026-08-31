@@ -83,6 +83,10 @@ impl Gateway {
             };
             let api_key = deployment.api_key.clone().unwrap_or_default();
             headers.extend(embed_auth_headers(upstream_fmt, &api_key));
+            yb_providers::append_headers(
+                &mut headers,
+                self.extra_headers(&deployment.extra, &deployment.model_name),
+            );
             let url = build_embed_url(
                 upstream_fmt,
                 deployment.api_base.as_deref(),

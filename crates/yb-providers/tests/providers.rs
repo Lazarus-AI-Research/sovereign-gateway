@@ -4,7 +4,7 @@
 use futures::StreamExt;
 use yb_core::WireFormat;
 
-use yb_providers::{
+use yb_providers::{append_headers, cloudflare_access_headers, 
     auth_headers, build_url, is_model_not_found, is_retryable, MockClient, ResponseBody,
     UpstreamClient, UpstreamRequest,
 };
@@ -84,6 +84,32 @@ fn build_url_gemini_stream_vs_nonstream() {
         streamed,
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:streamGenerateContent?alt=sse"
     );
+}
+
+#[test]
+fn cloudflare_access_headers_are_the_service_token_pair() {
+    let h = yb_providers::cloudflare_access_headers("abc.access", "s3cret");
+    assert_eq!(
+        h,
+        vec![
+            ("cf-access-client-id".to_string(), "abc.access".to_string()),
+            ("cf-access-client-secret".to_string(), "s3cret".to_string()),
+        ]
+    );
+}
+
+/// Edge auth composes with, and never replaces, the origin credential: a vLLM
+/// server behind Cloudflare Access needs both the service token and its Bearer.
+#[test]
+fn cloudflare_access_composes_with_upstream_auth() {
+    let mut headers = auth_headers(WireFormat::OpenaiChat, "sk-vllm");
+    headers.extend(yb_providers::cloudflare_access_headers("abc.access", "s3cret"));
+    let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["authorization", "cf-access-client-id", "cf-access-client-secret"]
+    );
+    assert_eq!(headers[0].1, "Bearer sk-vllm");
 }
 
 #[test]
@@ -196,3 +222,39 @@ async fn mock_can_simulate_retryable_status() {
         .unwrap();
     assert!(is_retryable(resp.status));
 }
+
+/// `append_headers` is first-writer-wins, which is what stops a database row's
+/// literal `extra.headers` from forging the file-owned Cloudflare service token
+/// or slipping a second `authorization` past the origin.
+#[test]
+fn extra_headers_can_never_displace_auth_or_the_service_token() {
+    let mut headers = auth_headers(WireFormat::OpenaiChat, "sk-origin");
+    append_headers(
+        &mut headers,
+        cloudflare_access_headers("id.access", "shh"),
+    );
+    // A row trying to override all three, plus one legitimate addition.
+    append_headers(
+        &mut headers,
+        vec![
+            ("authorization".to_string(), "Bearer stolen".to_string()),
+            ("CF-Access-Client-Id".to_string(), "forged".to_string()),
+            ("cf-access-client-secret".to_string(), "forged".to_string()),
+            ("x-tenant".to_string(), "acme".to_string()),
+        ],
+    );
+
+    let get = |n: &str| -> Vec<&str> {
+        headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(n))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    };
+    assert_eq!(get("authorization"), vec!["Bearer sk-origin"]);
+    assert_eq!(get("cf-access-client-id"), vec!["id.access"]);
+    assert_eq!(get("cf-access-client-secret"), vec!["shh"]);
+    // ...while a non-colliding header is still added.
+    assert_eq!(get("x-tenant"), vec!["acme"]);
+}
+

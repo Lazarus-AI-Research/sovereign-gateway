@@ -851,6 +851,13 @@ struct CreateModelBody {
     /// URL for http_ok checks (absolute, or relative to api_base's origin).
     #[serde(default)]
     health_path: Option<String>,
+    /// Open-ended per-deployment extras, e.g.
+    /// `{"cloudflare_access": true, "headers": {"X-Tenant": "acme"}}`. The
+    /// Cloudflare service token itself is file-owned
+    /// (`[upstream.cloudflare_access]`) and cannot be set, read, or overridden
+    /// through this API — only the flag selecting it can.
+    #[serde(default)]
+    extra: yb_core::Extra,
 }
 
 /// `GET /models` — list the live deployments (member+).
@@ -882,6 +889,7 @@ async fn create_model(
         pricing: body.pricing,
         health_check: body.health_check,
         health_path: body.health_path,
+        extra: body.extra.clone(),
         created_at: now(),
         updated_at: now(),
         deleted_at: None,

@@ -295,6 +295,32 @@ pub enum UpstreamMode {
 #[serde(default)]
 pub struct UpstreamConfig {
     pub mode: UpstreamMode,
+    /// The Cloudflare Access service token used by any deployment that sets the
+    /// `cloudflare_access` extra-header flag. Configured **here and only here**:
+    /// the credential is file-owned and immutable at runtime — never written to
+    /// the database, never returned by the admin API, never editable in the UI.
+    /// Absent ⇒ deployments carrying the flag are treated as misconfigured.
+    pub cloudflare_access: Option<CloudflareAccessConfig>,
+}
+
+/// A Cloudflare Access **service token** (client id + secret), sent as the
+/// `CF-Access-Client-Id` / `CF-Access-Client-Secret` header pair so a
+/// machine-to-machine request satisfies a Zero Trust application policy.
+///
+/// This authenticates to the Cloudflare *edge* — it is unrelated to, and
+/// composes with, the deployment's own upstream `api_key` for the origin.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CloudflareAccessConfig {
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+impl CloudflareAccessConfig {
+    /// Usable only when both halves of the service token are present.
+    pub fn is_complete(&self) -> bool {
+        !self.client_id.trim().is_empty() && !self.client_secret.trim().is_empty()
+    }
 }
 
 /// Deployment-selection strategy across a model's candidate deployments.
@@ -333,6 +359,11 @@ pub struct DeploymentConfig {
     /// URL for `http_ok` checks: absolute, or relative to `api_base`'s origin.
     #[serde(default)]
     pub health_path: Option<String>,
+    /// Open-ended per-deployment extras, e.g.
+    /// `extra = { cloudflare_access = true }`. The flag selects a credential;
+    /// the credential itself comes from `[upstream.cloudflare_access]`.
+    #[serde(default)]
+    pub extra: crate::routing::Extra,
 }
 
 fn default_weight() -> u32 {
@@ -384,6 +415,75 @@ mod tests {
         assert!(cfg.auth.has(AuthProvider::Local));
         assert!(!cfg.auth.has(AuthProvider::Sso));
         assert!(cfg.auth.sso.is_none());
+    }
+
+    #[test]
+    fn cloudflare_access_is_file_only_and_optional() {
+        // Absent by default — the feature is off unless configured.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.upstream.cloudflare_access.is_none());
+
+        let cfg: Config = toml::from_str(
+            r#"
+[upstream.cloudflare_access]
+client_id = "abc.access"
+client_secret = "s3cret"
+"#,
+        )
+        .unwrap();
+        let cf = cfg.upstream.cloudflare_access.clone().expect("configured");
+        assert_eq!(cf.client_id, "abc.access");
+        assert!(cf.is_complete());
+
+        // A half-filled token is not usable.
+        let cfg: Config = toml::from_str(
+            r#"
+[upstream.cloudflare_access]
+client_id = "abc.access"
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.upstream.cloudflare_access.unwrap().is_complete());
+    }
+
+    #[test]
+    fn deployment_extra_defaults_empty_and_parses_open_shape() {
+        let dc: DeploymentConfig = toml::from_str(
+            r#"
+provider = "vllm"
+upstream_model = "Qwen3.8-27B"
+upstream_format = "openai_chat"
+"#,
+        )
+        .unwrap();
+        assert!(dc.extra.is_empty());
+
+        let dc: DeploymentConfig = toml::from_str(
+            r#"
+provider = "vllm"
+upstream_model = "Qwen3.8-27B"
+upstream_format = "openai_chat"
+extra = { cloudflare_access = true, headers = { "X-Tenant" = "acme" } }
+"#,
+        )
+        .unwrap();
+        assert!(dc.extra.cloudflare_access);
+        assert_eq!(dc.extra.headers.get("X-Tenant").map(String::as_str), Some("acme"));
+        assert!(!dc.extra.is_empty());
+
+        // An unrecognized key is kept rather than rejected, so a value written by
+        // a newer build survives a round-trip through this one.
+        let dc: DeploymentConfig = toml::from_str(
+            r#"
+provider = "vllm"
+upstream_model = "Qwen3.8-27B"
+upstream_format = "openai_chat"
+extra = { future_knob = 7 }
+"#,
+        )
+        .unwrap();
+        assert!(!dc.extra.is_empty());
+        assert_eq!(dc.extra.rest.get("future_knob").and_then(|v| v.as_i64()), Some(7));
     }
 
     #[test]
