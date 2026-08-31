@@ -42,8 +42,13 @@
   button.ghost { background:transparent; color:var(--mut); border:1px solid var(--line); padding:5px 10px; border-radius:6px; cursor:pointer; }
   button.del { color:var(--bad); }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  .pill { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--mut); }
+  .pill { display:inline-flex; align-items:center; gap:5px; font-size:11px; line-height:1.6; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--mut); white-space:nowrap; max-width:100%; }
   .pill.admin { color:var(--acc); border-color:var(--acc); }
+  .pill > .x { color:var(--bad); cursor:pointer; font-weight:600; line-height:1; opacity:.65; margin-right:-2px; }
+  .pill > .x:hover { opacity:1; }
+  .pills { display:flex; flex-wrap:wrap; align-items:center; gap:5px; }
+  .nowrap { white-space:nowrap; }
+  .tablewrap { overflow-x:auto; }
   /* Token/pill input with a typeahead dropdown (see TokenInput in main.tsx). */
   .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:10px; }
   .fld { display:block; }
