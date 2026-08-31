@@ -25,14 +25,16 @@ use futures::{stream, StreamExt};
 
 use yb_core::catalog::{builtin_price, ModelPrice};
 use yb_core::spend::{Period, RollupDelta, SubjectType};
+use yb_core::config::CloudflareAccessConfig;
 use yb_core::{
-    new_id, now, AccessPolicy, ApiKey, Deployment, Error, NullObserver, Observer,
+    new_id, now, AccessPolicy, ApiKey, Deployment, Error, Extra, NullObserver, Observer,
     RequestLogRecord, RequestLogger, Result, RouteRequest, Router, Store, TelemetryRecord,
     Timestamp, WireFormat,
 };
 use yb_providers::{
-    auth_headers, build_url, is_model_not_found, is_retryable, ByteStream, ResponseBody,
-    UpstreamClient, UpstreamRequest,
+    append_headers, auth_headers, build_url, cloudflare_access_headers, is_model_not_found,
+    is_retryable,
+    ByteStream, ResponseBody, UpstreamClient, UpstreamRequest,
 };
 use yb_wire::{ChatRequest, ContentBlock, EmitOptions, StreamEvent, Usage};
 
@@ -205,6 +207,10 @@ pub struct Gateway {
     pub(crate) store: Arc<dyn Store>,
     pub(crate) logger: Arc<dyn RequestLogger>,
     pub(crate) observer: Arc<dyn Observer>,
+    /// The Cloudflare Access service token from `[upstream.cloudflare_access]`,
+    /// applied to deployments whose `extra` sets `cloudflare_access`.
+    /// File-owned and immutable for the process lifetime.
+    pub(crate) cf_access: Option<Arc<CloudflareAccessConfig>>,
 }
 
 impl Gateway {
@@ -233,7 +239,46 @@ impl Gateway {
             store,
             logger,
             observer,
+            cf_access: None,
         }
+    }
+
+    /// Attach the Cloudflare Access service token used by deployments whose
+    /// `extra` sets `cloudflare_access`. A `None` (or incomplete) token
+    /// leaves the feature off: such deployments still dispatch, but without the
+    /// edge headers, and the attempt is logged.
+    pub fn with_cloudflare_access(mut self, cfg: Option<CloudflareAccessConfig>) -> Self {
+        self.cf_access = cfg.filter(|c| c.is_complete()).map(Arc::new);
+        self
+    }
+
+    /// The extra headers a deployment opted into, resolved against the process
+    /// config, in order of decreasing authority.
+    ///
+    /// These are appended *after* the wire format's own auth headers and never
+    /// replace them: Cloudflare Access authenticates to the edge, while the
+    /// deployment's `api_key` authenticates to the origin behind it. The
+    /// file-owned service token is emitted before the row's literal `headers`,
+    /// so a database row can never forge or shadow it (see [`append_headers`]).
+    pub(crate) fn extra_headers(&self, extra: &Extra, model_name: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if extra.cloudflare_access {
+            match self.cf_access.as_deref() {
+                Some(cf) => out.extend(cloudflare_access_headers(&cf.client_id, &cf.client_secret)),
+                None => tracing::warn!(
+                    model = %model_name,
+                    "deployment requests cloudflare_access headers but \
+                     [upstream.cloudflare_access] is not configured; sending without them"
+                ),
+            }
+        }
+        out.extend(
+            extra
+                .headers
+                .iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v.clone())),
+        );
+        out
     }
 
     /// Orchestrate one inbound request and produce a translated response.
@@ -307,6 +352,10 @@ impl Gateway {
             // The upstream credential is the deployment's literal `api_key`.
             let api_key = deployment.api_key.clone().unwrap_or_default();
             headers.extend(auth_headers(upstream_fmt, &api_key));
+            append_headers(
+                &mut headers,
+                self.extra_headers(&deployment.extra, &deployment.model_name),
+            );
             let url = build_url(
                 upstream_fmt,
                 deployment.api_base.as_deref(),

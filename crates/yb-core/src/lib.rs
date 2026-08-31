@@ -30,8 +30,8 @@ pub use principal::{KeyAuth, Principal};
 pub use observe::{NullObserver, Observer};
 pub use reqlog::{NullLogger, RequestLogRecord, RequestLogger};
 pub use routing::{
-    Decision, Deployment, DeploymentRecord, EmbedFormat, HealthCheck, RouteRequest, Router,
-    UpstreamFormat,
+    Decision, Deployment, DeploymentRecord, EmbedFormat, Extra, HealthCheck, RouteRequest,
+    Router, UpstreamFormat,
     WireFormat,
 };
 pub use store::{LimitColumns, Store};

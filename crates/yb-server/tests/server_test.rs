@@ -89,6 +89,7 @@ async fn setup() -> (AppState, String) {
             pricing: None,
             health_check: Default::default(),
             health_path: None,
+            extra: Default::default(),
         }],
     }];
 

@@ -117,6 +117,7 @@ impl DeploymentRouter {
                     pricing: dc.pricing,
                     health_check: dc.health_check,
                     health_path: dc.health_path,
+                    extra: dc.extra.clone(),
                 })
             })
             .collect();
@@ -316,6 +317,7 @@ mod tests {
             pricing: None,
             health_check: Default::default(),
             health_path: None,
+            extra: Default::default(),
         }
     }
 
@@ -462,6 +464,7 @@ mod tests {
             pricing: None,
             health_check: Default::default(),
             health_path: None,
+            extra: Default::default(),
             created_at: yb_core::now(),
             updated_at: yb_core::now(),
             deleted_at: None,

@@ -312,13 +312,22 @@ async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> 
     } else {
         Arc::new(NullObserver)
     };
-    let gateway = Arc::new(Gateway::with_observer(
-        client,
-        router.clone(),
-        store.clone(),
-        logger,
-        observer.clone(),
-    ));
+    if cfg.upstream.cloudflare_access.as_ref().is_some_and(|c| c.is_complete()) {
+        tracing::info!(
+            "cloudflare access service token loaded; deployments flagged \
+             extra.cloudflare_access will present it"
+        );
+    }
+    let gateway = Arc::new(
+        Gateway::with_observer(
+            client,
+            router.clone(),
+            store.clone(),
+            logger,
+            observer.clone(),
+        )
+        .with_cloudflare_access(cfg.upstream.cloudflare_access.clone()),
+    );
 
     // --- 5. limiter, crypto, hasher -----------------------------------------
     let window = Duration::from_secs(cfg.features.ratelimit_window_secs.max(1));
@@ -431,6 +440,7 @@ async fn seed_models(
                 pricing: dc.pricing,
                 health_check: dc.health_check,
                 health_path: dc.health_path.clone(),
+                extra: dc.extra.clone(),
                 created_at: now(),
                 updated_at: now(),
                 deleted_at: None,

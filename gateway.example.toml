@@ -72,6 +72,21 @@ ratelimit_window_secs = 60       # rate-limit accounting window
 [upstream]
 mode = "http"                    # http (real upstreams) | mock (offline canned responses)
 
+# A Cloudflare Access service token, for backends sitting behind Zero Trust.
+# Cloudflare rejects unauthenticated traffic at the edge with a 403, so the
+# token is presented as CF-Access-Client-Id / CF-Access-Client-Secret.
+#
+# This is EDGE auth and composes with — never replaces — the deployment's own
+# api_key, which still authenticates to the origin behind Cloudflare.
+#
+# The credential lives here and only here: it is never written to the database,
+# never returned by the admin API, and not editable in the UI. A deployment opts
+# in by setting `extra = { cloudflare_access = true }` (see models.example.toml);
+# that flag selects the token but can never carry or override it.
+# [upstream.cloudflare_access]
+# client_id = "....access"
+# client_secret = "..."
+
 # ---------------------------------------------------------------------------
 # Routing policy. The model list is NOT here — models live in the database.
 # Load them from a dedicated models file with:

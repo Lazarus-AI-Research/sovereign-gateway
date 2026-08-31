@@ -476,6 +476,7 @@ async fn deployments_seed_create_and_list() {
         weight: 2,
         health_check: Default::default(),
         health_path: None,
+        extra: Default::default(),
         pricing: Some(yb_core::catalog::ModelPrice::new(2.5, 10.0)),
         created_at: now(),
         updated_at: now(),
@@ -547,6 +548,7 @@ async fn embed_format_deployment_roundtrips() {
         pricing: None,
         health_check: Default::default(),
         health_path: None,
+        extra: Default::default(),
         created_at: now(),
         updated_at: now(),
         deleted_at: None,
@@ -554,6 +556,129 @@ async fn embed_format_deployment_roundtrips() {
     store.create_deployment(&dep).await.unwrap();
     let all = store.list_deployments().await.unwrap();
     assert_eq!(all[0].upstream_format, UpstreamFormat::Embed(EmbedFormat::OpenaiEmbed));
+}
+
+/// The extra-header flags are a JSON object on the row: they round-trip, and a
+/// row written before the column existed (NULL/blank) decodes to "no extras"
+/// rather than failing the whole list query.
+#[tokio::test]
+async fn deployment_extra_roundtrip_and_lenient_decode() {
+    use yb_core::routing::{DeploymentRecord, Extra, WireFormat};
+    let (store, _db) = fresh_store().await;
+    let dep = DeploymentRecord {
+        id: new_id(),
+        model_name: "lambda0".into(),
+        provider: "vllm".into(),
+        upstream_model: "Qwen3.8-27B".into(),
+        api_base: Some("https://lambda0.example/v1".into()),
+        api_key: Some("sk-origin".into()),
+        upstream_format: WireFormat::OpenaiChat.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+        extra: Extra {
+            cloudflare_access: true,
+            headers: [("X-Tenant".to_string(), "acme".to_string())].into_iter().collect(),
+            ..Default::default()
+        },
+        created_at: now(),
+        updated_at: now(),
+        deleted_at: None,
+    };
+    store.create_deployment(&dep).await.unwrap();
+
+    let got = store.get_deployment(&dep.id).await.unwrap().unwrap();
+    assert!(got.extra.cloudflare_access);
+    assert_eq!(got.extra.headers.get("X-Tenant").map(String::as_str), Some("acme"));
+    assert!(!got.extra.is_empty());
+    // The projection onto the routing value carries the flag.
+    assert!(got.to_deployment().extra.cloudflare_access);
+
+    // Decoding is lenient: a blank or unrecognised value degrades to "no extra
+    // headers" instead of failing the whole list query, so one bad row can never
+    // take the model list down.
+    for bad in ["", "   ", "not json"] {
+        sqlx::query("UPDATE deployments SET extra = ? WHERE id = ?")
+            .bind(bad)
+            .bind(&dep.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let got = store.get_deployment(&dep.id).await.unwrap().unwrap();
+        assert!(got.extra.is_empty(), "value {bad:?} should decode to default");
+        assert_eq!(store.list_deployments().await.unwrap().len(), 1);
+    }
+}
+
+/// The additive migration must land the column on a database created before it
+/// existed, backfilling `{}` for every pre-existing row. This is the exact path
+/// an already-deployed database takes the first time the new binary boots, so it
+/// builds the legacy shape for real rather than mutating a current one.
+#[tokio::test]
+async fn extra_headers_column_is_added_to_a_legacy_database() {
+    let db = TempDb::new();
+    // A deployments table as it looked before `extra` existed, holding a
+    // row written by the older build.
+    {
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", db.as_str()))
+            .await
+            .expect("open legacy db");
+        sqlx::raw_sql(
+            "CREATE TABLE deployments (
+                 id TEXT PRIMARY KEY, model_name TEXT NOT NULL, provider TEXT NOT NULL,
+                 upstream_model TEXT NOT NULL, api_base TEXT, api_key TEXT,
+                 upstream_format TEXT NOT NULL, weight INTEGER NOT NULL DEFAULT 1,
+                 pricing TEXT, health_check TEXT NOT NULL DEFAULT 'none', health_path TEXT,
+                 natural_key TEXT NOT NULL, created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL, deleted_at TEXT);
+             INSERT INTO deployments
+                 (id, model_name, provider, upstream_model, upstream_format, weight,
+                  health_check, natural_key, created_at, updated_at)
+             VALUES ('legacy', 'old-model', 'p', 'um', '\"openai_chat\"', 1, 'none',
+                     'legacy-natural-key', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z');",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed legacy schema");
+        pool.close().await;
+    }
+
+    let store = SqliteStore::connect(db.as_str()).await.unwrap();
+    store.migrate().await.unwrap();
+
+    // The pre-existing row survives and reads back with the flags off.
+    let legacy = store
+        .get_deployment("legacy")
+        .await
+        .unwrap()
+        .expect("legacy row still present");
+    assert_eq!(legacy.model_name, "old-model");
+    assert!(legacy.extra.is_empty());
+
+    // ...and a newly written row can set the flag.
+    let dep = yb_core::routing::DeploymentRecord {
+        id: new_id(),
+        model_name: "m".into(),
+        provider: "p".into(),
+        upstream_model: "um".into(),
+        api_base: None,
+        api_key: None,
+        upstream_format: yb_core::routing::WireFormat::OpenaiChat.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+        extra: yb_core::routing::Extra { cloudflare_access: true, ..Default::default() },
+        created_at: now(),
+        updated_at: now(),
+        deleted_at: None,
+    };
+    store.create_deployment(&dep).await.unwrap();
+    assert!(store.get_deployment(&dep.id).await.unwrap().unwrap().extra.cloudflare_access);
+    // And the whole list still loads — `SELECT *` must agree with the new shape.
+    assert_eq!(store.list_deployments().await.unwrap().len(), 2);
 }
 
 #[tokio::test]

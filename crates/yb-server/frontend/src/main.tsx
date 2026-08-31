@@ -277,10 +277,15 @@ function BudgetEditor({ subjectType, subjectId }: { subjectType: string; subject
 
 function Models({ admin }: { admin: boolean }) {
   const [{ loading, data, error }, reload] = useAsync<any[]>(() => api('/models'));
-  const blank = { model_name: '', provider: '', upstream_model: '', upstream_format: 'openai_chat', api_base: '', api_key: '' };
+  const blank = { model_name: '', provider: '', upstream_model: '', upstream_format: 'openai_chat', api_base: '', api_key: '', extra: { cloudflare_access: false } };
   const [f, setF] = useState<any>(blank);
   const [msg, setMsg] = useState('');
   const upd = (k: string, v: string) => setF((s: any) => ({ ...s, [k]: v }));
+  // `extra` is an open object on the deployment row; this edits one key of it.
+  // The Cloudflare credential itself is server-side config and is never entered
+  // or displayed here — only the flag that selects it.
+  const updExtra = (k: string, v: any) =>
+    setF((s: any) => ({ ...s, extra: { ...s.extra, [k]: v } }));
   const add = async () => {
     setMsg('');
     try {
@@ -313,7 +318,7 @@ function Models({ admin }: { admin: boolean }) {
           ? <p class="empty">No models. {admin ? 'Click “Add deployment” or run ' : 'Ask an admin, or run '}<span class="mono">gateway import</span>.</p>
           : (
             <table style="margin-top:10px">
-              <thead><tr><th>model_name</th><th>provider</th><th>upstream_model</th><th>format</th><th>aliases</th><th>api_base</th>{admin && <th></th>}</tr></thead>
+              <thead><tr><th>model_name</th><th>provider</th><th>upstream_model</th><th>format</th><th>aliases</th><th>api_base</th><th>headers</th>{admin && <th></th>}</tr></thead>
               <tbody>{data.map((m) => (
                 <tr key={m.id}>
                   <td class="mono">{m.model_name}</td><td>{m.provider}</td>
@@ -324,6 +329,13 @@ function Models({ admin }: { admin: boolean }) {
                       ))}
                       {admin && <a onClick={() => addAlias(m.model_name)} style="cursor:pointer" class="mut">+ alias</a>}</td>
                   <td class="mono mut">{m.api_base || '—'}</td>
+                  <td>{m.extra?.cloudflare_access
+                        && <span class="pill" title="Sends the configured Cloudflare Access service token">CF Access</span>}
+                      {Object.keys(m.extra?.headers || {}).length > 0
+                        && <span class="pill mono" title={Object.keys(m.extra.headers).join(', ')}>
+                             +{Object.keys(m.extra.headers).length} hdr</span>}
+                      {!m.extra?.cloudflare_access && !Object.keys(m.extra?.headers || {}).length
+                        && <span class="mut">—</span>}</td>
                   {admin && <td><button class="ghost del" onClick={() => del(m.id)}>delete</button></td>}
                 </tr>
               ))}</tbody>
@@ -340,6 +352,12 @@ function Models({ admin }: { admin: boolean }) {
             <input placeholder="api_base (optional)" value={f.api_base} onInput={(e: any) => upd('api_base', e.target.value)} />
             <input placeholder="api_key (optional, literal)" value={f.api_key} onInput={(e: any) => upd('api_key', e.target.value)} />
           </div>
+          <label class="row" style="margin-top:10px;gap:8px;cursor:pointer">
+            <input type="checkbox" checked={!!f.extra.cloudflare_access}
+                   onChange={(e: any) => updExtra('cloudflare_access', e.target.checked)} />
+            <span>Behind Cloudflare Access
+              <span class="mut"> — send the service token from <span class="mono">[upstream.cloudflare_access]</span></span></span>
+          </label>
           <div class="row" style="margin-top:12px"><button class="btn" onClick={add}>Add model</button>{msg && <span class="err">{msg}</span>}</div>
         </Modal>
       )}
