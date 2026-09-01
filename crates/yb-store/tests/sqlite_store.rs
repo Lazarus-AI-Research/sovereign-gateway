@@ -147,7 +147,7 @@ async fn api_key_issue_and_verify_owned_by_user() {
         None,
         Default::default(),
         AccessPolicy {
-            denied_models: vec!["secret-model".into()],
+            denied_model_ids: vec!["secret-model".into()],
             ..Default::default()
         },
         LimitColumns {
@@ -460,15 +460,12 @@ async fn rate_counter_accumulates() {
     assert_eq!(b, 3);
 }
 
-#[tokio::test]
-async fn deployments_seed_create_and_list() {
-    use yb_core::routing::{DeploymentRecord, WireFormat};
-    let (store, _db) = fresh_store().await;
-
-    let dep = DeploymentRecord {
-        id: new_id(),
-        model_name: "gpt-4o".into(),
-        provider: "openai".into(),
+/// A `NewDeployment` of `model_name`, served by `provider`.
+fn new_dep(model_name: &str, provider: &str) -> yb_core::NewDeployment {
+    use yb_core::routing::WireFormat;
+    yb_core::NewDeployment {
+        model_name: model_name.into(),
+        provider: provider.into(),
         upstream_model: "gpt-4o".into(),
         api_base: None,
         api_key: None,
@@ -478,12 +475,17 @@ async fn deployments_seed_create_and_list() {
         health_path: None,
         extra: Default::default(),
         pricing: Some(yb_core::catalog::ModelPrice::new(2.5, 10.0)),
-        created_at: now(),
-        updated_at: now(),
-        deleted_at: None,
-    };
+    }
+}
 
-    // Seeding is idempotent on the natural key.
+#[tokio::test]
+async fn deployments_seed_create_and_list() {
+    use yb_core::routing::WireFormat;
+    let (store, _db) = fresh_store().await;
+
+    let dep = new_dep("gpt-4o", "openai");
+
+    // Seeding is idempotent on the deployment's identity tuple.
     assert!(store.seed_deployment(&dep).await.unwrap());
     assert!(!store.seed_deployment(&dep).await.unwrap());
 
@@ -495,10 +497,7 @@ async fn deployments_seed_create_and_list() {
     assert!(all[0].pricing.is_some());
 
     // Explicit create + soft delete.
-    let mut dep2 = dep.clone();
-    dep2.id = new_id();
-    dep2.provider = "azure".into();
-    store.create_deployment(&dep2).await.unwrap();
+    let dep2 = store.create_deployment(&new_dep("gpt-4o", "azure")).await.unwrap();
     assert_eq!(store.list_deployments().await.unwrap().len(), 2);
 
     store.delete_deployment(&dep2.id).await.unwrap();
@@ -506,27 +505,147 @@ async fn deployments_seed_create_and_list() {
     assert!(store.get_deployment(&dep2.id).await.unwrap().is_none());
 }
 
+/// `api_base = NULL` is the common case in a models file, and `NULL != NULL`,
+/// so a unique index without COALESCE would not dedupe it — every `gateway
+/// import` would insert a second copy of every such deployment.
+#[tokio::test]
+async fn seed_deployment_dedupes_when_api_base_is_null() {
+    let (store, _db) = fresh_store().await;
+    let dep = new_dep("gpt-4o", "openai");
+    assert!(dep.api_base.is_none());
+
+    assert!(store.seed_deployment(&dep).await.unwrap());
+    assert!(!store.seed_deployment(&dep).await.unwrap());
+    assert_eq!(store.list_deployments().await.unwrap().len(), 1);
+
+    // And a set api_base is still its own identity.
+    let mut with_base = new_dep("gpt-4o", "openai");
+    with_base.api_base = Some("https://example.test/v1".into());
+    assert!(store.seed_deployment(&with_base).await.unwrap());
+    assert_eq!(store.list_deployments().await.unwrap().len(), 2);
+}
+
+/// Two deployments of one public name are the load-balancing fan-out: one
+/// model row, two deployments, one shared id.
+#[tokio::test]
+async fn two_deployments_of_one_name_share_one_model() {
+    let (store, _db) = fresh_store().await;
+    store.seed_deployment(&new_dep("gpt-4o", "openai")).await.unwrap();
+    store.seed_deployment(&new_dep("gpt-4o", "azure")).await.unwrap();
+
+    let models = store.list_models().await.unwrap();
+    assert_eq!(models.len(), 1);
+    let deps = store.list_deployments().await.unwrap();
+    assert_eq!(deps.len(), 2);
+    assert_eq!(deps[0].model_id, models[0].id);
+    assert_eq!(deps[1].model_id, models[0].id);
+}
+
+#[tokio::test]
+async fn rename_model_leaves_the_old_name_as_an_alias() {
+    let (store, _db) = fresh_store().await;
+    store.seed_deployment(&new_dep("gpt-4o", "openai")).await.unwrap();
+    let before = store.list_models().await.unwrap().pop().unwrap();
+
+    let renamed = store.rename_model(&before.id, "gpt-4o-2024").await.unwrap();
+
+    // Same entity, new name.
+    assert_eq!(renamed.id, before.id);
+    assert_eq!(renamed.name, "gpt-4o-2024");
+    assert!(store.get_model_by_name("gpt-4o").await.unwrap().is_none());
+    assert_eq!(store.get_model_by_name("gpt-4o-2024").await.unwrap().unwrap().id, before.id);
+
+    // The old name still resolves, via the alias the rename left behind.
+    let aliases = store.list_aliases().await.unwrap();
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].alias, "gpt-4o");
+    assert_eq!(aliases[0].target, "gpt-4o-2024");
+    assert_eq!(aliases[0].model_id, before.id);
+
+    // The deployment followed the rename without being written to.
+    let deps = store.list_deployments().await.unwrap();
+    assert_eq!(deps[0].model_name, "gpt-4o-2024");
+    assert_eq!(deps[0].model_id, before.id);
+}
+
+/// The rename and its alias insert commit together, so a rejected rename must
+/// leave the model *and* the alias table exactly as they were.
+#[tokio::test]
+async fn rename_to_a_taken_name_conflicts_and_changes_nothing() {
+    let (store, _db) = fresh_store().await;
+    store.seed_deployment(&new_dep("gpt-4o", "openai")).await.unwrap();
+    store.seed_deployment(&new_dep("claude-sonnet", "anthropic")).await.unwrap();
+    let target = store.get_model_by_name("gpt-4o").await.unwrap().unwrap();
+
+    let err = store.rename_model(&target.id, "claude-sonnet").await.unwrap_err();
+    assert!(matches!(err, yb_core::Error::Conflict(_)), "got {err:?}");
+
+    assert_eq!(store.get_model_by_name("gpt-4o").await.unwrap().unwrap().id, target.id);
+    assert!(store.list_aliases().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rename_of_an_unknown_model_is_not_found() {
+    let (store, _db) = fresh_store().await;
+    let err = store.rename_model("nope", "whatever").await.unwrap_err();
+    assert!(matches!(err, yb_core::Error::NotFound(_)), "got {err:?}");
+}
+
+/// Renaming back consumes the alias the first rename created, rather than
+/// conflicting with it or leaving a self-referential `a -> a` behind.
+#[tokio::test]
+async fn rename_back_consumes_its_own_alias() {
+    let (store, _db) = fresh_store().await;
+    store.seed_deployment(&new_dep("a", "openai")).await.unwrap();
+    let m = store.get_model_by_name("a").await.unwrap().unwrap();
+
+    store.rename_model(&m.id, "b").await.unwrap();
+    store.rename_model(&m.id, "a").await.unwrap();
+
+    let aliases = store.list_aliases().await.unwrap();
+    assert_eq!(aliases.len(), 1, "expected only b -> a, got {aliases:?}");
+    assert_eq!(aliases[0].alias, "b");
+    assert_eq!(aliases[0].target, "a");
+}
+
+/// Aliases store the model id, so a rename retargets every one of them with no
+/// write to the alias table at all.
+#[tokio::test]
+async fn renaming_retargets_every_alias() {
+    let (store, _db) = fresh_store().await;
+    store.seed_deployment(&new_dep("gpt-4o", "openai")).await.unwrap();
+    let m = store.get_model_by_name("gpt-4o").await.unwrap().unwrap();
+    store.upsert_alias("fast", &m.id).await.unwrap();
+    store.upsert_alias("smart", &m.id).await.unwrap();
+
+    store.rename_model(&m.id, "gpt-4o-2024").await.unwrap();
+
+    let aliases = store.list_aliases().await.unwrap();
+    for a in &aliases {
+        assert_eq!(a.target, "gpt-4o-2024", "alias {} did not follow the rename", a.alias);
+    }
+    // fast, smart, and the old name.
+    assert_eq!(aliases.len(), 3);
+}
+
 #[tokio::test]
 async fn model_aliases_upsert_list_delete() {
-    use yb_core::ModelAlias;
     let (store, _db) = fresh_store().await;
 
     assert!(store.list_aliases().await.unwrap().is_empty());
 
-    store
-        .upsert_alias(&ModelAlias { alias: "gpt-4".into(), target: "gpt-4o".into(), created_at: now() })
-        .await
-        .unwrap();
-    // Upsert on the same alias key replaces the target (uniqueness via PK).
-    store
-        .upsert_alias(&ModelAlias { alias: "gpt-4".into(), target: "gpt-4o-mini".into(), created_at: now() })
-        .await
-        .unwrap();
+    let a = store.ensure_model("gpt-4o").await.unwrap();
+    let b = store.ensure_model("gpt-4o-mini").await.unwrap();
+
+    store.upsert_alias("gpt-4", &a.id).await.unwrap();
+    // Upsert on the same alias key repoints it (uniqueness via PK).
+    store.upsert_alias("gpt-4", &b.id).await.unwrap();
 
     let all = store.list_aliases().await.unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].alias, "gpt-4");
     assert_eq!(all[0].target, "gpt-4o-mini");
+    assert_eq!(all[0].model_id, b.id);
 
     store.delete_alias("gpt-4").await.unwrap();
     assert!(store.list_aliases().await.unwrap().is_empty());
@@ -534,10 +653,9 @@ async fn model_aliases_upsert_list_delete() {
 
 #[tokio::test]
 async fn embed_format_deployment_roundtrips() {
-    use yb_core::routing::{DeploymentRecord, EmbedFormat, UpstreamFormat};
+    use yb_core::routing::{EmbedFormat, UpstreamFormat};
     let (store, _db) = fresh_store().await;
-    let dep = DeploymentRecord {
-        id: new_id(),
+    let dep = yb_core::NewDeployment {
         model_name: "embedding-omni-default".into(),
         provider: "runtime".into(),
         upstream_model: "LCO-Embedding-Omni".into(),
@@ -549,9 +667,6 @@ async fn embed_format_deployment_roundtrips() {
         health_check: Default::default(),
         health_path: None,
         extra: Default::default(),
-        created_at: now(),
-        updated_at: now(),
-        deleted_at: None,
     };
     store.create_deployment(&dep).await.unwrap();
     let all = store.list_deployments().await.unwrap();
@@ -563,10 +678,9 @@ async fn embed_format_deployment_roundtrips() {
 /// rather than failing the whole list query.
 #[tokio::test]
 async fn deployment_extra_roundtrip_and_lenient_decode() {
-    use yb_core::routing::{DeploymentRecord, Extra, WireFormat};
+    use yb_core::routing::{Extra, WireFormat};
     let (store, _db) = fresh_store().await;
-    let dep = DeploymentRecord {
-        id: new_id(),
+    let dep = yb_core::NewDeployment {
         model_name: "lambda0".into(),
         provider: "vllm".into(),
         upstream_model: "Qwen3.8-27B".into(),
@@ -582,13 +696,10 @@ async fn deployment_extra_roundtrip_and_lenient_decode() {
             headers: [("X-Tenant".to_string(), "acme".to_string())].into_iter().collect(),
             ..Default::default()
         },
-        created_at: now(),
-        updated_at: now(),
-        deleted_at: None,
     };
-    store.create_deployment(&dep).await.unwrap();
+    let created = store.create_deployment(&dep).await.unwrap();
 
-    let got = store.get_deployment(&dep.id).await.unwrap().unwrap();
+    let got = store.get_deployment(&created.id).await.unwrap().unwrap();
     assert!(got.extra.cloudflare_access);
     assert_eq!(got.extra.headers.get("X-Tenant").map(String::as_str), Some("acme"));
     assert!(!got.extra.is_empty());
@@ -601,84 +712,14 @@ async fn deployment_extra_roundtrip_and_lenient_decode() {
     for bad in ["", "   ", "not json"] {
         sqlx::query("UPDATE deployments SET extra = ? WHERE id = ?")
             .bind(bad)
-            .bind(&dep.id)
+            .bind(&created.id)
             .execute(store.pool())
             .await
             .unwrap();
-        let got = store.get_deployment(&dep.id).await.unwrap().unwrap();
+        let got = store.get_deployment(&created.id).await.unwrap().unwrap();
         assert!(got.extra.is_empty(), "value {bad:?} should decode to default");
         assert_eq!(store.list_deployments().await.unwrap().len(), 1);
     }
-}
-
-/// The additive migration must land the column on a database created before it
-/// existed, backfilling `{}` for every pre-existing row. This is the exact path
-/// an already-deployed database takes the first time the new binary boots, so it
-/// builds the legacy shape for real rather than mutating a current one.
-#[tokio::test]
-async fn extra_headers_column_is_added_to_a_legacy_database() {
-    let db = TempDb::new();
-    // A deployments table as it looked before `extra` existed, holding a
-    // row written by the older build.
-    {
-        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", db.as_str()))
-            .await
-            .expect("open legacy db");
-        sqlx::raw_sql(
-            "CREATE TABLE deployments (
-                 id TEXT PRIMARY KEY, model_name TEXT NOT NULL, provider TEXT NOT NULL,
-                 upstream_model TEXT NOT NULL, api_base TEXT, api_key TEXT,
-                 upstream_format TEXT NOT NULL, weight INTEGER NOT NULL DEFAULT 1,
-                 pricing TEXT, health_check TEXT NOT NULL DEFAULT 'none', health_path TEXT,
-                 natural_key TEXT NOT NULL, created_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL, deleted_at TEXT);
-             INSERT INTO deployments
-                 (id, model_name, provider, upstream_model, upstream_format, weight,
-                  health_check, natural_key, created_at, updated_at)
-             VALUES ('legacy', 'old-model', 'p', 'um', '\"openai_chat\"', 1, 'none',
-                     'legacy-natural-key', '2026-01-01T00:00:00Z',
-                     '2026-01-01T00:00:00Z');",
-        )
-        .execute(&pool)
-        .await
-        .expect("seed legacy schema");
-        pool.close().await;
-    }
-
-    let store = SqliteStore::connect(db.as_str()).await.unwrap();
-    store.migrate().await.unwrap();
-
-    // The pre-existing row survives and reads back with the flags off.
-    let legacy = store
-        .get_deployment("legacy")
-        .await
-        .unwrap()
-        .expect("legacy row still present");
-    assert_eq!(legacy.model_name, "old-model");
-    assert!(legacy.extra.is_empty());
-
-    // ...and a newly written row can set the flag.
-    let dep = yb_core::routing::DeploymentRecord {
-        id: new_id(),
-        model_name: "m".into(),
-        provider: "p".into(),
-        upstream_model: "um".into(),
-        api_base: None,
-        api_key: None,
-        upstream_format: yb_core::routing::WireFormat::OpenaiChat.into(),
-        weight: 1,
-        pricing: None,
-        health_check: Default::default(),
-        health_path: None,
-        extra: yb_core::routing::Extra { cloudflare_access: true, ..Default::default() },
-        created_at: now(),
-        updated_at: now(),
-        deleted_at: None,
-    };
-    store.create_deployment(&dep).await.unwrap();
-    assert!(store.get_deployment(&dep.id).await.unwrap().unwrap().extra.cloudflare_access);
-    // And the whole list still loads — `SELECT *` must agree with the new shape.
-    assert_eq!(store.list_deployments().await.unwrap().len(), 2);
 }
 
 #[tokio::test]

@@ -14,12 +14,11 @@ use yb_core::model::{
     TelemetryRecord, User,
 };
 use yb_core::principal::KeyAuth;
-use yb_core::routing::DeploymentRecord;
+use yb_core::routing::{DeploymentRecord, ModelRecord, NewDeployment};
 use yb_core::spend::{Budget, BudgetAction, Period, RollupDelta, SpendRow, SubjectType};
-use yb_core::{now, Error, LimitColumns, Micros, Result, Store, Timestamp};
+use yb_core::{new_id, now, Error, LimitColumns, Micros, Result, Store, Timestamp};
 
 use crate::common::{dec_access, enc_access, storage_err};
-use crate::schema::POSTGRES_SCHEMA;
 
 /// A Postgres [`Store`]. Cheap to clone (wraps an `Arc`-backed pool).
 #[derive(Clone)]
@@ -80,9 +79,15 @@ fn enc_enum<T: serde::Serialize>(v: &T) -> String {
 /// inside sqlx: the cached column metadata and the live statement's column count
 /// disagree, and the row is indexed with the wrong one. Naming the columns keeps
 /// reads pinned to the shape this code expects.
-const DEPLOYMENT_COLS: &str = "id, model_name, provider, upstream_model, api_base, api_key, \
-     upstream_format, weight, pricing, health_check, health_path, extra, natural_key, \
-     created_at, updated_at, deleted_at";
+const DEPLOYMENT_COLS: &str = "d.id, d.model_id, m.name AS model_name, d.provider, \
+     d.upstream_model, d.api_base, d.api_key, d.upstream_format, d.weight, d.pricing, \
+     d.health_check, d.health_path, d.extra, d.created_at, d.updated_at, d.deleted_at";
+
+/// The join every deployment read goes through, paired with [`DEPLOYMENT_COLS`].
+const DEPLOYMENT_FROM: &str = "FROM deployments d JOIN models m ON m.id = d.model_id";
+
+/// Column list for `models` reads.
+const MODEL_COLS: &str = "id, name, created_at, updated_at";
 
 /// Encode a deployment's `extra` object as JSON (`{}` when empty).
 fn enc_extra(x: &yb_core::Extra) -> String {
@@ -208,12 +213,33 @@ fn map_spend_row(r: &PgRow) -> Result<SpendRow> {
 }
 
 /// Map a `deployments` row to a [`DeploymentRecord`].
+/// Map a `models` row to a [`ModelRecord`].
+fn map_model(r: &PgRow) -> Result<ModelRecord> {
+    Ok(ModelRecord {
+        id: r.try_get("id").map_err(storage_err)?,
+        name: r.try_get("name").map_err(storage_err)?,
+        created_at: r.try_get("created_at").map_err(storage_err)?,
+        updated_at: r.try_get("updated_at").map_err(storage_err)?,
+    })
+}
+
+/// Map a joined `model_aliases` row. `target` is the model's current name.
+fn map_alias(r: &PgRow) -> Result<ModelAlias> {
+    Ok(ModelAlias {
+        alias: r.try_get("alias").map_err(storage_err)?,
+        model_id: r.try_get("model_id").map_err(storage_err)?,
+        target: r.try_get("target").map_err(storage_err)?,
+        created_at: r.try_get("created_at").map_err(storage_err)?,
+    })
+}
+
 fn map_deployment(r: &PgRow) -> Result<DeploymentRecord> {
     let fmt_s: String = r.try_get("upstream_format").map_err(storage_err)?;
     let pricing_s: Option<String> = r.try_get("pricing").map_err(storage_err)?;
     let weight: i32 = r.try_get("weight").map_err(storage_err)?;
     Ok(DeploymentRecord {
         id: r.try_get("id").map_err(storage_err)?,
+        model_id: r.try_get("model_id").map_err(storage_err)?,
         model_name: r.try_get("model_name").map_err(storage_err)?,
         provider: r.try_get("provider").map_err(storage_err)?,
         upstream_model: r.try_get("upstream_model").map_err(storage_err)?,
@@ -240,20 +266,10 @@ fn map_deployment(r: &PgRow) -> Result<DeploymentRecord> {
 #[async_trait]
 impl Store for PostgresStore {
     async fn migrate(&self) -> Result<()> {
-        sqlx::raw_sql(POSTGRES_SCHEMA)
-            .execute(&self.pool)
+        crate::schema::POSTGRES_MIGRATOR
+            .run(&self.pool)
             .await
-            .map_err(storage_err)?;
-        // Additive column migrations for pre-existing databases.
-        for ddl in [
-            "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'inference'",
-            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS health_check TEXT NOT NULL DEFAULT 'none'",
-            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS health_path TEXT",
-            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS extra TEXT NOT NULL DEFAULT '{}'",
-        ] {
-            let _ = sqlx::raw_sql(ddl).execute(&self.pool).await;
-        }
-        Ok(())
+            .map_err(|e| yb_core::Error::Storage(e.to_string()))
     }
 
     // ---- users (login accounts; own keys) -----------------------------
@@ -879,11 +895,134 @@ impl Store for PostgresStore {
         row.try_get("count").map_err(storage_err)
     }
 
-    // ---- deployments (the live model list) ----------------------------
+    // ---- models (the entity behind a public model name) ----------------
+    async fn list_models(&self) -> Result<Vec<ModelRecord>> {
+        let rows = sqlx::query(&format!("SELECT {MODEL_COLS} FROM models ORDER BY name"))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        rows.iter().map(map_model).collect()
+    }
+
+    async fn get_model(&self, id: &str) -> Result<Option<ModelRecord>> {
+        let row = sqlx::query(&format!("SELECT {MODEL_COLS} FROM models WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        row.as_ref().map(map_model).transpose()
+    }
+
+    async fn get_model_by_name(&self, name: &str) -> Result<Option<ModelRecord>> {
+        let row = sqlx::query(&format!("SELECT {MODEL_COLS} FROM models WHERE name = $1"))
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        row.as_ref().map(map_model).transpose()
+    }
+
+    async fn ensure_model(&self, name: &str) -> Result<ModelRecord> {
+        // One statement, so there is no read-then-write race. The no-op
+        // `DO UPDATE` is what makes RETURNING fire on the conflict path —
+        // `DO NOTHING` returns zero rows.
+        let row = sqlx::query(&format!(
+            "INSERT INTO models (id, name, created_at, updated_at) VALUES ($1,$2,$3,$4) \
+             ON CONFLICT(name) DO UPDATE SET updated_at = models.updated_at \
+             RETURNING {MODEL_COLS}"
+        ))
+        .bind(new_id())
+        .bind(name)
+        .bind(now())
+        .bind(now())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        map_model(&row)
+    }
+
+    async fn rename_model(&self, id: &str, new_name: &str) -> Result<ModelRecord> {
+        let mut tx = self.pool.begin().await.map_err(storage_err)?;
+
+        let current = sqlx::query(&format!("SELECT {MODEL_COLS} FROM models WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage_err)?;
+        let current = match current {
+            Some(r) => map_model(&r)?,
+            None => return Err(Error::NotFound("model".into())),
+        };
+        if current.name == new_name {
+            return Ok(current);
+        }
+
+        let taken = sqlx::query("SELECT 1 FROM models WHERE name = $1 AND id <> $2")
+            .bind(new_name)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage_err)?;
+        if taken.is_some() {
+            return Err(Error::Conflict(format!("model \"{new_name}\" already exists")));
+        }
+
+        // An alias of *this* model is consumed rather than conflicting, so
+        // renaming A->B->A leaves no A->A behind.
+        let alias_owner: Option<String> =
+            sqlx::query("SELECT model_id FROM model_aliases WHERE alias = $1")
+                .bind(new_name)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(storage_err)?
+                .map(|r| r.get("model_id"));
+        match alias_owner.as_deref() {
+            Some(owner) if owner != id => {
+                return Err(Error::Conflict(format!(
+                    "\"{new_name}\" is already an alias of another model"
+                )))
+            }
+            Some(_) => {
+                sqlx::query("DELETE FROM model_aliases WHERE alias = $1")
+                    .bind(new_name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage_err)?;
+            }
+            None => {}
+        }
+
+        sqlx::query("UPDATE models SET name = $1, updated_at = $2 WHERE id = $3")
+            .bind(new_name)
+            .bind(now())
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_err)?;
+
+        // Leave the old name behind, so clients still sending it keep resolving.
+        sqlx::query(
+            "INSERT INTO model_aliases (alias, model_id, created_at) VALUES ($1,$2,$3) \
+             ON CONFLICT(alias) DO UPDATE SET model_id = excluded.model_id",
+        )
+        .bind(&current.name)
+        .bind(id)
+        .bind(now())
+        .execute(&mut *tx)
+        .await
+        .map_err(storage_err)?;
+
+        tx.commit().await.map_err(storage_err)?;
+        self.get_model(id)
+            .await?
+            .ok_or_else(|| Error::NotFound("model".into()))
+    }
+
+    // ---- deployments (one model's upstream fan-out) --------------------
     async fn list_deployments(&self) -> Result<Vec<DeploymentRecord>> {
         let rows = sqlx::query(&format!(
-            "SELECT {DEPLOYMENT_COLS} FROM deployments WHERE deleted_at IS NULL \
-             ORDER BY model_name, provider, upstream_model"
+            "SELECT {DEPLOYMENT_COLS} {DEPLOYMENT_FROM} WHERE d.deleted_at IS NULL \
+             ORDER BY m.name, d.provider, d.upstream_model"
         ))
         .fetch_all(&self.pool)
         .await
@@ -893,24 +1032,26 @@ impl Store for PostgresStore {
 
     async fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
         let row = sqlx::query(&format!(
-            "SELECT {DEPLOYMENT_COLS} FROM deployments WHERE id = $1 AND deleted_at IS NULL"
+            "SELECT {DEPLOYMENT_COLS} {DEPLOYMENT_FROM} WHERE d.id = $1 AND d.deleted_at IS NULL"
         ))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(storage_err)?;
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_err)?;
         row.as_ref().map(map_deployment).transpose()
     }
 
-    async fn create_deployment(&self, dep: &DeploymentRecord) -> Result<()> {
+    async fn create_deployment(&self, dep: &NewDeployment) -> Result<DeploymentRecord> {
+        let model = self.ensure_model(&dep.model_name).await?;
+        let id = new_id();
         sqlx::query(
-            "INSERT INTO deployments (id, model_name, provider, upstream_model, \
+            "INSERT INTO deployments (id, model_id, provider, upstream_model, \
              api_base, api_key, upstream_format, weight, pricing, health_check, health_path, \
-             extra, natural_key, created_at, updated_at, deleted_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NULL)",
+             extra, created_at, updated_at, deleted_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULL)",
         )
-        .bind(&dep.id)
-        .bind(&dep.model_name)
+        .bind(&id)
+        .bind(&model.id)
         .bind(&dep.provider)
         .bind(&dep.upstream_model)
         .bind(&dep.api_base)
@@ -921,13 +1062,14 @@ impl Store for PostgresStore {
         .bind(dep.health_check.as_str())
         .bind(&dep.health_path)
         .bind(enc_extra(&dep.extra))
-        .bind(dep.natural_key())
-        .bind(dep.created_at)
-        .bind(dep.updated_at)
+        .bind(now())
+        .bind(now())
         .execute(&self.pool)
         .await
         .map_err(storage_err)?;
-        Ok(())
+        self.get_deployment(&id)
+            .await?
+            .ok_or_else(|| Error::NotFound("deployment".into()))
     }
 
     async fn delete_deployment(&self, id: &str) -> Result<()> {
@@ -940,11 +1082,21 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn seed_deployment(&self, dep: &DeploymentRecord) -> Result<bool> {
+    async fn seed_deployment(&self, dep: &NewDeployment) -> Result<bool> {
+        let model = self.ensure_model(&dep.model_name).await?;
+        // Mirrors `deployments_identity_uq`. COALESCE is required, not
+        // cosmetic: NULL != NULL, so comparing api_base directly would miss
+        // every deployment that omits it — most of them — and each import
+        // would insert a second copy.
         let exists = sqlx::query(
-            "SELECT 1 FROM deployments WHERE natural_key = $1 AND deleted_at IS NULL",
+            "SELECT 1 FROM deployments WHERE model_id = $1 AND provider = $2 \
+             AND upstream_model = $3 AND COALESCE(api_base,'') = COALESCE($4,'') \
+             AND deleted_at IS NULL",
         )
-        .bind(dep.natural_key())
+        .bind(&model.id)
+        .bind(&dep.provider)
+        .bind(&dep.upstream_model)
+        .bind(&dep.api_base)
         .fetch_optional(&self.pool)
         .await
         .map_err(storage_err)?;
@@ -955,35 +1107,38 @@ impl Store for PostgresStore {
         Ok(true)
     }
 
-    // ---- model aliases ------------------------------------------------
+    // ---- model aliases (extra public name -> model) --------------------
     async fn list_aliases(&self) -> Result<Vec<ModelAlias>> {
-        let rows = sqlx::query("SELECT alias, target, created_at FROM model_aliases ORDER BY alias")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage_err)?;
-        rows.iter()
-            .map(|r| {
-                Ok(ModelAlias {
-                    alias: r.try_get("alias").map_err(storage_err)?,
-                    target: r.try_get("target").map_err(storage_err)?,
-                    created_at: r.try_get("created_at").map_err(storage_err)?,
-                })
-            })
-            .collect()
+        let rows = sqlx::query(
+            "SELECT a.alias, a.model_id, m.name AS target, a.created_at \
+             FROM model_aliases a JOIN models m ON m.id = a.model_id ORDER BY a.alias",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        rows.iter().map(map_alias).collect()
     }
 
-    async fn upsert_alias(&self, alias: &ModelAlias) -> Result<()> {
+    async fn upsert_alias(&self, alias: &str, model_id: &str) -> Result<ModelAlias> {
         sqlx::query(
-            "INSERT INTO model_aliases (alias, target, created_at) VALUES ($1,$2,$3) \
-             ON CONFLICT(alias) DO UPDATE SET target = excluded.target",
+            "INSERT INTO model_aliases (alias, model_id, created_at) VALUES ($1,$2,$3) \
+             ON CONFLICT(alias) DO UPDATE SET model_id = excluded.model_id",
         )
-        .bind(&alias.alias)
-        .bind(&alias.target)
-        .bind(alias.created_at)
+        .bind(alias)
+        .bind(model_id)
+        .bind(now())
         .execute(&self.pool)
         .await
         .map_err(storage_err)?;
-        Ok(())
+        let row = sqlx::query(
+            "SELECT a.alias, a.model_id, m.name AS target, a.created_at \
+             FROM model_aliases a JOIN models m ON m.id = a.model_id WHERE a.alias = $1",
+        )
+        .bind(alias)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        map_alias(&row)
     }
 
     async fn delete_alias(&self, alias: &str) -> Result<()> {

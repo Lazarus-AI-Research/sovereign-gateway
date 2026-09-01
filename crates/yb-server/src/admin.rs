@@ -61,12 +61,15 @@ pub fn router() -> Router<AppState> {
         .route("/users/:id", delete(delete_user))
         .route("/users/:id/role", put(set_user_role))
         .route("/users/:id/password", put(set_user_password))
-        // models (the live deployment list)
+        // models (the entity: a public name, its aliases, its deployments)
         .route("/models", get(list_models).post(create_model))
-        .route("/models/health", get(health_all_models))
-        .route("/models/:id", delete(delete_model))
-        .route("/models/:id/health", post(health_one_model))
-        // model aliases (public name -> model name)
+        .route("/models/:id/name", put(rename_model))
+        // deployments (one model's upstream fan-out)
+        .route("/deployments", get(list_deployments).post(create_deployment))
+        .route("/deployments/health", get(health_all_models))
+        .route("/deployments/:id", delete(delete_deployment))
+        .route("/deployments/:id/health", post(health_one_model))
+        // model aliases (extra public name -> model)
         .route("/aliases", get(list_aliases).post(create_alias))
         .route("/aliases/:alias", delete(delete_alias))
         // keys (owned by users; admin sees all)
@@ -874,16 +877,153 @@ struct CreateModelBody {
     extra: yb_core::Extra,
 }
 
-/// `GET /models` — list the live deployments (member+).
-async fn list_models(principal: Principal, State(state): State<AppState>) -> Response {
+/// `GET /deployments` — list the live deployments (member+).
+async fn list_deployments(principal: Principal, State(state): State<AppState>) -> Response {
     if let Err(r) = authz(&principal, Action::ReadCatalog) {
         return r;
     }
     respond(state.store.list_deployments().await)
 }
 
-/// `POST /models` — add a deployment and hot-reload the router (admin only).
+/// `GET /models` — list the model entities, each with its aliases and the
+/// number of deployments backing it (member+).
+///
+/// The console groups its table by model, so the fan-out is counted here rather
+/// than inferred client-side from the deployment list.
+async fn list_models(principal: Principal, State(state): State<AppState>) -> Response {
+    if let Err(r) = authz(&principal, Action::ReadCatalog) {
+        return r;
+    }
+    let models = match state.store.list_models().await {
+        Ok(m) => m,
+        Err(e) => return error_response(&e),
+    };
+    let deployments = match state.store.list_deployments().await {
+        Ok(d) => d,
+        Err(e) => return error_response(&e),
+    };
+    let aliases = match state.store.list_aliases().await {
+        Ok(a) => a,
+        Err(e) => return error_response(&e),
+    };
+    let out: Vec<_> = models
+        .into_iter()
+        .map(|m| {
+            let mut names: Vec<&str> = aliases
+                .iter()
+                .filter(|a| a.model_id == m.id)
+                .map(|a| a.alias.as_str())
+                .collect();
+            names.sort_unstable();
+            json!({
+                "id": m.id,
+                "name": m.name,
+                "aliases": names,
+                "deployment_count": deployments.iter().filter(|d| d.model_id == m.id).count(),
+                "created_at": m.created_at,
+                "updated_at": m.updated_at,
+            })
+        })
+        .collect();
+    respond(Ok(out))
+}
+
+/// Validate a public model name or an alias.
+///
+/// Deliberately permissive about punctuation — real upstream ids look like
+/// `meta-llama/Llama-3-70B` — but rejects the shapes that break a URL path or a
+/// JSON round-trip.
+fn validate_public_name(s: &str) -> std::result::Result<String, Response> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err(error_response(&Error::BadRequest("name is required".into())));
+    }
+    if t.chars().count() > 200 {
+        return Err(error_response(&Error::BadRequest(
+            "name must be 200 characters or fewer".into(),
+        )));
+    }
+    if t.chars().any(|c| c.is_ascii_control()) {
+        return Err(error_response(&Error::BadRequest(
+            "name must not contain control characters".into(),
+        )));
+    }
+    Ok(t.to_string())
+}
+
+#[derive(Deserialize)]
+struct RenameModelBody {
+    name: String,
+}
+
+/// `PUT /models/:id/name` — rename a model, leaving its previous name behind as
+/// an alias so clients mid-flight keep resolving (admin only).
+///
+/// The alias is not optional. Renaming is a one-click inline edit in the
+/// console, and a rename without it is a silent outage for every client still
+/// naming the old model.
+async fn rename_model(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RenameModelBody>,
+) -> Response {
+    if let Err(r) = authz(&principal, Action::EditConfig) {
+        return r;
+    }
+    let name = match validate_public_name(&body.name) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let rec = match state.store.rename_model(&id, &name).await {
+        Ok(r) => r,
+        Err(e) => return error_response(&e),
+    };
+    if let Err(e) = state.reload_models().await {
+        return error_response(&e);
+    }
+    respond(Ok(rec))
+}
+
+#[derive(Deserialize)]
+struct CreateModelEntityBody {
+    name: String,
+}
+
+/// `POST /models` — create a model by name, with no deployments yet (admin only).
+///
+/// A model with no deployments is deliberately allowed: it is visible in the
+/// console and completable in the policy editor, but absent from the router
+/// snapshot and from `GET /v1/models`, so it cannot be routed to. That is what
+/// lets an operator pre-authorize (or pre-deny) a model before standing up the
+/// upstream that serves it.
 async fn create_model(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<CreateModelEntityBody>,
+) -> Response {
+    if let Err(r) = authz(&principal, Action::EditConfig) {
+        return r;
+    }
+    let name = match validate_public_name(&body.name) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let rec = match state.store.ensure_model(&name).await {
+        Ok(r) => r,
+        Err(e) => return error_response(&e),
+    };
+    if let Err(e) = state.reload_models().await {
+        return error_response(&e);
+    }
+    respond(Ok(rec))
+}
+
+/// `POST /deployments` — add a deployment and hot-reload the router (admin only).
+///
+/// The body names its model; the store resolves that to a model row, creating
+/// one if the name is new.
+async fn create_deployment(
     principal: Principal,
     State(state): State<AppState>,
     Json(body): Json<CreateModelBody>,
@@ -891,9 +1031,12 @@ async fn create_model(
     if let Err(r) = authz(&principal, Action::EditConfig) {
         return r;
     }
-    let dep = yb_core::DeploymentRecord {
-        id: new_id(),
-        model_name: body.model_name,
+    let model_name = match validate_public_name(&body.model_name) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let dep = yb_core::NewDeployment {
+        model_name,
         provider: body.provider,
         upstream_model: body.upstream_model,
         api_base: body.api_base,
@@ -904,21 +1047,19 @@ async fn create_model(
         health_check: body.health_check,
         health_path: body.health_path,
         extra: body.extra.clone(),
-        created_at: now(),
-        updated_at: now(),
-        deleted_at: None,
     };
-    if let Err(e) = state.store.create_deployment(&dep).await {
-        return error_response(&e);
-    }
+    let created = match state.store.create_deployment(&dep).await {
+        Ok(d) => d,
+        Err(e) => return error_response(&e),
+    };
     if let Err(e) = state.reload_models().await {
         return error_response(&e);
     }
-    respond(Ok(dep))
+    respond(Ok(created))
 }
 
-/// `DELETE /models/:id` — soft-delete a deployment and hot-reload (admin only).
-async fn delete_model(
+/// `DELETE /deployments/:id` — soft-delete a deployment and hot-reload (admin only).
+async fn delete_deployment(
     principal: Principal,
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -999,14 +1140,35 @@ async fn create_alias(
     if body.alias == body.target {
         return error_response(&Error::BadRequest("an alias cannot point to itself".into()));
     }
-    let alias = yb_core::ModelAlias {
-        alias: body.alias,
-        target: body.target,
-        created_at: now(),
+    let alias_name = match validate_public_name(&body.alias) {
+        Ok(n) => n,
+        Err(r) => return r,
     };
-    if let Err(e) = state.store.upsert_alias(&alias).await {
-        return error_response(&e);
+    // `target` is a name — this is a hand-authored edge — so resolve it. An
+    // alias to a model that does not exist used to be accepted and then simply
+    // never resolved; it is a 404 now.
+    let target = match state.store.get_model_by_name(&body.target).await {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return error_response(&Error::NotFound(format!("model \"{}\"", body.target)))
+        }
+        Err(e) => return error_response(&e),
+    };
+    // A name is either a model's or an alias's, never both — otherwise the
+    // alias is silently shadowed by the model of the same name.
+    match state.store.get_model_by_name(&alias_name).await {
+        Ok(Some(_)) => {
+            return error_response(&Error::Conflict(format!(
+                "\"{alias_name}\" is already a model name"
+            )))
+        }
+        Ok(None) => {}
+        Err(e) => return error_response(&e),
     }
+    let alias = match state.store.upsert_alias(&alias_name, &target.id).await {
+        Ok(a) => a,
+        Err(e) => return error_response(&e),
+    };
     if let Err(e) = state.reload_models().await {
         return error_response(&e);
     }
@@ -1073,14 +1235,16 @@ fn rank(hay: &str, needle: &str) -> Option<u8> {
 /// exact → prefix → substring, then alphabetical; an empty `q` returns the head
 /// of the list so clicking the field is enough to browse.
 ///
-/// `model` deliberately suggests **canonical** model names, because that is what
-/// an [`AccessPolicy`] is matched against — aliases resolve to their target
-/// before the policy check, so offering an alias as a value would create a rule
-/// that never fires. Aliases still appear, as a hint on their target's row.
+/// For `model` the suggested `value` is the model **id** while the `label` is
+/// its name, because that is what an [`AccessPolicy`] stores. Holding the id is
+/// what keeps a rule matching after a rename; a name would silently stop
+/// matching. Aliases still appear, as a hint on their model's row, and are
+/// matchable — they are a legitimate way to *find* a model — but are never the
+/// value, since a policy is checked after aliases resolve.
 ///
 /// Authorization tracks what each list already discloses: `model` and
-/// `provider` restate `GET /models`, which any member may read, while `user`
-/// exposes the account list and keeps the `ManageMembers` bar.
+/// `provider` restate `GET /deployments`, which any member may read, while
+/// `user` exposes the account list and keeps the `ManageMembers` bar.
 async fn complete(
     principal: Principal,
     State(state): State<AppState>,
@@ -1120,23 +1284,34 @@ async fn complete(
                 }
             } else {
                 let aliases = state.store.list_aliases().await.unwrap_or_default();
-                let mut by_model: BTreeMap<String, (BTreeSet<String>, Vec<String>)> =
+                let models = match state.store.list_models().await {
+                    Ok(m) => m,
+                    Err(e) => return error_response(&e),
+                };
+                // Keyed by model id, because that is what a policy stores. Built
+                // from the model list rather than the deployments, so a model
+                // with no deployments yet is still completable — which is how an
+                // operator pre-authorizes one.
+                let mut by_model: BTreeMap<String, (String, BTreeSet<String>, Vec<String>)> =
                     BTreeMap::new();
-                for d in &deps {
+                for m in &models {
                     by_model
-                        .entry(d.model_name.clone())
-                        .or_default()
-                        .0
-                        .insert(d.provider.clone());
+                        .entry(m.id.clone())
+                        .or_insert_with(|| (m.name.clone(), BTreeSet::new(), Vec::new()));
                 }
-                for a in &aliases {
-                    if let Some(e) = by_model.get_mut(&a.target) {
-                        e.1.push(a.alias.clone());
+                for d in &deps {
+                    if let Some(e) = by_model.get_mut(&d.model_id) {
+                        e.1.insert(d.provider.clone());
                     }
                 }
-                for (model, (providers, mut names)) in by_model {
+                for a in &aliases {
+                    if let Some(e) = by_model.get_mut(&a.model_id) {
+                        e.2.push(a.alias.clone());
+                    }
+                }
+                for (model_id, (model, providers, mut names)) in by_model {
                     // An alias is a legitimate way to *find* a model, so match on
-                    // it too — but the suggested value stays the canonical name.
+                    // it too — but the value stays the model id.
                     let r = rank(&model, &needle).or_else(|| {
                         names.iter().filter_map(|a| rank(a, &needle)).min()
                     });
@@ -1156,8 +1331,8 @@ async fn complete(
                     hits.push((
                         r,
                         Suggestion {
-                            label: model.clone(),
-                            value: model,
+                            label: model,
+                            value: model_id,
                             hint,
                         },
                     ));

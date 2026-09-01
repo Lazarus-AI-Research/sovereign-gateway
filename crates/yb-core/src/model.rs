@@ -10,12 +10,19 @@ use serde::{Deserialize, Serialize};
 
 /// A per-key / per-team model & provider allow/deny list. Empty allow lists mean
 /// "no restriction at this scope"; deny always wins.
+///
+/// Models are held as **ids**, providers as **names**. That asymmetry is
+/// deliberate and not an oversight: a model is an entity with a row and a stable
+/// id, whereas a provider is a free-form attribution label with no row anywhere.
+/// Holding model ids is what stops a rename from silently un-denying a denied
+/// model — with names, `denied_models: ["gpt-4o"]` simply stops matching the
+/// moment someone renames it, granting access with no error and no log line.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccessPolicy {
     #[serde(default)]
-    pub allowed_models: Vec<String>,
+    pub allowed_model_ids: Vec<String>,
     #[serde(default)]
-    pub denied_models: Vec<String>,
+    pub denied_model_ids: Vec<String>,
     #[serde(default)]
     pub allowed_providers: Vec<String>,
     #[serde(default)]
@@ -24,19 +31,23 @@ pub struct AccessPolicy {
 
 impl AccessPolicy {
     pub fn is_unrestricted(&self) -> bool {
-        self.allowed_models.is_empty()
-            && self.denied_models.is_empty()
+        self.allowed_model_ids.is_empty()
+            && self.denied_model_ids.is_empty()
             && self.allowed_providers.is_empty()
             && self.denied_providers.is_empty()
     }
 
     /// Does this policy permit the given model? Deny wins; a non-empty allow
     /// list is a ceiling (anything not listed is denied).
-    pub fn permits_model(&self, model: &str) -> bool {
-        if self.denied_models.iter().any(|m| m == model) {
+    ///
+    /// Takes a model **id**, so the answer is stable across renames.
+    pub fn permits_model(&self, model_id: &str) -> bool {
+        if self.denied_model_ids.iter().any(|m| m == model_id) {
             return false;
         }
-        if !self.allowed_models.is_empty() && !self.allowed_models.iter().any(|m| m == model) {
+        if !self.allowed_model_ids.is_empty()
+            && !self.allowed_model_ids.iter().any(|m| m == model_id)
+        {
             return false;
         }
         true
@@ -79,8 +90,8 @@ impl AccessPolicy {
             a.iter().filter(|x| b.contains(x)).cloned().collect()
         }
         AccessPolicy {
-            allowed_models: intersect_allow(&self.allowed_models, &other.allowed_models),
-            denied_models: union(&self.denied_models, &other.denied_models),
+            allowed_model_ids: intersect_allow(&self.allowed_model_ids, &other.allowed_model_ids),
+            denied_model_ids: union(&self.denied_model_ids, &other.denied_model_ids),
             allowed_providers: intersect_allow(&self.allowed_providers, &other.allowed_providers),
             denied_providers: union(&self.denied_providers, &other.denied_providers),
         }
@@ -302,12 +313,17 @@ pub struct TeamMembership {
     pub created_at: Timestamp,
 }
 
-/// A public model alias: requests for `alias` resolve as if they named `target`
-/// (another public model name). A thin rename on top of the deployment list,
-/// distinct from fallbacks (which are failover, not aliasing).
+/// A public model alias: requests for `alias` resolve as if they named the
+/// model's own name. Distinct from fallbacks (which are failover, not aliasing).
+///
+/// Stored against `model_id`; `target` is the model's **current** name, joined
+/// at read time. So renaming a model retargets every one of its aliases with no
+/// write, and an alias can never dangle or chain — it is always exactly one hop
+/// from a canonical name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelAlias {
     pub alias: String,
+    pub model_id: Id,
     pub target: String,
     pub created_at: Timestamp,
 }
@@ -343,8 +359,8 @@ mod access_tests {
 
     fn pol(allow: &[&str], deny: &[&str]) -> AccessPolicy {
         AccessPolicy {
-            allowed_models: allow.iter().map(|s| s.to_string()).collect(),
-            denied_models: deny.iter().map(|s| s.to_string()).collect(),
+            allowed_model_ids: allow.iter().map(|s| s.to_string()).collect(),
+            denied_model_ids: deny.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
     }

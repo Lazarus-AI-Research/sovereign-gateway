@@ -30,7 +30,8 @@ pub use principal::{KeyAuth, Principal};
 pub use observe::{NullObserver, Observer};
 pub use reqlog::{NullLogger, RequestLogRecord, RequestLogger};
 pub use routing::{
-    Decision, Deployment, DeploymentRecord, EmbedFormat, Extra, HealthCheck, RouteRequest,
+    Decision, Deployment, DeploymentRecord, EmbedFormat, Extra, HealthCheck, ModelRecord,
+    NewDeployment, RouteRequest,
     Router, UpstreamFormat,
     WireFormat,
 };

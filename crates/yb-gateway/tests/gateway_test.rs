@@ -226,20 +226,38 @@ impl Store for RecordingStore {
     async fn get_deployment(&self, _id: &str) -> Result<Option<yb_core::DeploymentRecord>> {
         Ok(None)
     }
-    async fn create_deployment(&self, _dep: &yb_core::DeploymentRecord) -> Result<()> {
-        Ok(())
+    async fn create_deployment(
+        &self,
+        _dep: &yb_core::NewDeployment,
+    ) -> Result<yb_core::DeploymentRecord> {
+        unimplemented!("RecordingStore only serves the request path")
     }
     async fn delete_deployment(&self, _id: &str) -> Result<()> {
         Ok(())
     }
-    async fn seed_deployment(&self, _dep: &yb_core::DeploymentRecord) -> Result<bool> {
+    async fn seed_deployment(&self, _dep: &yb_core::NewDeployment) -> Result<bool> {
         Ok(true)
+    }
+    async fn list_models(&self) -> Result<Vec<yb_core::ModelRecord>> {
+        Ok(vec![])
+    }
+    async fn get_model(&self, _id: &str) -> Result<Option<yb_core::ModelRecord>> {
+        Ok(None)
+    }
+    async fn get_model_by_name(&self, _name: &str) -> Result<Option<yb_core::ModelRecord>> {
+        Ok(None)
+    }
+    async fn ensure_model(&self, _name: &str) -> Result<yb_core::ModelRecord> {
+        unimplemented!("RecordingStore only serves the request path")
+    }
+    async fn rename_model(&self, _id: &str, _new_name: &str) -> Result<yb_core::ModelRecord> {
+        unimplemented!("RecordingStore only serves the request path")
     }
     async fn list_aliases(&self) -> Result<Vec<yb_core::ModelAlias>> {
         Ok(vec![])
     }
-    async fn upsert_alias(&self, _alias: &yb_core::ModelAlias) -> Result<()> {
-        Ok(())
+    async fn upsert_alias(&self, _alias: &str, _model_id: &str) -> Result<yb_core::ModelAlias> {
+        unimplemented!("RecordingStore only serves the request path")
     }
     async fn delete_alias(&self, _alias: &str) -> Result<()> {
         Ok(())

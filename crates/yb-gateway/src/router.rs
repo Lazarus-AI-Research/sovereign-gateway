@@ -103,10 +103,20 @@ impl DeploymentRouter {
         aliases: HashMap<String, String>,
         strategy: Strategy,
     ) -> Self {
+        // This path is fed by config/tests, which name models but carry no ids.
+        // Synthesize one stable id per distinct name so that id-keyed filtering
+        // and dedupe behave exactly as they do against the database.
+        let mut ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for mc in &models {
+            let next = format!("cfg-{}", ids.len());
+            ids.entry(mc.model_name.clone()).or_insert(next);
+        }
         let deployments = models
             .into_iter()
             .flat_map(|mc| {
+                let model_id = ids.get(&mc.model_name).cloned().unwrap_or_default();
                 mc.deployments.into_iter().map(move |dc| Deployment {
+                    model_id: model_id.clone(),
                     model_name: mc.model_name.clone(),
                     provider: dc.provider,
                     upstream_model: dc.upstream_model,
@@ -232,7 +242,7 @@ impl DeploymentRouter {
 
         let mut survivors = Vec::new();
         for (i, d) in entry.deployments.iter().enumerate() {
-            if req.excluded_models.contains(&d.model_name) {
+            if req.excluded_model_ids.contains(&d.model_id) {
                 continue;
             }
             if let Some(enabled) = &req.enabled_providers {
@@ -250,7 +260,7 @@ impl DeploymentRouter {
         }
 
         for d in self.order(snap.strategy, entry, survivors) {
-            let key = (d.provider.clone(), d.upstream_model.clone(), d.model_name.clone());
+            let key = (d.provider.clone(), d.upstream_model.clone(), d.model_id.clone());
             if seen.insert(key) {
                 out.push(d);
             }
@@ -407,7 +417,9 @@ mod tests {
     fn excluded_model_removes_fallback() {
         let r = mk_router(Strategy::Simple);
         let mut rq = req("smart");
-        rq.excluded_models = BTreeSet::from(["cheap".to_string()]);
+        // Exclusion is by model id. `from_models` synthesizes `cfg-N` ids in
+        // declaration order, and `cheap` is the second model in `mk_router`.
+        rq.excluded_model_ids = BTreeSet::from(["cfg-1".to_string()]);
         let d = r.resolve(&rq).unwrap();
         assert!(d.candidates.iter().all(|c| c.model_name != "cheap"));
         assert_eq!(d.candidates.len(), 2);
@@ -454,6 +466,7 @@ mod tests {
         // Reload with a single new model; the old ones disappear.
         let rec = DeploymentRecord {
             id: yb_core::new_id(),
+            model_id: "m-fresh".into(),
             model_name: "fresh".into(),
             provider: "openai".into(),
             upstream_model: "gpt-4o".into(),
