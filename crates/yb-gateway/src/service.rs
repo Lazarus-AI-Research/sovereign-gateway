@@ -435,7 +435,8 @@ impl Gateway {
                 }
                 (true, ResponseBody::Stream(up)) => {
                     let stream =
-                        translate_stream(up, upstream_fmt, surface, rctx, status, cache_echo);
+                        translate_stream(up, upstream_fmt, surface, rctx, status, cache_echo,
+                                         chat.include_usage);
                     Ok(GatewayResponse::Stream {
                         status,
                         headers: sse_headers(),
@@ -969,9 +970,13 @@ fn translate_stream(
     rctx: RecordCtx,
     status: u16,
     cache_echo: (Option<String>, Option<String>),
+    include_usage: bool,
 ) -> ByteStream {
     let mut encoder = wire::Encoder::new(surface);
     encoder.set_prompt_cache(cache_echo.0, cache_echo.1);
+    // What the client asked for on the way in decides whether usage is relayed
+    // on the way out. The gateway collects it either way, for billing.
+    encoder.set_include_usage(include_usage);
     let init = StreamState {
         upstream,
         buf: Vec::new(),
@@ -1061,13 +1066,18 @@ fn translate_stream(
                         events.extend(evs);
                     }
                     st.done = true;
-                    let bytes = if events.is_empty() {
-                        Bytes::new()
+                    let mut b = if events.is_empty() {
+                        Vec::new()
                     } else {
-                        let b = st.encoder.encode(&events);
-                        st.response_bytes += b.len() as i64;
-                        Bytes::from(b)
+                        st.encoder.encode(&events)
                     };
+                    // Anything the encoder was still holding — the OpenAI Chat
+                    // surface defers [DONE] while waiting on a trailing usage
+                    // chunk, so an upstream that hangs up first must not leave
+                    // the client's stream unterminated.
+                    b.extend(st.encoder.finish());
+                    st.response_bytes += b.len() as i64;
+                    let bytes = Bytes::from(b);
                     let ir = st.ir_json();
                     st.rctx
                         .finish(st.usage, st.status, false, ir, st.response_bytes)

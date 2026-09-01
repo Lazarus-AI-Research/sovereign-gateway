@@ -39,6 +39,16 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop: Vec<String>,
     pub stream: bool,
+    /// The client asked for token usage on the stream
+    /// (`stream_options.include_usage`, OpenAI Chat Completions only).
+    ///
+    /// OpenAI omits `usage` from a stream unless this is set, so the surface
+    /// only emits the trailing usage chunk when the caller asked for it. The
+    /// gateway always requests usage *upstream* regardless — it needs the
+    /// counts for billing and telemetry — so this governs what is relayed on,
+    /// not what is collected.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_usage: bool,
     /// Extended-thinking / reasoning controls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
