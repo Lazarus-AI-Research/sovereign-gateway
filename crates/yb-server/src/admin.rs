@@ -72,6 +72,8 @@ pub fn router() -> Router<AppState> {
         // providers (an endpoint, its credentials, its deployments)
         .route("/providers", get(list_providers).post(create_provider))
         .route("/providers/:id", put(update_provider).delete(delete_provider))
+        .route("/providers/:id/discover", post(discover_provider_models))
+        .route("/deployments/bulk", post(create_deployments_bulk))
         // model aliases (extra public name -> model)
         .route("/aliases", get(list_aliases).post(create_alias))
         .route("/aliases/:alias", delete(delete_alias))
@@ -1011,6 +1013,139 @@ async fn update_provider(
         return error_response(&e);
     }
     respond(Ok(provider_json(&updated)))
+}
+
+#[derive(Deserialize)]
+struct DiscoverBody {
+    upstream_format: yb_core::UpstreamFormat,
+}
+
+/// `POST /providers/:id/discover` — ask the endpoint which models it serves
+/// (admin only).
+///
+/// The adapter shape is supplied by the caller rather than stored on the
+/// provider, because one endpoint can serve several: OpenAI answers both
+/// `openai_chat` and `openai_embed` from the same base. It decides the listing
+/// URL and how the reply is parsed.
+///
+/// Each result is flagged with whether this provider already has a deployment
+/// for it, so the console can present "add the rest" rather than offering
+/// duplicates that the identity index would reject anyway.
+async fn discover_provider_models(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DiscoverBody>,
+) -> Response {
+    if let Err(r) = authz(&principal, Action::EditConfig) {
+        return r;
+    }
+    let provider = match state.store.get_provider(&id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return error_response(&Error::NotFound("provider".into())),
+        Err(e) => return error_response(&e),
+    };
+    let found = match state
+        .gateway
+        .discover_models(
+            provider.api_base.as_deref(),
+            provider.api_key.as_deref(),
+            &provider.extra,
+            body.upstream_format,
+            &provider.name,
+        )
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => return error_response(&e),
+    };
+    let existing = match state.store.list_deployments().await {
+        Ok(d) => d,
+        Err(e) => return error_response(&e),
+    };
+    let out: Vec<serde_json::Value> = found
+        .into_iter()
+        .map(|upstream_model| {
+            let deployed = existing.iter().any(|d| {
+                d.provider_id == provider.id
+                    && d.upstream_model == upstream_model
+                    && d.upstream_format == body.upstream_format
+            });
+            json!({ "upstream_model": upstream_model, "deployed": deployed })
+        })
+        .collect();
+    respond(Ok(json!({ "provider": provider.name, "models": out })))
+}
+
+#[derive(Deserialize)]
+struct BulkDeploymentsBody {
+    provider: String,
+    upstream_format: yb_core::UpstreamFormat,
+    /// Each entry binds one upstream model to a public model name. The name may
+    /// be an existing model or a new one — the store resolves it either way.
+    models: Vec<BulkDeploymentEntry>,
+}
+
+#[derive(Deserialize)]
+struct BulkDeploymentEntry {
+    upstream_model: String,
+    model_name: String,
+}
+
+/// `POST /deployments/bulk` — create many deployments in one call (admin only).
+///
+/// The counterpart to discovery: selecting twenty models should be one request
+/// and one router reload, not twenty of each. Individual failures are collected
+/// and reported rather than aborting the batch, so one bad name does not lose
+/// the other nineteen.
+async fn create_deployments_bulk(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<BulkDeploymentsBody>,
+) -> Response {
+    if let Err(r) = authz(&principal, Action::EditConfig) {
+        return r;
+    }
+    let provider_name = match validate_public_name(&body.provider) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let mut created = 0usize;
+    let mut skipped = 0usize;
+    let mut errors: Vec<serde_json::Value> = Vec::new();
+    for entry in &body.models {
+        let model_name = match validate_public_name(&entry.model_name) {
+            Ok(n) => n,
+            Err(_) => {
+                errors.push(json!({ "upstream_model": entry.upstream_model,
+                                    "error": "invalid model name" }));
+                continue;
+            }
+        };
+        let dep = yb_core::NewDeployment {
+            model_name,
+            provider_name: provider_name.clone(),
+            upstream_model: entry.upstream_model.clone(),
+            upstream_format: body.upstream_format,
+            weight: 1,
+            pricing: None,
+            health_check: Default::default(),
+            health_path: None,
+        };
+        match state.store.seed_deployment(&dep).await {
+            Ok(true) => created += 1,
+            // Already present: the identity index says this exact binding
+            // exists, which is the common case when re-running discovery.
+            Ok(false) => skipped += 1,
+            Err(e) => errors.push(
+                json!({ "upstream_model": entry.upstream_model, "error": e.to_string() }),
+            ),
+        }
+    }
+    if let Err(e) = state.reload_models().await {
+        return error_response(&e);
+    }
+    respond(Ok(json!({ "created": created, "skipped": skipped, "errors": errors })))
 }
 
 /// `DELETE /providers/:id` — remove a provider with no deployments (admin only).

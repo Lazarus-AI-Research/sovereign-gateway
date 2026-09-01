@@ -254,6 +254,75 @@ impl Gateway {
         self
     }
 
+    /// Ask a provider's endpoint which models it serves, for a given adapter.
+    ///
+    /// The provider deliberately has no wire format — one endpoint can serve
+    /// several — so the caller supplies the adapter shape, which decides both
+    /// the listing URL and how the response is parsed.
+    ///
+    /// Auth is built exactly as a request would build it: the format's own
+    /// scheme for the origin, then the provider's edge headers (Cloudflare
+    /// Access, literal headers), so a backend behind Zero Trust answers rather
+    /// than 403ing.
+    pub async fn discover_models(
+        &self,
+        api_base: Option<&str>,
+        api_key: Option<&str>,
+        extra: &Extra,
+        fmt: yb_core::UpstreamFormat,
+        label: &str,
+    ) -> yb_core::Result<Vec<String>> {
+        let url = crate::health::models_list_url_for(fmt, api_base)
+            .map_err(yb_core::Error::BadRequest)?;
+        let key = api_key.unwrap_or_default();
+        let mut headers = match fmt {
+            yb_core::UpstreamFormat::Chat(f) => auth_headers(f, key),
+            yb_core::UpstreamFormat::Embed(f) => yb_providers::embed_auth_headers(f, key),
+        };
+        append_headers(&mut headers, self.extra_headers(extra, label));
+
+        let resp = self
+            .client
+            .send(UpstreamRequest {
+                url,
+                method: yb_providers::HttpMethod::Get,
+                headers,
+                body: Vec::new(),
+                stream: false,
+            })
+            .await
+            .map_err(|e| yb_core::Error::Upstream {
+                provider: label.to_string(),
+                status: 502,
+                message: format!("model discovery failed: {e}"),
+            })?;
+
+        let body = match resp.body {
+            yb_providers::ResponseBody::Full(b) => b,
+            _ => {
+                return Err(yb_core::Error::Upstream {
+                    provider: label.to_string(),
+                    status: 502,
+                    message: "model discovery got a streaming response".into(),
+                })
+            }
+        };
+        if !(200..300).contains(&resp.status) {
+            let msg = String::from_utf8_lossy(&body);
+            let msg = msg.chars().take(200).collect::<String>();
+            return Err(yb_core::Error::Upstream {
+                provider: label.to_string(),
+                status: resp.status,
+                message: msg.trim().to_string(),
+            });
+        }
+        crate::health::parse_models_list(fmt, &body).map_err(|message| yb_core::Error::Upstream {
+            provider: label.to_string(),
+            status: 502,
+            message,
+        })
+    }
+
     /// The extra headers a deployment opted into, resolved against the process
     /// config, in order of decreasing authority.
     ///

@@ -467,8 +467,9 @@ function ModelName({ model, admin, onRenamed }: { model: any; admin: boolean; on
  * never the key, so an edit that leaves the field blank keeps the stored one
  * rather than blanking it. The placeholder says which of those is happening.
  */
-function Providers({ admin }: { admin: boolean }) {
-  const [{ data, error }, reload] = useAsync<any[]>(() => api('/providers'));
+function Providers({ admin, data, error, reload }: {
+  admin: boolean; data: any[] | null; error: string; reload: () => void;
+}) {
   const blank = { name: '', api_base: '', api_key: '', extra: { cloudflare_access: false } };
   const [f, setF] = useState<any>(blank);
   const [editing, setEditing] = useState<string>('');
@@ -545,14 +546,16 @@ function Providers({ admin }: { admin: boolean }) {
           <div class="grid">
             <input placeholder="name (e.g. openai)" value={f.name}
                    onInput={(e: any) => setF((s: any) => ({ ...s, name: e.target.value }))} />
-            <input placeholder="api_base (blank = format default)" value={f.api_base}
+            <input placeholder="api_base (blank = default)" value={f.api_base}
                    onInput={(e: any) => setF((s: any) => ({ ...s, api_base: e.target.value }))} />
             <input type="password" value={f.api_key}
                    placeholder={editing ? 'api_key (blank = keep current)' : 'api_key'}
                    onInput={(e: any) => setF((s: any) => ({ ...s, api_key: e.target.value }))} />
           </div>
-          <label class="row" style="margin-top:10px;gap:8px;cursor:pointer">
-            <input type="checkbox" checked={!!f.extra.cloudflare_access}
+          {/* nowrap + top alignment: `.row` wraps, which would strand the box
+              on its own line above a long label. */}
+          <label class="row" style="margin-top:10px;gap:8px;cursor:pointer;flex-wrap:nowrap;align-items:flex-start">
+            <input type="checkbox" style="margin-top:3px;flex:none" checked={!!f.extra.cloudflare_access}
                    onChange={(e: any) => setF((s: any) => ({ ...s, extra: { ...s.extra, cloudflare_access: e.target.checked } }))} />
             <span>Behind Cloudflare Access
               <span class="mut"> — send the service token from <span class="mono">[upstream.cloudflare_access]</span></span></span>
@@ -575,7 +578,10 @@ function Models({ admin }: { admin: boolean }) {
   // api_base / api_key / extra are the provider's now, so the deployment form
   // is just: which model, through which provider, speaking which format.
   const blank = { model_name: '', provider: '', upstream_model: '', upstream_format: 'openai_chat' };
-  const [{ data: providerData }] = useAsync<any[]>(() => api('/providers'));
+  // Owned here, not inside Providers, so that adding a provider immediately
+  // populates this form's picker instead of needing a page reload.
+  const [{ data: providerData, error: providerError }, reloadProviders] =
+    useAsync<any[]>(() => api('/providers'));
   const [f, setF] = useState<any>(blank);
   const [msg, setMsg] = useState('');
   const upd = (k: string, v: string) => setF((s: any) => ({ ...s, [k]: v }));
@@ -583,11 +589,48 @@ function Models({ admin }: { admin: boolean }) {
     setMsg('');
     try {
       await api('/deployments', { method: 'POST', body: { ...f } });
-      setF(blank); setShowAdd(false); reload(); reloadModels();
+      // Providers too: their deployment counts just changed.
+      setF(blank); setShowAdd(false); reload(); reloadModels(); reloadProviders();
     } catch (e: any) { setMsg(e.message); }
   };
   const [showAdd, setShowAdd] = useState(false);
-  const del = async (id: string) => { if (confirm('Delete this deployment?')) { await api('/deployments/' + id, { method: 'DELETE' }); reload(); reloadModels(); } };
+  // Discovery: ask the provider's endpoint what it serves for the chosen
+  // adapter, then pick which of those to deploy and under which public name.
+  const [found, setFound] = useState<any[] | null>(null);
+  const [picked, setPicked] = useState<Record<string, string>>({});
+  const [detecting, setDetecting] = useState(false);
+  const detect = async () => {
+    const p = (providerData || []).find((x) => x.name === f.provider);
+    if (!p) { setMsg('pick a provider first'); return; }
+    setDetecting(true); setMsg(''); setFound(null);
+    try {
+      const r = await api('/providers/' + encodeURIComponent(p.id) + '/discover',
+                          { method: 'POST', body: { upstream_format: f.upstream_format } });
+      setFound(r.models || []);
+      // Default each public name to the upstream id — the common case — while
+      // leaving every row editable so several endpoints can back one model.
+      const pre: Record<string, string> = {};
+      for (const m of r.models || []) if (!m.deployed) pre[m.upstream_model] = m.upstream_model;
+      setPicked(pre);
+    } catch (e: any) { setMsg(e.message); }
+    finally { setDetecting(false); }
+  };
+  const addPicked = async () => {
+    const models = Object.entries(picked)
+      .filter(([, name]) => name && name.trim())
+      .map(([upstream_model, model_name]) => ({ upstream_model, model_name: model_name.trim() }));
+    if (!models.length) { setMsg('nothing selected'); return; }
+    setMsg('');
+    try {
+      const r = await api('/deployments/bulk', { method: 'POST',
+        body: { provider: f.provider, upstream_format: f.upstream_format, models } });
+      setShowAdd(false); setFound(null); setPicked({});
+      reload(); reloadModels(); reloadProviders();
+      if (r.errors?.length) alert(r.errors.length + ' failed; ' + r.created + ' added');
+    } catch (e: any) { setMsg(e.message); }
+  };
+  const closeAdd = () => { setShowAdd(false); setFound(null); setPicked({}); setMsg(''); };
+  const del = async (id: string) => { if (confirm('Delete this deployment?')) { await api('/deployments/' + id, { method: 'DELETE' }); reload(); reloadModels(); reloadProviders(); } };
   const [{ data: aliasData }, reloadAliases] = useAsync<any[]>(() => api('/aliases'));
   const aliasesFor = (modelId: string) => (aliasData || []).filter((a) => a.model_id === modelId);
   const addAlias = async (target: string) => {
@@ -602,7 +645,7 @@ function Models({ admin }: { admin: boolean }) {
   const delAlias = async (a: string) => { if (confirm('Remove alias “' + a + '”?')) { await api('/aliases/' + encodeURIComponent(a), { method: 'DELETE' }); reloadAliases(); } };
   return (
     <Fragment>
-      <Providers admin={admin} />
+      <Providers admin={admin} data={providerData} error={providerError} reload={reloadProviders} />
       <div class="card">
         <div class="row"><h2 style="margin:0">Models <span class="mut">— each public name, with the deployments behind it</span></h2>
           <span class="sp" style="flex:1"></span>
@@ -648,7 +691,7 @@ function Models({ admin }: { admin: boolean }) {
           )}
       </div>
       {admin && showAdd && (
-        <Modal title="Add a deployment" onClose={() => setShowAdd(false)}>
+        <Modal title="Add a deployment" onClose={closeAdd}>
           <div class="grid">
             <input placeholder="model_name (public)" value={f.model_name} onInput={(e: any) => upd('model_name', e.target.value)} />
             <select value={f.provider} onChange={(e: any) => upd('provider', e.target.value)}>
@@ -663,7 +706,78 @@ function Models({ admin }: { admin: boolean }) {
             add or edit those in the Providers card above. One endpoint can serve
             several formats, which is why the format is set here.
           </p>
-          <div class="row" style="margin-top:12px"><button class="btn" onClick={add}>Add deployment</button>{msg && <span class="err">{msg}</span>}</div>
+          <div class="row" style="margin-top:10px">
+            <button class="ghost" disabled={!f.provider || detecting} onClick={detect}>
+              {detecting ? 'Detecting…' : 'Detect models from this provider'}
+            </button>
+            <span class="mut" style="font-size:12px">
+              asks the endpoint what it serves for this adapter
+            </span>
+          </div>
+          {found && (
+            <div style="margin-top:12px">
+              {!found.length
+                ? <p class="mut">The endpoint reported no models for this adapter.</p>
+                : (
+                  <Fragment>
+                    <div class="row" style="justify-content:space-between">
+                      <span class="mut" style="font-size:12px">
+                        {found.filter((m) => !m.deployed).length} available ·{' '}
+                        {found.filter((m) => m.deployed).length} already deployed ·
+                        set the public name each should answer to
+                      </span>
+                      <span>
+                        <a class="link" onClick={() => {
+                          const all: Record<string, string> = {};
+                          for (const m of found) if (!m.deployed) all[m.upstream_model] = m.upstream_model;
+                          setPicked(all);
+                        }}>select all</a>{' · '}
+                        <a class="link" onClick={() => setPicked({})}>none</a>{' · '}
+                        <a class="link" onClick={() => { setFound(null); setPicked({}); }}>
+                          back to manual
+                        </a>
+                      </span>
+                    </div>
+                    <div class="tablewrap" style="max-height:320px;overflow-y:auto;margin-top:6px">
+                      <table>
+                        <thead><tr><th></th><th>upstream_model</th><th>public model name</th></tr></thead>
+                        <tbody>{found.map((m) => (
+                          <tr key={m.upstream_model}>
+                            <td>
+                              <input type="checkbox" disabled={m.deployed}
+                                     checked={m.upstream_model in picked}
+                                     onChange={(e: any) => setPicked((s) => {
+                                       const n = { ...s };
+                                       if (e.target.checked) n[m.upstream_model] = m.upstream_model;
+                                       else delete n[m.upstream_model];
+                                       return n;
+                                     })} />
+                            </td>
+                            <td class="mono nowrap">{m.upstream_model}</td>
+                            <td>{m.deployed
+                              ? <span class="mut">already deployed</span>
+                              : <input class="mono" style="width:100%" value={picked[m.upstream_model] || ''}
+                                       placeholder="not selected"
+                                       disabled={!(m.upstream_model in picked)}
+                                       onInput={(e: any) => setPicked((s) => ({ ...s, [m.upstream_model]: e.target.value }))} />}
+                            </td>
+                          </tr>
+                        ))}</tbody>
+                      </table>
+                    </div>
+                    <div class="row" style="margin-top:10px">
+                      <button class="btn" onClick={addPicked}>
+                        Add {Object.keys(picked).length} deployment{Object.keys(picked).length === 1 ? '' : 's'}
+                      </button>
+                    </div>
+                  </Fragment>
+                )}
+            </div>
+          )}
+          <div class="row" style="margin-top:12px">
+            {!found && <button class="btn" onClick={add}>Add deployment</button>}
+            {msg && <span class="err">{msg}</span>}
+          </div>
         </Modal>
       )}
     </Fragment>

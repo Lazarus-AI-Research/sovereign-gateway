@@ -785,6 +785,31 @@ async fn put_json(
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
+/// `POST uri` with `body`, authenticated by a session cookie.
+async fn post_json_as(
+    app: &axum::Router,
+    uri: &str,
+    cookie: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
 /// A session cookie for a freshly created admin, for the mutation endpoints.
 async fn admin_cookie(store: &dyn Store) -> String {
     let admin = User {
@@ -902,6 +927,82 @@ async fn a_deny_survives_a_rename() {
         vec!["claude-sonnet".to_string()],
         "a renamed model must stay denied — this is the bug ids exist to prevent"
     );
+}
+
+/// Bulk create is the counterpart to discovery: selecting twenty models should
+/// be one request and one router reload, not twenty of each.
+#[tokio::test]
+async fn bulk_deployments_create_and_are_idempotent() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state.clone());
+
+    let body = json!({
+        "provider": "local-vllm",
+        "upstream_format": "openai_chat",
+        "models": [
+            { "upstream_model": "gpt-4o",      "model_name": "gpt-4o" },
+            // An upstream id may answer to a different public name.
+            { "upstream_model": "gpt-4o-mini", "model_name": "fast" },
+        ]
+    });
+    let (status, v) = post_json_as(&app, "/admin/v1/deployments/bulk", &cookie, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{v:?}");
+    assert_eq!(v["created"], 2);
+    assert_eq!(v["skipped"], 0);
+
+    // The provider was created on demand, and both models exist.
+    assert!(store.get_provider_by_name("local-vllm").await.unwrap().is_some());
+    assert!(store.get_model_by_name("fast").await.unwrap().is_some());
+    let deps = store.list_deployments().await.unwrap();
+    assert_eq!(deps.len(), 2);
+    let fast = deps.iter().find(|d| d.model_name == "fast").unwrap();
+    assert_eq!(fast.upstream_model, "gpt-4o-mini");
+
+    // Re-running is a no-op rather than a duplicate — the same identity index
+    // that makes `gateway import` idempotent.
+    let (status, v) = post_json_as(&app, "/admin/v1/deployments/bulk", &cookie, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["created"], 0);
+    assert_eq!(v["skipped"], 2);
+    assert_eq!(store.list_deployments().await.unwrap().len(), 2);
+
+    // And the router picked them up without a restart.
+    let (_, v) = get_json(&app, "/admin/v1/models", &cookie).await;
+    let names: Vec<&str> = v.as_array().unwrap().iter()
+        .map(|m| m["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["fast", "gpt-4o"]);
+}
+
+/// Discovery is an admin action against a real endpoint, so the failure modes
+/// that do not need an upstream are worth pinning.
+#[tokio::test]
+async fn discovery_rejects_unknown_providers_and_non_admins() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "gpt-4o", "openai").await;
+    let id = provider_id(store.as_ref(), "openai").await;
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state);
+
+    let (status, _) = post_json_as(&app, "/admin/v1/providers/nope/discover", &cookie,
+                                   json!({ "upstream_format": "openai_chat" })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Voyage publishes no model list; discovery must say so rather than
+    // inventing a URL that 404s.
+    let (status, v) = post_json_as(&app, &format!("/admin/v1/providers/{id}/discover"), &cookie,
+                                   json!({ "upstream_format": "voyage_embed" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(v["error"]["message"].as_str().unwrap().contains("no model-listing endpoint"));
+
+    let member = store.list_users().await.unwrap().into_iter()
+        .find(|u| u.role == Role::Member).expect("seeded member");
+    let member_cookie = session_cookie(store.as_ref(), &member.id).await;
+    let (status, _) = post_json_as(&app, &format!("/admin/v1/providers/{id}/discover"),
+                                   &member_cookie, json!({ "upstream_format": "openai_chat" })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 /// The provider half of the same guarantee.
