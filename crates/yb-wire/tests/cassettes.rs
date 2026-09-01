@@ -87,10 +87,25 @@ fn decode_stream(format: &str, lines: &[String]) -> Vec<StreamEvent> {
     out
 }
 
-fn encode_stream(format: &str, events: &[StreamEvent]) -> Vec<u8> {
+/// Encode IR events into the client's format.
+///
+/// `include_usage` comes from the cassette's own `inbound_body`, because on the
+/// real path the client's request shapes the response encoder — OpenAI only
+/// relays usage on a stream when `stream_options.include_usage` asked for it.
+/// Passing it here is what lets a cassette cover the relay rather than stopping
+/// at the decode.
+fn encode_stream(format: &str, events: &[StreamEvent], include_usage: bool) -> Vec<u8> {
     match format {
         "anthropic" => anthropic::encode_sse(events, &mut anthropic::EmitState::default()),
-        "openai_chat" => openai_chat::encode_sse(events, &mut openai_chat::EmitState::default()),
+        "openai_chat" => {
+            let mut st = openai_chat::EmitState::default();
+            st.set_include_usage(include_usage);
+            let mut out = openai_chat::encode_sse(events, &mut st);
+            // The surface holds [DONE] back while waiting on a trailing usage
+            // chunk; the real driver flushes at end of stream, so do the same.
+            out.extend(st.finish());
+            out
+        }
         "openai_responses" => {
             openai_responses::encode_sse(events, &mut openai_responses::EmitState::default())
         }
@@ -185,7 +200,14 @@ fn run(name: &str) {
             .map(|l| l.as_str().unwrap().to_string())
             .collect();
         let events = decode_stream(target_format, &lines);
-        let encoded = encode_stream(client_format, &events);
+        // What the client asked for on the way in governs what it gets back.
+        let include_usage = c
+            .get("inbound_body")
+            .and_then(|b| b.get("stream_options"))
+            .and_then(|o| o.get("include_usage"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let encoded = encode_stream(client_format, &events, include_usage);
         let got = String::from_utf8(encoded).unwrap();
         assert_eq!(
             parse_sse(&got),
@@ -237,6 +259,17 @@ fn anthropic_to_responses_tools() {
 #[test]
 fn openai_stream_to_anthropic() {
     run("openai_stream_to_anthropic");
+}
+
+/// Usage must survive the relay, not just the decode.
+///
+/// Recorded live from Kimi k3 over OpenAI Chat Completions with
+/// `stream_options.include_usage`. The upstream's trailing choices-less usage
+/// chunk was being decoded, accumulated for billing, and then dropped on the
+/// way out, so a downstream metering proxy saw nothing.
+#[test]
+fn openai_stream_usage_relay() {
+    run("openai_stream_usage_relay");
 }
 
 #[test]
@@ -402,13 +435,13 @@ fn vllm_replay_tool_stream_decodes_and_reencodes() {
 
     // Re-encode to every client surface without panicking; Responses output must
     // be lifecycle-correct end to end.
-    assert_responses_lifecycle(&encode_stream("openai_responses", &events));
-    let _ = encode_stream("anthropic", &events);
-    let _ = encode_stream("openai_chat", &events);
+    assert_responses_lifecycle(&encode_stream("openai_responses", &events, false));
+    let _ = encode_stream("anthropic", &events, false);
+    let _ = encode_stream("openai_chat", &events, false);
 
     // Gemini has no partial-tool encoding, so its encoder buffers tool args and
     // must emit ONE functionCall part carrying the complete args object.
-    let gem = String::from_utf8(encode_stream("gemini", &events)).unwrap();
+    let gem = String::from_utf8(encode_stream("gemini", &events, false)).unwrap();
     assert!(gem.contains("\"functionCall\""), "gemini output missing functionCall");
     assert!(
         gem.contains("\"answer\":42") || gem.contains("\"answer\": 42"),
@@ -429,9 +462,9 @@ fn vllm_replay_codex_stream_decodes_and_reencodes() {
     let done = events.iter().any(|e| matches!(e, StreamEvent::Done { .. }));
     assert!(done, "stream must terminate with Done");
 
-    assert_responses_lifecycle(&encode_stream("openai_responses", &events));
-    let _ = encode_stream("anthropic", &events);
-    let _ = encode_stream("openai_chat", &events);
+    assert_responses_lifecycle(&encode_stream("openai_responses", &events, false));
+    let _ = encode_stream("anthropic", &events, false);
+    let _ = encode_stream("openai_chat", &events, false);
 }
 
 /// `prompt_cache_key` round-trips on both OpenAI shapes, always accompanied by
