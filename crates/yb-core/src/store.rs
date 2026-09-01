@@ -13,7 +13,7 @@ use crate::model::{
     TelemetryRecord, User,
 };
 use crate::principal::KeyAuth;
-use crate::routing::{DeploymentRecord, ModelRecord, NewDeployment};
+use crate::routing::{DeploymentRecord, ModelRecord, NewDeployment, ProviderRecord};
 use crate::spend::{Budget, Period, RollupDelta, SpendRow, SubjectType};
 use async_trait::async_trait;
 
@@ -134,6 +134,27 @@ pub trait Store: Send + Sync {
     /// *this* model, that alias is consumed rather than conflicting — so
     /// undoing a rename leaves no self-referential alias behind.
     async fn rename_model(&self, id: &str, new_name: &str) -> crate::Result<ModelRecord>;
+
+    // ---- providers (an endpoint, its credentials, its deployments) -----
+    async fn list_providers(&self) -> crate::Result<Vec<ProviderRecord>>;
+    async fn get_provider(&self, id: &str) -> crate::Result<Option<ProviderRecord>>;
+    async fn get_provider_by_name(&self, name: &str) -> crate::Result<Option<ProviderRecord>>;
+    /// Resolve `name` to its provider, creating a credential-less row if the
+    /// name is new. The name-based edge the import file and admin bodies use.
+    async fn ensure_provider(&self, name: &str) -> crate::Result<ProviderRecord>;
+    /// Replace a provider's endpoint settings. `api_key: None` leaves the
+    /// stored credential untouched — the admin API never reads a key back out,
+    /// so an edit round-trip must not be able to blank one by omission.
+    async fn update_provider(
+        &self,
+        id: &str,
+        name: &str,
+        api_base: Option<&str>,
+        api_key: Option<&str>,
+        extra: &crate::routing::Extra,
+    ) -> crate::Result<ProviderRecord>;
+    /// Delete a provider. `Conflict` if any live deployment still uses it.
+    async fn delete_provider(&self, id: &str) -> crate::Result<()>;
 
     // ---- deployments (one model's upstream fan-out) --------------------
     async fn list_deployments(&self) -> crate::Result<Vec<DeploymentRecord>>;

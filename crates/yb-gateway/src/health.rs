@@ -210,10 +210,16 @@ fn probe_embed_request(model: &str) -> EmbedRequest {
     }
 }
 
-/// The model-listing URL for a deployment's backend family, with the same
-/// version-dedup join semantics as request URLs.
-fn models_list_url(dep: &DeploymentRecord) -> std::result::Result<String, String> {
-    let (default_base, version, endpoint) = match dep.upstream_format {
+/// The model-listing URL for a backend family, with the same version-dedup join
+/// semantics as request URLs.
+///
+/// Takes the format and base rather than a whole deployment, because provider
+/// model-discovery calls it before any deployment exists.
+pub fn models_list_url_for(
+    fmt: UpstreamFormat,
+    api_base: Option<&str>,
+) -> std::result::Result<String, String> {
+    let (default_base, version, endpoint) = match fmt {
         UpstreamFormat::Chat(WireFormat::Anthropic) => ("https://api.anthropic.com", "v1", "models"),
         UpstreamFormat::Chat(WireFormat::OpenaiChat | WireFormat::OpenaiResponses)
         | UpstreamFormat::Embed(EmbedFormat::OpenaiEmbed) => {
@@ -230,13 +236,18 @@ fn models_list_url(dep: &DeploymentRecord) -> std::result::Result<String, String
             )
         }
     };
-    let base = dep.api_base.as_deref().unwrap_or(default_base);
+    let base = api_base.unwrap_or(default_base);
     let base = base.strip_suffix('/').unwrap_or(base);
     Ok(if base == version || base.ends_with(&format!("/{version}")) {
         format!("{base}/{endpoint}")
     } else {
         format!("{base}/{version}/{endpoint}")
     })
+}
+
+/// Back-compat shim for the health path, which has a deployment in hand.
+fn models_list_url(dep: &DeploymentRecord) -> std::result::Result<String, String> {
+    models_list_url_for(dep.upstream_format, dep.api_base.as_deref())
 }
 
 /// The `scheme://host[:port]` origin of a URL (path stripped).
@@ -259,6 +270,7 @@ mod tests {
         DeploymentRecord {
             id: "d1".into(),
             model_id: "m1".into(),
+            provider_id: "p1".into(),
             model_name: "m".into(),
             provider: "p".into(),
             upstream_model: "um".into(),
@@ -340,5 +352,118 @@ mod tests {
     fn none_means_no_request() {
         let d = dep(WireFormat::OpenaiChat.into(), None, HealthCheck::None, None);
         assert!(build_check_request(&d, Vec::new()).unwrap().is_none());
+    }
+}
+
+/// Parse a model-listing response into upstream model ids.
+///
+/// Each family answers in its own shape, so this mirrors [`models_list_url_for`]:
+/// OpenAI-compatible and Anthropic return `{"data":[{"id":…}]}`; Gemini and
+/// Cohere return `{"models":[{"name":…}]}`; Ollama returns `{"models":[{"name":…}]}`
+/// from `/api/tags`. Gemini prefixes ids with `models/`, which is stripped so the
+/// value matches what a request would send.
+pub fn parse_models_list(fmt: UpstreamFormat, body: &[u8]) -> std::result::Result<Vec<String>, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("upstream returned invalid JSON: {e}"))?;
+    let mut out = Vec::new();
+    let (key, field) = match fmt {
+        UpstreamFormat::Chat(WireFormat::Gemini) | UpstreamFormat::Embed(EmbedFormat::GeminiEmbed) => {
+            ("models", "name")
+        }
+        UpstreamFormat::Embed(EmbedFormat::CohereEmbed | EmbedFormat::OllamaEmbed) => {
+            ("models", "name")
+        }
+        _ => ("data", "id"),
+    };
+    let Some(items) = v.get(key).and_then(|d| d.as_array()) else {
+        return Err(format!("upstream response has no `{key}` array"));
+    };
+    for item in items {
+        if let Some(id) = item.get(field).and_then(|s| s.as_str()) {
+            // Gemini reports `models/gemini-1.5-pro`; requests send the bare id.
+            out.push(id.strip_prefix("models/").unwrap_or(id).to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use yb_core::routing::{EmbedFormat, WireFormat};
+
+    #[test]
+    fn parses_each_family_response_shape() {
+        // OpenAI-compatible and Anthropic: {"data":[{"id":…}]}
+        let openai = br#"{"data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"}]}"#;
+        assert_eq!(
+            parse_models_list(WireFormat::OpenaiChat.into(), openai).unwrap(),
+            vec!["gpt-4o", "gpt-4o-mini"]
+        );
+        let anthropic = br#"{"data":[{"id":"claude-sonnet-4"}]}"#;
+        assert_eq!(
+            parse_models_list(WireFormat::Anthropic.into(), anthropic).unwrap(),
+            vec!["claude-sonnet-4"]
+        );
+
+        // Gemini: {"models":[{"name":"models/…"}]} — the prefix is stripped so
+        // the value matches what a request actually sends.
+        let gemini = br#"{"models":[{"name":"models/gemini-2.0-flash"}]}"#;
+        assert_eq!(
+            parse_models_list(WireFormat::Gemini.into(), gemini).unwrap(),
+            vec!["gemini-2.0-flash"]
+        );
+
+        // Ollama's /api/tags.
+        let ollama = br#"{"models":[{"name":"llama3"},{"name":"nomic-embed-text"}]}"#;
+        assert_eq!(
+            parse_models_list(EmbedFormat::OllamaEmbed.into(), ollama).unwrap(),
+            vec!["llama3", "nomic-embed-text"]
+        );
+    }
+
+    #[test]
+    fn results_are_sorted_and_deduped() {
+        let body = br#"{"data":[{"id":"b"},{"id":"a"},{"id":"b"}]}"#;
+        assert_eq!(
+            parse_models_list(WireFormat::OpenaiChat.into(), body).unwrap(),
+            vec!["a", "b"]
+        );
+    }
+
+    /// A wrong-shaped or non-JSON body is a clear error, not an empty list —
+    /// "the endpoint serves nothing" and "we could not read the reply" must not
+    /// look the same in the console.
+    #[test]
+    fn a_bad_body_is_an_error_not_an_empty_list() {
+        assert!(parse_models_list(WireFormat::OpenaiChat.into(), b"not json").is_err());
+        let wrong_shape = br#"{"models":[{"name":"x"}]}"#;
+        assert!(parse_models_list(WireFormat::OpenaiChat.into(), wrong_shape).is_err());
+    }
+
+    /// Voyage has no listing endpoint, so discovery must say so rather than
+    /// inventing a URL that 404s.
+    #[test]
+    fn voyage_has_no_listing_endpoint() {
+        let err = models_list_url_for(EmbedFormat::VoyageEmbed.into(), None).unwrap_err();
+        assert!(err.contains("no model-listing endpoint"), "{err}");
+    }
+
+    #[test]
+    fn listing_url_joins_without_duplicating_the_version() {
+        assert_eq!(
+            models_list_url_for(WireFormat::OpenaiChat.into(), Some("http://host:8000/v1")).unwrap(),
+            "http://host:8000/v1/models"
+        );
+        assert_eq!(
+            models_list_url_for(WireFormat::OpenaiChat.into(), Some("http://host:8000")).unwrap(),
+            "http://host:8000/v1/models"
+        );
+        assert_eq!(
+            models_list_url_for(WireFormat::OpenaiChat.into(), None).unwrap(),
+            "https://api.openai.com/v1/models"
+        );
     }
 }

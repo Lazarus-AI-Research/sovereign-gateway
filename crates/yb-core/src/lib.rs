@@ -31,6 +31,7 @@ pub use observe::{NullObserver, Observer};
 pub use reqlog::{NullLogger, RequestLogRecord, RequestLogger};
 pub use routing::{
     Decision, Deployment, DeploymentRecord, EmbedFormat, Extra, HealthCheck, ModelRecord,
+    ProviderRecord,
     NewDeployment, RouteRequest,
     Router, UpstreamFormat,
     WireFormat,

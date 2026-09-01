@@ -14,7 +14,7 @@ use yb_core::model::{
     TelemetryRecord, User,
 };
 use yb_core::principal::KeyAuth;
-use yb_core::routing::{DeploymentRecord, ModelRecord, NewDeployment};
+use yb_core::routing::{DeploymentRecord, ModelRecord, NewDeployment, ProviderRecord};
 use yb_core::spend::{Budget, BudgetAction, Period, RollupDelta, SpendRow, SubjectType};
 use yb_core::{new_id, now, Error, LimitColumns, Micros, Result, Store, Timestamp};
 
@@ -79,15 +79,20 @@ fn enc_enum<T: serde::Serialize>(v: &T) -> String {
 /// inside sqlx: the cached column metadata and the live statement's column count
 /// disagree, and the row is indexed with the wrong one. Naming the columns keeps
 /// reads pinned to the shape this code expects.
-const DEPLOYMENT_COLS: &str = "d.id, d.model_id, m.name AS model_name, d.provider, \
-     d.upstream_model, d.api_base, d.api_key, d.upstream_format, d.weight, d.pricing, \
-     d.health_check, d.health_path, d.extra, d.created_at, d.updated_at, d.deleted_at";
+const DEPLOYMENT_COLS: &str = "d.id, d.model_id, m.name AS model_name, \
+     d.provider_id, p.name AS provider, p.api_base, p.api_key, p.extra, \
+     d.upstream_model, d.upstream_format, d.weight, d.pricing, \
+     d.health_check, d.health_path, d.created_at, d.updated_at, d.deleted_at";
 
 /// The join every deployment read goes through, paired with [`DEPLOYMENT_COLS`].
-const DEPLOYMENT_FROM: &str = "FROM deployments d JOIN models m ON m.id = d.model_id";
+const DEPLOYMENT_FROM: &str = "FROM deployments d JOIN models m ON m.id = d.model_id \
+     JOIN providers p ON p.id = d.provider_id";
 
 /// Column list for `models` reads.
 const MODEL_COLS: &str = "id, name, created_at, updated_at";
+
+/// Column list for `providers` reads.
+const PROVIDER_COLS: &str = "id, name, api_base, api_key, extra, created_at, updated_at";
 
 /// Encode a deployment's `extra` object as JSON (`{}` when empty).
 fn enc_extra(x: &yb_core::Extra) -> String {
@@ -213,6 +218,19 @@ fn map_spend_row(r: &PgRow) -> Result<SpendRow> {
 }
 
 /// Map a `deployments` row to a [`DeploymentRecord`].
+/// Map a `providers` row to a [`ProviderRecord`].
+fn map_provider(r: &PgRow) -> Result<ProviderRecord> {
+    Ok(ProviderRecord {
+        id: r.try_get("id").map_err(storage_err)?,
+        name: r.try_get("name").map_err(storage_err)?,
+        api_base: r.try_get("api_base").map_err(storage_err)?,
+        api_key: r.try_get("api_key").map_err(storage_err)?,
+        extra: dec_extra(r.try_get("extra").map_err(storage_err)?),
+        created_at: r.try_get("created_at").map_err(storage_err)?,
+        updated_at: r.try_get("updated_at").map_err(storage_err)?,
+    })
+}
+
 /// Map a `models` row to a [`ModelRecord`].
 fn map_model(r: &PgRow) -> Result<ModelRecord> {
     Ok(ModelRecord {
@@ -241,6 +259,7 @@ fn map_deployment(r: &PgRow) -> Result<DeploymentRecord> {
         id: r.try_get("id").map_err(storage_err)?,
         model_id: r.try_get("model_id").map_err(storage_err)?,
         model_name: r.try_get("model_name").map_err(storage_err)?,
+        provider_id: r.try_get("provider_id").map_err(storage_err)?,
         provider: r.try_get("provider").map_err(storage_err)?,
         upstream_model: r.try_get("upstream_model").map_err(storage_err)?,
         api_base: r.try_get("api_base").map_err(storage_err)?,
@@ -923,6 +942,27 @@ impl Store for PostgresStore {
     }
 
     async fn ensure_model(&self, name: &str) -> Result<ModelRecord> {
+        // A public name is either a model's or an alias's, never both.
+        // `Snapshot::canonical` lets a real model shadow an alias of the same
+        // name, so creating one here would silently steal that alias's traffic
+        // — reachable from `gateway import` re-running a file that still names
+        // a model which has since been renamed.
+        if let Some(row) = sqlx::query("SELECT model_id FROM model_aliases WHERE alias = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_err)?
+        {
+            let owner: String = row.get("model_id");
+            let target = self
+                .get_model(&owner)
+                .await?
+                .map(|m| m.name)
+                .unwrap_or_else(|| owner.clone());
+            return Err(Error::Conflict(format!(
+                "\"{name}\" is an alias of model \"{target}\"; rename it there or drop the alias"
+            )));
+        }
         // One statement, so there is no read-then-write race. The no-op
         // `DO UPDATE` is what makes RETURNING fire on the conflict path —
         // `DO NOTHING` returns zero rows.
@@ -1018,11 +1058,113 @@ impl Store for PostgresStore {
             .ok_or_else(|| Error::NotFound("model".into()))
     }
 
+    // ---- providers (an endpoint, its credentials, its deployments) -----
+    async fn list_providers(&self) -> Result<Vec<ProviderRecord>> {
+        let rows = sqlx::query(&format!("SELECT {PROVIDER_COLS} FROM providers ORDER BY name"))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        rows.iter().map(map_provider).collect()
+    }
+
+    async fn get_provider(&self, id: &str) -> Result<Option<ProviderRecord>> {
+        let row = sqlx::query(&format!("SELECT {PROVIDER_COLS} FROM providers WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        row.as_ref().map(map_provider).transpose()
+    }
+
+    async fn get_provider_by_name(&self, name: &str) -> Result<Option<ProviderRecord>> {
+        let row = sqlx::query(&format!("SELECT {PROVIDER_COLS} FROM providers WHERE name = $1"))
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        row.as_ref().map(map_provider).transpose()
+    }
+
+    async fn ensure_provider(&self, name: &str) -> Result<ProviderRecord> {
+        let row = sqlx::query(&format!(
+            "INSERT INTO providers (id, name, api_base, api_key, extra, created_at, updated_at) \
+             VALUES ($1,$2,NULL,NULL,'{{}}',$3,$4) \
+             ON CONFLICT(name) DO UPDATE SET updated_at = providers.updated_at \
+             RETURNING {PROVIDER_COLS}"
+        ))
+        .bind(new_id())
+        .bind(name)
+        .bind(now())
+        .bind(now())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        map_provider(&row)
+    }
+
+    async fn update_provider(
+        &self,
+        id: &str,
+        name: &str,
+        api_base: Option<&str>,
+        api_key: Option<&str>,
+        extra: &yb_core::Extra,
+    ) -> Result<ProviderRecord> {
+        let taken = sqlx::query("SELECT 1 FROM providers WHERE name = $1 AND id <> $2")
+            .bind(name)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        if taken.is_some() {
+            return Err(Error::Conflict(format!("provider \"{name}\" already exists")));
+        }
+        // `api_key = NULL` means "leave it alone": the admin API never reads a
+        // key back out, so an edit round-trip must not blank one by omission.
+        sqlx::query(
+            "UPDATE providers SET name = $1, api_base = $2, \
+             api_key = COALESCE($3, api_key), extra = $4, updated_at = $5 WHERE id = $6",
+        )
+        .bind(name)
+        .bind(api_base)
+        .bind(api_key)
+        .bind(enc_extra(extra))
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        self.get_provider(id)
+            .await?
+            .ok_or_else(|| Error::NotFound("provider".into()))
+    }
+
+    async fn delete_provider(&self, id: &str) -> Result<()> {
+        let in_use = sqlx::query(
+            "SELECT 1 FROM deployments WHERE provider_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        if in_use.is_some() {
+            return Err(Error::Conflict(
+                "provider still has deployments; delete them first".into(),
+            ));
+        }
+        sqlx::query("DELETE FROM providers WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        Ok(())
+    }
+
     // ---- deployments (one model's upstream fan-out) --------------------
     async fn list_deployments(&self) -> Result<Vec<DeploymentRecord>> {
         let rows = sqlx::query(&format!(
             "SELECT {DEPLOYMENT_COLS} {DEPLOYMENT_FROM} WHERE d.deleted_at IS NULL \
-             ORDER BY m.name, d.provider, d.upstream_model"
+             ORDER BY m.name, p.name, d.upstream_model"
         ))
         .fetch_all(&self.pool)
         .await
@@ -1043,25 +1185,23 @@ impl Store for PostgresStore {
 
     async fn create_deployment(&self, dep: &NewDeployment) -> Result<DeploymentRecord> {
         let model = self.ensure_model(&dep.model_name).await?;
+        let provider = self.ensure_provider(&dep.provider_name).await?;
         let id = new_id();
         sqlx::query(
-            "INSERT INTO deployments (id, model_id, provider, upstream_model, \
-             api_base, api_key, upstream_format, weight, pricing, health_check, health_path, \
-             extra, created_at, updated_at, deleted_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULL)",
+            "INSERT INTO deployments (id, model_id, provider_id, upstream_model, \
+             upstream_format, weight, pricing, health_check, health_path, \
+             created_at, updated_at, deleted_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL)",
         )
         .bind(&id)
         .bind(&model.id)
-        .bind(&dep.provider)
+        .bind(&provider.id)
         .bind(&dep.upstream_model)
-        .bind(&dep.api_base)
-        .bind(&dep.api_key)
         .bind(enc_enum(&dep.upstream_format))
         .bind(dep.weight as i32)
         .bind(enc_pricing(&dep.pricing))
         .bind(dep.health_check.as_str())
         .bind(&dep.health_path)
-        .bind(enc_extra(&dep.extra))
         .bind(now())
         .bind(now())
         .execute(&self.pool)
@@ -1084,19 +1224,16 @@ impl Store for PostgresStore {
 
     async fn seed_deployment(&self, dep: &NewDeployment) -> Result<bool> {
         let model = self.ensure_model(&dep.model_name).await?;
-        // Mirrors `deployments_identity_uq`. COALESCE is required, not
-        // cosmetic: NULL != NULL, so comparing api_base directly would miss
-        // every deployment that omits it — most of them — and each import
-        // would insert a second copy.
+        let provider = self.ensure_provider(&dep.provider_name).await?;
+        // Mirrors `deployments_identity_uq`. Every column is NOT NULL now that
+        // api_base has moved to the provider, so this needs no COALESCE.
         let exists = sqlx::query(
-            "SELECT 1 FROM deployments WHERE model_id = $1 AND provider = $2 \
-             AND upstream_model = $3 AND COALESCE(api_base,'') = COALESCE($4,'') \
-             AND deleted_at IS NULL",
+            "SELECT 1 FROM deployments WHERE model_id = $1 AND provider_id = $2 \
+             AND upstream_model = $3 AND deleted_at IS NULL",
         )
         .bind(&model.id)
-        .bind(&dep.provider)
+        .bind(&provider.id)
         .bind(&dep.upstream_model)
-        .bind(&dep.api_base)
         .fetch_optional(&self.pool)
         .await
         .map_err(storage_err)?;

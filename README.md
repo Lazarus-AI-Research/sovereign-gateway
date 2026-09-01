@@ -88,14 +88,22 @@ TOKEN=$(curl -s -b cookies.txt -X POST localhost:8080/admin/v1/keys \
   -d '{"name":"prod"}' | jq -r .token)
 
 # Manage models at runtime (router hot-reloads, no restart).
-# A model is the public name clients request; a deployment is one concrete
-# upstream behind it. One model can have several deployments — that is the
-# load-balancing fan-out.
-curl -s -b cookies.txt localhost:8080/admin/v1/models        # the entities
-curl -s -b cookies.txt localhost:8080/admin/v1/deployments   # their upstreams
+# Three nouns: a provider is an endpoint with credentials; a model is a public
+# name clients request; a deployment binds one model to one provider with a wire
+# format. One model can have several deployments — the load-balancing fan-out —
+# and one provider can serve many models.
+curl -s -b cookies.txt localhost:8080/admin/v1/providers     # endpoints + credentials
+curl -s -b cookies.txt localhost:8080/admin/v1/models        # public names
+curl -s -b cookies.txt localhost:8080/admin/v1/deployments   # name x endpoint
+
+# A provider is an endpoint with credentials, serving many models. Declare it
+# once; deployments pick it by name.
+curl -s -b cookies.txt -X POST localhost:8080/admin/v1/providers \
+  -H 'content-type: application/json' \
+  -d '{"name":"openai","api_key":"sk-..."}'
 curl -s -b cookies.txt -X POST localhost:8080/admin/v1/deployments \
   -H 'content-type: application/json' \
-  -d '{"model_name":"gpt-4o","provider":"openai","upstream_model":"gpt-4o","upstream_format":"openai_chat","api_key":"sk-..."}'
+  -d '{"model_name":"gpt-4o","provider":"openai","upstream_model":"gpt-4o","upstream_format":"openai_chat"}'
 
 # Rename a model. The old name is kept as an alias automatically, so clients
 # that still send it keep working.

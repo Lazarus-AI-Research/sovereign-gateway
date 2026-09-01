@@ -238,6 +238,31 @@ impl Store for RecordingStore {
     async fn seed_deployment(&self, _dep: &yb_core::NewDeployment) -> Result<bool> {
         Ok(true)
     }
+    async fn list_providers(&self) -> Result<Vec<yb_core::ProviderRecord>> {
+        Ok(vec![])
+    }
+    async fn get_provider(&self, _id: &str) -> Result<Option<yb_core::ProviderRecord>> {
+        Ok(None)
+    }
+    async fn get_provider_by_name(&self, _name: &str) -> Result<Option<yb_core::ProviderRecord>> {
+        Ok(None)
+    }
+    async fn ensure_provider(&self, _name: &str) -> Result<yb_core::ProviderRecord> {
+        unimplemented!("RecordingStore only serves the request path")
+    }
+    async fn update_provider(
+        &self,
+        _id: &str,
+        _name: &str,
+        _api_base: Option<&str>,
+        _api_key: Option<&str>,
+        _extra: &yb_core::Extra,
+    ) -> Result<yb_core::ProviderRecord> {
+        unimplemented!("RecordingStore only serves the request path")
+    }
+    async fn delete_provider(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
     async fn list_models(&self) -> Result<Vec<yb_core::ModelRecord>> {
         Ok(vec![])
     }
