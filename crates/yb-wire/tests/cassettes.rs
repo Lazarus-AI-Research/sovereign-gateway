@@ -107,7 +107,12 @@ fn encode_stream(format: &str, events: &[StreamEvent], include_usage: bool) -> V
             out
         }
         "openai_responses" => {
-            openai_responses::encode_sse(events, &mut openai_responses::EmitState::default())
+            let mut st = openai_responses::EmitState::default();
+            let mut out = openai_responses::encode_sse(events, &mut st);
+            // Same deferral as the chat surface: response.completed waits on
+            // usage, and the real driver flushes at end of stream.
+            out.extend(st.finish());
+            out
         }
         "gemini" => gemini::encode_sse(events, &mut gemini::EmitState::default()),
         other => panic!("unknown client format {other}"),
@@ -537,7 +542,11 @@ fn prompt_cache_fields_echo_on_response_object() {
         StreamEvent::TextDelta { text: "hi".into() },
         StreamEvent::Done { stop_reason: yb_wire::StopReason::EndTurn },
     ];
-    let sse = String::from_utf8(openai_responses::encode_sse(&events, &mut st)).unwrap();
+    // No UsageDelta here, so `response.completed` is deferred; the real driver
+    // flushes at end of stream, and so must this.
+    let mut bytes = openai_responses::encode_sse(&events, &mut st);
+    bytes.extend(st.finish());
+    let sse = String::from_utf8(bytes).unwrap();
     let completed = sse.lines()
         .filter(|l| l.starts_with("data:"))
         .map(|l| serde_json::from_str::<Value>(l[5..].trim()).unwrap())

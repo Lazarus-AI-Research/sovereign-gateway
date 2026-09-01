@@ -204,13 +204,16 @@ impl Encoder {
 
     /// Bytes still owed when the upstream stream ends.
     ///
-    /// The OpenAI Chat surface holds `[DONE]` back while it waits for the
-    /// trailing usage chunk; if the upstream hangs up without sending one, this
-    /// closes the client's stream rather than leaving it unterminated. A no-op
-    /// on every other surface.
+    /// Both OpenAI surfaces hold their terminal event back while waiting for
+    /// the trailing usage chunk — Chat defers `[DONE]`, Responses defers
+    /// `response.completed`. If the upstream hangs up without sending usage,
+    /// this closes the client's stream rather than leaving it unterminated.
+    /// A no-op on the Anthropic and Gemini surfaces, which carry usage on the
+    /// terminal event itself.
     pub fn finish(&mut self) -> Vec<u8> {
         match self {
             Encoder::OpenaiChat(s) => s.finish(),
+            Encoder::OpenaiResponses(s) => s.finish(),
             _ => Vec::new(),
         }
     }

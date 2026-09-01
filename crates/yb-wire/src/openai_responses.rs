@@ -570,6 +570,15 @@ pub struct EmitState {
     open: Option<OpenItem>,
     /// Completed items, assembled into `response.completed`.
     done_items: Vec<Value>,
+    /// `response.completed` held back until usage arrives.
+    ///
+    /// Unlike Chat Completions, the Responses API always reports usage on the
+    /// terminal event — there is no `include_usage` to opt into. But an
+    /// OpenAI-compatible *upstream* sends usage on a line after the one
+    /// carrying `finish_reason`, so `Done` reaches this encoder first. Emitting
+    /// `response.completed` there would publish `usage: null` and lose the
+    /// counts, which is what a metering client reads.
+    pending_completed: bool,
 }
 
 impl EmitState {
@@ -655,19 +664,49 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
             }
             StreamEvent::UsageDelta { usage } => {
                 state.usage.get_or_insert_default().merge(usage);
+                // The usage `response.completed` was waiting on.
+                if state.pending_completed {
+                    state.pending_completed = false;
+                    write_completed(&mut out, state);
+                }
             }
             StreamEvent::Done { .. } => {
+                // Close any open item now; only the terminal event waits.
                 close_open(&mut out, state);
-                let resp = state.response_obj("completed", json!(state.done_items.clone()));
-                write_event(&mut out, state, "response.completed",
-                    json!({"type": "response.completed", "response": resp}));
+                if state.usage.is_some() {
+                    write_completed(&mut out, state);
+                } else {
+                    state.pending_completed = true;
+                }
             }
         }
     }
     out.into_bytes()
 }
 
+/// Write the terminal `response.completed` event.
+fn write_completed(out: &mut String, state: &mut EmitState) {
+    let resp = state.response_obj("completed", json!(state.done_items.clone()));
+    write_event(out, state, "response.completed",
+        json!({"type": "response.completed", "response": resp}));
+}
+
 impl EmitState {
+    /// Close a stream that ended while still waiting for usage.
+    ///
+    /// Emits the deferred `response.completed` — with a null `usage`, which is
+    /// the honest report when the upstream never sent any — so the client is
+    /// never left without a terminal event.
+    pub fn finish(&mut self) -> Vec<u8> {
+        if !self.pending_completed {
+            return Vec::new();
+        }
+        self.pending_completed = false;
+        let mut out = String::new();
+        write_completed(&mut out, self);
+        out.into_bytes()
+    }
+
     fn response_obj(&self, status: &str, output: Value) -> Value {
         let usage = self.usage.map(|u| json!({
             "input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
@@ -775,4 +814,77 @@ fn write_event(out: &mut String, state: &mut EmitState, name: &str, mut data: Va
     out.push_str("data: ");
     out.push_str(&data.to_string());
     out.push_str("\n\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::StopReason;
+
+    fn encode_all(events: &[StreamEvent]) -> String {
+        let mut st = EmitState::default();
+        let mut out = encode_sse(events, &mut st);
+        out.extend(st.finish());
+        String::from_utf8(out).unwrap()
+    }
+
+    fn completed(sse: &str) -> Value {
+        sse.lines()
+            .filter(|l| l.starts_with("data:"))
+            .map(|l| serde_json::from_str::<Value>(l[5..].trim()).unwrap())
+            .find(|v| v["type"] == "response.completed")
+            .expect("a response.completed event")
+    }
+
+    /// The Responses API always reports usage on its terminal event — there is
+    /// no `include_usage` to opt into — but an OpenAI-compatible upstream sends
+    /// usage on the line *after* the finish reason. `Done` therefore reaches
+    /// the encoder first, and emitting `response.completed` there published
+    /// `usage: null` and lost the counts a metering client reads.
+    #[test]
+    fn usage_arriving_after_done_still_lands_on_response_completed() {
+        let sse = encode_all(&[
+            StreamEvent::MessageStart { model: "k3".into() },
+            StreamEvent::TextDelta { text: "ok".into() },
+            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+            StreamEvent::UsageDelta {
+                usage: Usage { input_tokens: 88, output_tokens: 35, ..Default::default() },
+            },
+        ]);
+        let c = completed(&sse);
+        assert_eq!(c["response"]["status"], "completed");
+        assert_eq!(c["response"]["usage"]["input_tokens"], 88);
+        assert_eq!(c["response"]["usage"]["output_tokens"], 35);
+        assert_eq!(c["response"]["usage"]["total_tokens"], 123);
+    }
+
+    /// Usage that shares the terminal event (a Responses upstream) is emitted
+    /// immediately, and the completed event is written exactly once.
+    #[test]
+    fn usage_before_done_emits_completed_once() {
+        let sse = encode_all(&[
+            StreamEvent::MessageStart { model: "k3".into() },
+            StreamEvent::UsageDelta {
+                usage: Usage { input_tokens: 1, output_tokens: 2, ..Default::default() },
+            },
+            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+        ]);
+        assert_eq!(sse.matches("response.completed").count(), 2, "one event, named twice: {sse}");
+        assert_eq!(completed(&sse)["response"]["usage"]["total_tokens"], 3);
+    }
+
+    /// An upstream that hangs up without ever sending usage must still leave
+    /// the client with a terminal event — holding it back forever would strand
+    /// the stream. A null `usage` is the honest report.
+    #[test]
+    fn a_stream_that_never_reports_usage_still_completes() {
+        let sse = encode_all(&[
+            StreamEvent::MessageStart { model: "k3".into() },
+            StreamEvent::TextDelta { text: "ok".into() },
+            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+        ]);
+        let c = completed(&sse);
+        assert_eq!(c["response"]["status"], "completed");
+        assert_eq!(c["response"]["usage"], Value::Null);
+    }
 }
