@@ -143,7 +143,8 @@ pub struct RequestCtx {
     /// Model **ids** excluded by policy, so a rename cannot un-exclude one.
     pub excluded_model_ids: BTreeSet<String>,
     /// Provider attribution names excluded for this caller (denylist).
-    pub excluded_providers: BTreeSet<String>,
+    /// Provider **ids** excluded by policy.
+    pub excluded_provider_ids: BTreeSet<String>,
     /// The effective model/provider access grant for this caller — the key's
     /// policy merged with its team's. Deny wins, allow-lists are ceilings.
     pub access: AccessPolicy,
@@ -251,6 +252,75 @@ impl Gateway {
     pub fn with_cloudflare_access(mut self, cfg: Option<CloudflareAccessConfig>) -> Self {
         self.cf_access = cfg.filter(|c| c.is_complete()).map(Arc::new);
         self
+    }
+
+    /// Ask a provider's endpoint which models it serves, for a given adapter.
+    ///
+    /// The provider deliberately has no wire format — one endpoint can serve
+    /// several — so the caller supplies the adapter shape, which decides both
+    /// the listing URL and how the response is parsed.
+    ///
+    /// Auth is built exactly as a request would build it: the format's own
+    /// scheme for the origin, then the provider's edge headers (Cloudflare
+    /// Access, literal headers), so a backend behind Zero Trust answers rather
+    /// than 403ing.
+    pub async fn discover_models(
+        &self,
+        api_base: Option<&str>,
+        api_key: Option<&str>,
+        extra: &Extra,
+        fmt: yb_core::UpstreamFormat,
+        label: &str,
+    ) -> yb_core::Result<Vec<String>> {
+        let url = crate::health::models_list_url_for(fmt, api_base)
+            .map_err(yb_core::Error::BadRequest)?;
+        let key = api_key.unwrap_or_default();
+        let mut headers = match fmt {
+            yb_core::UpstreamFormat::Chat(f) => auth_headers(f, key),
+            yb_core::UpstreamFormat::Embed(f) => yb_providers::embed_auth_headers(f, key),
+        };
+        append_headers(&mut headers, self.extra_headers(extra, label));
+
+        let resp = self
+            .client
+            .send(UpstreamRequest {
+                url,
+                method: yb_providers::HttpMethod::Get,
+                headers,
+                body: Vec::new(),
+                stream: false,
+            })
+            .await
+            .map_err(|e| yb_core::Error::Upstream {
+                provider: label.to_string(),
+                status: 502,
+                message: format!("model discovery failed: {e}"),
+            })?;
+
+        let body = match resp.body {
+            yb_providers::ResponseBody::Full(b) => b,
+            _ => {
+                return Err(yb_core::Error::Upstream {
+                    provider: label.to_string(),
+                    status: 502,
+                    message: "model discovery got a streaming response".into(),
+                })
+            }
+        };
+        if !(200..300).contains(&resp.status) {
+            let msg = String::from_utf8_lossy(&body);
+            let msg = msg.chars().take(200).collect::<String>();
+            return Err(yb_core::Error::Upstream {
+                provider: label.to_string(),
+                status: resp.status,
+                message: msg.trim().to_string(),
+            });
+        }
+        crate::health::parse_models_list(fmt, &body).map_err(|message| yb_core::Error::Upstream {
+            provider: label.to_string(),
+            status: 502,
+            message,
+        })
     }
 
     /// The extra headers a deployment opted into, resolved against the process
@@ -436,7 +506,8 @@ impl Gateway {
                 }
                 (true, ResponseBody::Stream(up)) => {
                     let stream =
-                        translate_stream(up, upstream_fmt, surface, rctx, status, cache_echo);
+                        translate_stream(up, upstream_fmt, surface, rctx, status, cache_echo,
+                                         chat.include_usage);
                     Ok(GatewayResponse::Stream {
                         status,
                         headers: sse_headers(),
@@ -497,13 +568,13 @@ impl Gateway {
         let mut excluded_model_ids: BTreeSet<String> = ctx.excluded_model_ids.clone();
         excluded_model_ids.extend(ctx.access.denied_model_ids.iter().cloned());
 
-        let mut denied_providers: BTreeSet<String> = ctx.excluded_providers.clone();
-        denied_providers.extend(ctx.access.denied_providers.iter().cloned());
+        let mut denied_provider_ids: BTreeSet<String> = ctx.excluded_provider_ids.clone();
+        denied_provider_ids.extend(ctx.access.denied_provider_ids.iter().cloned());
 
-        let enabled_providers = if ctx.access.allowed_providers.is_empty() {
+        let enabled_provider_ids = if ctx.access.allowed_provider_ids.is_empty() {
             None
         } else {
-            Some(ctx.access.allowed_providers.iter().cloned().collect())
+            Some(ctx.access.allowed_provider_ids.iter().cloned().collect())
         };
 
         RouteRequest {
@@ -516,8 +587,8 @@ impl Gateway {
                 .flat_map(|m| &m.content)
                 .any(|c| matches!(c, ContentBlock::Image { .. })),
             excluded_model_ids,
-            enabled_providers,
-            denied_providers,
+            enabled_provider_ids,
+            denied_provider_ids,
             preferred_models: Vec::new(),
         }
     }
@@ -530,12 +601,12 @@ impl Gateway {
             .into_iter()
             .filter(|d| {
                 if !ctx.access.permits_model(&d.model_id)
-                    || !ctx.access.permits_provider(&d.provider)
+                    || !ctx.access.permits_provider(&d.provider_id)
                 {
                     return false;
                 }
                 !ctx.excluded_model_ids.contains(&d.model_id)
-                    && !ctx.excluded_providers.contains(&d.provider)
+                    && !ctx.excluded_provider_ids.contains(&d.provider_id)
             })
             .collect()
     }
@@ -970,9 +1041,13 @@ fn translate_stream(
     rctx: RecordCtx,
     status: u16,
     cache_echo: (Option<String>, Option<String>),
+    include_usage: bool,
 ) -> ByteStream {
     let mut encoder = wire::Encoder::new(surface);
     encoder.set_prompt_cache(cache_echo.0, cache_echo.1);
+    // What the client asked for on the way in decides whether usage is relayed
+    // on the way out. The gateway collects it either way, for billing.
+    encoder.set_include_usage(include_usage);
     let init = StreamState {
         upstream,
         buf: Vec::new(),
@@ -1062,13 +1137,18 @@ fn translate_stream(
                         events.extend(evs);
                     }
                     st.done = true;
-                    let bytes = if events.is_empty() {
-                        Bytes::new()
+                    let mut b = if events.is_empty() {
+                        Vec::new()
                     } else {
-                        let b = st.encoder.encode(&events);
-                        st.response_bytes += b.len() as i64;
-                        Bytes::from(b)
+                        st.encoder.encode(&events)
                     };
+                    // Anything the encoder was still holding — the OpenAI Chat
+                    // surface defers [DONE] while waiting on a trailing usage
+                    // chunk, so an upstream that hangs up first must not leave
+                    // the client's stream unterminated.
+                    b.extend(st.encoder.finish());
+                    st.response_bytes += b.len() as i64;
+                    let bytes = Bytes::from(b);
                     let ir = st.ir_json();
                     st.rctx
                         .finish(st.usage, st.status, false, ir, st.response_bytes)

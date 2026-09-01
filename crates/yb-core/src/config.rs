@@ -383,10 +383,31 @@ pub struct ModelConfig {
 /// A standalone models file, parsed by `gateway import <file>` to upsert the
 /// live model list into the database. Deliberately separate from the serve
 /// config ([`Config`]): models live in the DB, configured in exactly one place,
+/// One upstream endpoint: its base URL, its credential, and its edge settings.
+///
+/// Credentials live here rather than on each deployment because they describe
+/// the endpoint — two models behind one OpenAI account are one key, not two.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderConfig {
+    pub name: String,
+    /// `None` means the wire format's default base.
+    pub api_base: Option<String>,
+    pub api_key: Option<String>,
+    /// `extra = { cloudflare_access = true, headers = { … } }` — edge concerns
+    /// of this endpoint. The Cloudflare token itself is file-owned, in
+    /// `[upstream.cloudflare_access]`; this flag only selects it.
+    pub extra: crate::routing::Extra,
+}
+
 /// and the import file is just a convenient bulk loader.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelsFile {
+    /// Upstream endpoints and their credentials. A deployment names one of
+    /// these; a name that is not declared here is created credential-less.
+    #[serde(rename = "provider", default)]
+    pub providers: Vec<ProviderConfig>,
     #[serde(rename = "model")]
     pub models: Vec<ModelConfig>,
     /// Public model aliases (`alias` → `target` model name), seeded into the DB.

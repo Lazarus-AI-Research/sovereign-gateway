@@ -598,16 +598,13 @@ async fn invite_provisions_local_user_with_role_and_password_create_is_blocked()
 async fn seed_dep(store: &dyn Store, model_name: &str, provider: &str) {
     let dep = yb_core::NewDeployment {
         model_name: model_name.into(),
-        provider: provider.into(),
+        provider_name: provider.into(),
         upstream_model: model_name.into(),
-        api_base: None,
-        api_key: None,
         upstream_format: WireFormat::OpenaiChat.into(),
         weight: 1,
         pricing: None,
         health_check: Default::default(),
         health_path: None,
-        extra: Default::default(),
     };
     store.create_deployment(&dep).await.unwrap();
 }
@@ -616,6 +613,11 @@ async fn seed_dep(store: &dyn Store, model_name: &str, provider: &str) {
 /// policy) while reading like they speak names.
 async fn model_id(store: &dyn Store, name: &str) -> String {
     store.get_model_by_name(name).await.unwrap().expect("model exists").id
+}
+
+/// The provider id behind a provider name, for the same reason.
+async fn provider_id(store: &dyn Store, name: &str) -> String {
+    store.get_provider_by_name(name).await.unwrap().expect("provider exists").id
 }
 
 /// Log `user_id` in by minting a session row directly, returning the cookie
@@ -711,10 +713,12 @@ async fn complete_suggests_models_and_providers_that_exist() {
     assert_eq!(v[0]["label"], "claude-sonnet");
     assert_eq!(v[0]["value"], sonnet_id);
 
-    // Providers are distinct, with a deployment count as the hint.
+    // Providers are distinct, with a deployment count as the hint. As with
+    // models, the value is the id a policy stores and the label is the name.
     let (_, v) = get_json(&app, "/admin/v1/complete?kind=provider", &cookie).await;
-    let provs: Vec<&str> = v.as_array().unwrap().iter().map(|s| s["value"].as_str().unwrap()).collect();
+    let provs: Vec<&str> = v.as_array().unwrap().iter().map(|s| s["label"].as_str().unwrap()).collect();
     assert_eq!(provs, vec!["anthropic", "azure", "openai"]);
+    assert_eq!(v[0]["value"], provider_id(store.as_ref(), "anthropic").await);
     assert_eq!(v[0]["hint"], "1 deployment");
 
     // Completing the user list is member-forbidden: it discloses the accounts.
@@ -768,6 +772,31 @@ async fn put_json(
         .oneshot(
             Request::builder()
                 .method("PUT")
+                .uri(uri)
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// `POST uri` with `body`, authenticated by a session cookie.
+async fn post_json_as(
+    app: &axum::Router,
+    uri: &str,
+    cookie: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
                 .uri(uri)
                 .header("cookie", cookie)
                 .header("content-type", "application/json")
@@ -900,6 +929,169 @@ async fn a_deny_survives_a_rename() {
     );
 }
 
+/// Bulk create is the counterpart to discovery: selecting twenty models should
+/// be one request and one router reload, not twenty of each.
+#[tokio::test]
+async fn bulk_deployments_create_and_are_idempotent() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state.clone());
+
+    let body = json!({
+        "provider": "local-vllm",
+        "upstream_format": "openai_chat",
+        "models": [
+            { "upstream_model": "gpt-4o",      "model_name": "gpt-4o" },
+            // An upstream id may answer to a different public name.
+            { "upstream_model": "gpt-4o-mini", "model_name": "fast" },
+        ]
+    });
+    let (status, v) = post_json_as(&app, "/admin/v1/deployments/bulk", &cookie, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{v:?}");
+    assert_eq!(v["created"], 2);
+    assert_eq!(v["skipped"], 0);
+
+    // The provider was created on demand, and both models exist.
+    assert!(store.get_provider_by_name("local-vllm").await.unwrap().is_some());
+    assert!(store.get_model_by_name("fast").await.unwrap().is_some());
+    let deps = store.list_deployments().await.unwrap();
+    assert_eq!(deps.len(), 2);
+    let fast = deps.iter().find(|d| d.model_name == "fast").unwrap();
+    assert_eq!(fast.upstream_model, "gpt-4o-mini");
+
+    // Re-running is a no-op rather than a duplicate — the same identity index
+    // that makes `gateway import` idempotent.
+    let (status, v) = post_json_as(&app, "/admin/v1/deployments/bulk", &cookie, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["created"], 0);
+    assert_eq!(v["skipped"], 2);
+    assert_eq!(store.list_deployments().await.unwrap().len(), 2);
+
+    // And the router picked them up without a restart.
+    let (_, v) = get_json(&app, "/admin/v1/models", &cookie).await;
+    let names: Vec<&str> = v.as_array().unwrap().iter()
+        .map(|m| m["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["fast", "gpt-4o"]);
+}
+
+/// Discovery is an admin action against a real endpoint, so the failure modes
+/// that do not need an upstream are worth pinning.
+#[tokio::test]
+async fn discovery_rejects_unknown_providers_and_non_admins() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "gpt-4o", "openai").await;
+    let id = provider_id(store.as_ref(), "openai").await;
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state);
+
+    let (status, _) = post_json_as(&app, "/admin/v1/providers/nope/discover", &cookie,
+                                   json!({ "upstream_format": "openai_chat" })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Voyage publishes no model list; discovery must say so rather than
+    // inventing a URL that 404s.
+    let (status, v) = post_json_as(&app, &format!("/admin/v1/providers/{id}/discover"), &cookie,
+                                   json!({ "upstream_format": "voyage_embed" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(v["error"]["message"].as_str().unwrap().contains("no model-listing endpoint"));
+
+    let member = store.list_users().await.unwrap().into_iter()
+        .find(|u| u.role == Role::Member).expect("seeded member");
+    let member_cookie = session_cookie(store.as_ref(), &member.id).await;
+    let (status, _) = post_json_as(&app, &format!("/admin/v1/providers/{id}/discover"),
+                                   &member_cookie, json!({ "upstream_format": "openai_chat" })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// The provider half of the same guarantee.
+///
+/// A provider used to be a bare string on the deployment row, so a policy that
+/// denied `anthropic` stopped matching the moment the provider was renamed —
+/// the identical silent-grant as models had. Providers are entities now, and
+/// the deny is by id.
+#[tokio::test]
+async fn a_provider_deny_survives_a_provider_rename() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "gpt-4o", "openai").await;
+    seed_dep(store.as_ref(), "claude-sonnet", "anthropic").await;
+    state.reload_models().await.unwrap();
+
+    let denied = provider_id(store.as_ref(), "anthropic").await;
+    let token = key_with(
+        store.as_ref(),
+        AccessPolicy { denied_provider_ids: vec![denied.clone()], ..Default::default() },
+        None,
+    )
+    .await;
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state.clone());
+
+    let listed = |v: &Value| -> Vec<String> {
+        v["data"].as_array().unwrap().iter()
+            .map(|m| m["id"].as_str().unwrap().to_string()).collect()
+    };
+    let (_, v) = get_as(&app, "/v1/models", &token).await;
+    assert_eq!(listed(&v), vec!["gpt-4o".to_string()], "denied before the rename");
+
+    let (status, _) = put_json(
+        &app,
+        &format!("/admin/v1/providers/{denied}"),
+        &cookie,
+        json!({ "name": "anthropic-prod" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, v) = get_as(&app, "/v1/models", &token).await;
+    assert_eq!(
+        listed(&v),
+        vec!["gpt-4o".to_string()],
+        "a renamed provider must stay denied"
+    );
+}
+
+/// One endpoint, one credential — configured once and read by every deployment
+/// served through it.
+#[tokio::test]
+async fn deployments_read_their_providers_endpoint() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "gpt-4o", "openai").await;
+    seed_dep(store.as_ref(), "text-embedding-3-small", "openai").await;
+    let id = provider_id(store.as_ref(), "openai").await;
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state);
+
+    let (status, body) = put_json(
+        &app,
+        &format!("/admin/v1/providers/{id}"),
+        &cookie,
+        json!({ "name": "openai", "api_base": "https://api.example/v1", "api_key": "sk-shared" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    // The credential is never disclosed, only whether one is set.
+    assert_eq!(body["has_api_key"], true);
+    assert!(body.get("api_key").is_none(), "a key must never be read back out");
+
+    let deps = store.list_deployments().await.unwrap();
+    assert_eq!(deps.len(), 2);
+    for d in &deps {
+        assert_eq!(d.api_base.as_deref(), Some("https://api.example/v1"));
+        assert_eq!(d.api_key.as_deref(), Some("sk-shared"));
+    }
+
+    // A second edit that omits the key keeps it, rather than blanking it.
+    let (status, _) = put_json(&app, &format!("/admin/v1/providers/{id}"), &cookie,
+                               json!({ "name": "openai", "api_base": "https://api.example/v1" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let deps = store.list_deployments().await.unwrap();
+    assert_eq!(deps[0].api_key.as_deref(), Some("sk-shared"));
+}
+
 #[tokio::test]
 async fn rename_rejects_bad_input_and_non_admins() {
     let (state, _token) = setup().await;
@@ -1029,7 +1221,7 @@ async fn a_model_whose_only_provider_is_denied_is_not_listed() {
     let token = key_with(
         store.as_ref(),
         AccessPolicy {
-            denied_providers: vec!["anthropic".into()],
+            denied_provider_ids: vec![provider_id(store.as_ref(), "anthropic").await],
             ..Default::default()
         },
         None,

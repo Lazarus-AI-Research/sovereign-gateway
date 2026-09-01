@@ -4,8 +4,8 @@
 //! hot-swappable [`Snapshot`] behind an `RwLock<Arc<…>>`. [`Router::resolve`]:
 //!
 //! 1. expands the requested public model into its deployments,
-//! 2. filters by `excluded_models`, the optional `enabled_providers` allowlist,
-//!    and the `denied_providers` denylist on the [`RouteRequest`],
+//! 2. filters by `excluded_model_ids`, the optional `enabled_provider_ids`
+//!    allowlist, and the `denied_provider_ids` denylist on the [`RouteRequest`],
 //! 3. orders the survivors by the configured [`Strategy`]
 //!    (weighted shuffle / round-robin / approximate least-busy), and
 //! 4. appends each fallback model's deployments (same filtering), de-duplicated.
@@ -93,6 +93,18 @@ pub struct DeploymentRouter {
     rng: AtomicU64,
 }
 
+/// Synthetic ids for the config-authored path.
+///
+/// [`DeploymentRouter::from_models`] is fed by `gateway.toml` and by tests,
+/// which name models and providers but carry no ids. Deriving the id from the
+/// name keeps it stable and legible; the database path uses real uuids.
+fn cfg_model_id(name: &str) -> String {
+    format!("cfg-model:{name}")
+}
+fn cfg_provider_id(name: &str) -> String {
+    format!("cfg-provider:{name}")
+}
+
 impl DeploymentRouter {
     /// Build a router from a model list plus routing policy (the file/seed
     /// shape). Used in tests and for a file-only deployment; production seeds the
@@ -106,18 +118,14 @@ impl DeploymentRouter {
         // This path is fed by config/tests, which name models but carry no ids.
         // Synthesize one stable id per distinct name so that id-keyed filtering
         // and dedupe behave exactly as they do against the database.
-        let mut ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        for mc in &models {
-            let next = format!("cfg-{}", ids.len());
-            ids.entry(mc.model_name.clone()).or_insert(next);
-        }
         let deployments = models
             .into_iter()
             .flat_map(|mc| {
-                let model_id = ids.get(&mc.model_name).cloned().unwrap_or_default();
+                let model_id = cfg_model_id(&mc.model_name);
                 mc.deployments.into_iter().map(move |dc| Deployment {
                     model_id: model_id.clone(),
                     model_name: mc.model_name.clone(),
+                    provider_id: cfg_provider_id(&dc.provider),
                     provider: dc.provider,
                     upstream_model: dc.upstream_model,
                     api_base: dc.api_base,
@@ -245,12 +253,12 @@ impl DeploymentRouter {
             if req.excluded_model_ids.contains(&d.model_id) {
                 continue;
             }
-            if let Some(enabled) = &req.enabled_providers {
-                if !enabled.contains(&d.provider) {
+            if let Some(enabled) = &req.enabled_provider_ids {
+                if !enabled.contains(&d.provider_id) {
                     continue;
                 }
             }
-            if req.denied_providers.contains(&d.provider) {
+            if req.denied_provider_ids.contains(&d.provider_id) {
                 continue;
             }
             survivors.push(i);
@@ -260,7 +268,7 @@ impl DeploymentRouter {
         }
 
         for d in self.order(snap.strategy, entry, survivors) {
-            let key = (d.provider.clone(), d.upstream_model.clone(), d.model_id.clone());
+            let key = (d.provider_id.clone(), d.upstream_model.clone(), d.model_id.clone());
             if seen.insert(key) {
                 out.push(d);
             }
@@ -397,7 +405,7 @@ mod tests {
     fn denied_provider_filtered() {
         let r = mk_router(Strategy::Simple);
         let mut rq = req("smart");
-        rq.denied_providers = BTreeSet::from(["openai".to_string(), "openrouter".to_string()]);
+        rq.denied_provider_ids = BTreeSet::from([cfg_provider_id("openai"), cfg_provider_id("openrouter")]);
         let d = r.resolve(&rq).unwrap();
         assert_eq!(d.candidates.len(), 1);
         assert_eq!(d.candidates[0].provider, "anthropic");
@@ -407,7 +415,7 @@ mod tests {
     fn enabled_providers_allowlist() {
         let r = mk_router(Strategy::Simple);
         let mut rq = req("smart");
-        rq.enabled_providers = Some(BTreeSet::from(["anthropic".to_string()]));
+        rq.enabled_provider_ids = Some(BTreeSet::from([cfg_provider_id("anthropic")]));
         let d = r.resolve(&rq).unwrap();
         assert_eq!(d.candidates.len(), 1);
         assert_eq!(d.candidates[0].provider, "anthropic");
@@ -417,9 +425,8 @@ mod tests {
     fn excluded_model_removes_fallback() {
         let r = mk_router(Strategy::Simple);
         let mut rq = req("smart");
-        // Exclusion is by model id. `from_models` synthesizes `cfg-N` ids in
-        // declaration order, and `cheap` is the second model in `mk_router`.
-        rq.excluded_model_ids = BTreeSet::from(["cfg-1".to_string()]);
+        // Exclusion is by model id, not name.
+        rq.excluded_model_ids = BTreeSet::from([cfg_model_id("cheap")]);
         let d = r.resolve(&rq).unwrap();
         assert!(d.candidates.iter().all(|c| c.model_name != "cheap"));
         assert_eq!(d.candidates.len(), 2);
@@ -429,8 +436,11 @@ mod tests {
     fn everything_filtered_is_no_eligible_provider() {
         let r = mk_router(Strategy::Simple);
         let mut rq = req("smart");
-        rq.denied_providers =
-            BTreeSet::from(["openai".into(), "anthropic".into(), "openrouter".into()]);
+        rq.denied_provider_ids = BTreeSet::from([
+            cfg_provider_id("openai"),
+            cfg_provider_id("anthropic"),
+            cfg_provider_id("openrouter"),
+        ]);
         let err = r.resolve(&rq).unwrap_err();
         assert!(matches!(err, Error::NoEligibleProvider(_)));
     }
@@ -468,6 +478,7 @@ mod tests {
             id: yb_core::new_id(),
             model_id: "m-fresh".into(),
             model_name: "fresh".into(),
+            provider_id: "p-openai".into(),
             provider: "openai".into(),
             upstream_model: "gpt-4o".into(),
             api_base: None,

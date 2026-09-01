@@ -146,34 +146,57 @@ CREATE TABLE models (
 );
 CREATE UNIQUE INDEX models_name_uq ON models(name);
 
+-- A provider: one upstream endpoint, its credentials, and the deployments served
+-- through it. Credentials live here rather than on each deployment because they
+-- describe the *endpoint* — two models behind one OpenAI account are one key,
+-- not two copies of it. `extra` is the same story: the Cloudflare Access flag
+-- and literal headers are edge concerns of the endpoint.
+--
+-- `upstream_format` deliberately is NOT here: one endpoint can serve several
+-- (OpenAI serves openai_chat and openai_embed from the same base), so the wire
+-- format belongs to the deployment.
+CREATE TABLE providers (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    -- NULL means "the wire format's default base".
+    api_base            TEXT,
+    api_key             TEXT,
+    extra               TEXT NOT NULL DEFAULT '{}',
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE UNIQUE INDEX providers_name_uq ON providers(name);
+
+-- One binding of a model to a provider, in a given wire format. Several
+-- deployments of one model are the load-balancing fan-out.
 CREATE TABLE deployments (
     id                  TEXT PRIMARY KEY,
     model_id            TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
-    provider            TEXT NOT NULL,
+    -- CASCADE reaps tombstoned deployments when a provider is removed.
+    -- Deleting a provider that still has *live* deployments is refused in the
+    -- store (`delete_provider`), which is the check that carries meaning here:
+    -- deployments are soft-deleted, so RESTRICT would also trip on tombstones
+    -- and a provider could never be removed once it had ever been used.
+    provider_id         TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
     upstream_model      TEXT NOT NULL,
-    api_base            TEXT,
-    api_key             TEXT,
     upstream_format     TEXT NOT NULL,
     weight              INTEGER NOT NULL DEFAULT 1,
     pricing             TEXT,
     health_check        TEXT NOT NULL DEFAULT 'none',
     health_path         TEXT,
-    extra               TEXT NOT NULL DEFAULT '{}',
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
     deleted_at          TEXT
 );
 CREATE INDEX deployments_model_idx ON deployments(model_id) WHERE deleted_at IS NULL;
--- A deployment's identity, replacing the old denormalized `natural_key` string.
--- This is the idempotency key for `gateway import`. Keyed on model_id rather
--- than the name, so renaming a model cannot make an import re-insert it under
--- its old name.
---
--- COALESCE is load-bearing, not cosmetic: NULL != NULL, so a bare four-column
--- unique index would let import insert a second copy of every deployment that
--- omits api_base — which is most of them.
+CREATE INDEX deployments_provider_idx ON deployments(provider_id) WHERE deleted_at IS NULL;
+
+-- A deployment's identity, and the idempotency key for `gateway import`. Keyed
+-- on ids rather than names, so renaming a model or a provider cannot make an
+-- import re-insert the deployment under its old name. Every column is NOT NULL,
+-- so this needs no COALESCE.
 CREATE UNIQUE INDEX deployments_identity_uq
-    ON deployments(model_id, provider, upstream_model, COALESCE(api_base, ''))
+    ON deployments(model_id, provider_id, upstream_model)
     WHERE deleted_at IS NULL;
 
 CREATE TABLE sessions (

@@ -1,24 +1,46 @@
 # Example models file — load into the database with:
 #   gateway import models.example.toml gateway.toml
 #
-# Each [[model]] is a public model name (what clients request) with one or more
-# deployments. Models live ONLY in the database; the serve config carries none.
-# Add or remove them at runtime via POST/DELETE /admin/v1/models.
+# Two kinds of block:
+#
+#   [[provider]]  one upstream endpoint: its base URL, its credential, and the
+#                 edge settings in front of it. Declared once and shared.
+#   [[model]]     a public model name clients request, with one or more
+#                 deployments. Each deployment names the provider it goes
+#                 through and the wire format it speaks.
+#
+# Credentials live on the provider, not the deployment: two models behind one
+# OpenAI account are one key, not two copies of it. The wire format stays on the
+# deployment, because one endpoint can serve several (OpenAI serves openai_chat
+# and openai_embed from the same base).
+#
+# Models and providers live ONLY in the database. Add or remove them at runtime
+# via the admin API; this file is a bulk loader.
+
+[[provider]]
+name = "openai"
+# api_base is optional — omit it for the wire format's default.
+api_key = "sk-..."
+
+[[provider]]
+name = "anthropic"
+api_key = "sk-ant-..."
+
+[[provider]]
+name = "voyage"
+api_key = "pa-..."
 
 [[model]]
 model_name = "gpt-4o"            # the public name clients request
   aliases = ["gpt-4", "fast"]    # extra public names that resolve to this model
   [[model.deployments]]
-  provider = "openai"            # free-form attribution label (for access policy + telemetry)
+  provider = "openai"            # which [[provider]] this goes through
   upstream_model = "gpt-4o"      # id sent upstream
   upstream_format = "openai_chat" # chat: anthropic | openai_chat | openai_responses | gemini
                                   # embeddings: openai_embed | gemini_embed | cohere_embed | voyage_embed | ollama_embed
-  api_key = "sk-..."             # the upstream provider key, stored on the deployment
   weight = 1
   # health_check = "none"        # none | http_ok | models_list | probe — independent of upstream_format
-  # health_path = "/health"      # for http_ok: absolute URL, or path on api_base's origin
-  # api_base = "https://api.openai.com/v1"        # optional override
-  # extra = { cloudflare_access = true }          # see the vLLM example below
+  # health_path = "/health"      # for http_ok: absolute URL, or path on the provider's api_base
   # pricing = { input_per_1m = 2.5, output_per_1m = 10.0 }   # optional USD/1M overrides
 
 [[model]]
@@ -27,7 +49,6 @@ model_name = "claude-3-5-sonnet"
   provider = "anthropic"
   upstream_model = "claude-3-5-sonnet-20241022"
   upstream_format = "anthropic"
-  api_key = "sk-ant-..."
   weight = 1
 
 # ---------------------------------------------------------------------------
@@ -40,10 +61,10 @@ model_name = "claude-3-5-sonnet"
 [[model]]
 model_name = "text-embedding-3-small"
   [[model.deployments]]
+  # The same [[provider]] as gpt-4o above — one endpoint, one key, two models.
   provider = "openai"
   upstream_model = "text-embedding-3-small"
   upstream_format = "openai_embed"
-  api_key = "sk-..."
   # pricing = { input_per_1m = 0.02, output_per_1m = 0.0 }
 
 [[model]]
@@ -52,12 +73,11 @@ model_name = "voyage-multimodal-3"
   provider = "voyage"
   upstream_model = "voyage-multimodal-3"
   upstream_format = "voyage_embed"
-  api_key = "pa-..."
 
 # ---------------------------------------------------------------------------
-# `extra` — an open string→value object stored on the deployment row, for knobs
-# that are per-deployment rather than per-format. Unrecognized keys are kept
-# verbatim, so it is additive and needs no migration. Two keys are understood:
+# `extra` — an open string→value object on the **provider**, for knobs that
+# describe the endpoint. Unrecognized keys are kept verbatim, so it is additive
+# and needs no migration. Two keys are understood:
 #
 #   cloudflare_access = true    send the Cloudflare Access service token from
 #                               [upstream.cloudflare_access] in gateway.toml, so
@@ -68,21 +88,24 @@ model_name = "voyage-multimodal-3"
 #
 # Precedence is by decreasing authority: the wire format's own auth first, then
 # the file-owned service token, then these literal headers. A name already set
-# is never overwritten, so a deployment row cannot forge the service token or
-# slip a second Authorization past the origin.
+# is never overwritten, so a provider row cannot forge the service token or slip
+# a second Authorization past the origin.
 #
 # Below: an OpenAI-compatible (vLLM) server behind Cloudflare Access. Both
 # credentials are required — the service token to get past the edge, and api_key
 # for the origin's own auth.
 # ---------------------------------------------------------------------------
+[[provider]]
+name = "vllm"
+api_base = "https://vllm.example.com/v1"
+api_key = "..."                # the origin's key, behind the edge
+extra = { cloudflare_access = true, headers = { "X-Tenant" = "acme" } }
+
 [[model]]
 model_name = "qwen3-27b"
   [[model.deployments]]
   provider = "vllm"
   upstream_model = "Qwen3.8-27B"
   upstream_format = "openai_chat"
-  api_base = "https://vllm.example.com/v1"
-  api_key = "..."                # the origin's key, behind the edge
-  extra = { cloudflare_access = true, headers = { "X-Tenant" = "acme" } }
   health_check = "http_ok"
   health_path = "/health"

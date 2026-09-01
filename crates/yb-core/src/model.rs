@@ -11,12 +11,10 @@ use serde::{Deserialize, Serialize};
 /// A per-key / per-team model & provider allow/deny list. Empty allow lists mean
 /// "no restriction at this scope"; deny always wins.
 ///
-/// Models are held as **ids**, providers as **names**. That asymmetry is
-/// deliberate and not an oversight: a model is an entity with a row and a stable
-/// id, whereas a provider is a free-form attribution label with no row anywhere.
-/// Holding model ids is what stops a rename from silently un-denying a denied
-/// model — with names, `denied_models: ["gpt-4o"]` simply stops matching the
-/// moment someone renames it, granting access with no error and no log line.
+/// Both models and providers are held as **ids**. Holding ids is what stops a
+/// rename from silently un-denying something: with names, `denied_models:
+/// ["gpt-4o"]` simply stops matching the moment someone renames it, granting
+/// access with no error and no log line.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccessPolicy {
     #[serde(default)]
@@ -24,17 +22,17 @@ pub struct AccessPolicy {
     #[serde(default)]
     pub denied_model_ids: Vec<String>,
     #[serde(default)]
-    pub allowed_providers: Vec<String>,
+    pub allowed_provider_ids: Vec<String>,
     #[serde(default)]
-    pub denied_providers: Vec<String>,
+    pub denied_provider_ids: Vec<String>,
 }
 
 impl AccessPolicy {
     pub fn is_unrestricted(&self) -> bool {
         self.allowed_model_ids.is_empty()
             && self.denied_model_ids.is_empty()
-            && self.allowed_providers.is_empty()
-            && self.denied_providers.is_empty()
+            && self.allowed_provider_ids.is_empty()
+            && self.denied_provider_ids.is_empty()
     }
 
     /// Does this policy permit the given model? Deny wins; a non-empty allow
@@ -54,12 +52,12 @@ impl AccessPolicy {
     }
 
     /// Does this policy permit the given provider? Same precedence as models.
-    pub fn permits_provider(&self, provider: &str) -> bool {
-        if self.denied_providers.iter().any(|p| p == provider) {
+    pub fn permits_provider(&self, provider_id: &str) -> bool {
+        if self.denied_provider_ids.iter().any(|p| p == provider_id) {
             return false;
         }
-        if !self.allowed_providers.is_empty()
-            && !self.allowed_providers.iter().any(|p| p == provider)
+        if !self.allowed_provider_ids.is_empty()
+            && !self.allowed_provider_ids.iter().any(|p| p == provider_id)
         {
             return false;
         }
@@ -92,8 +90,8 @@ impl AccessPolicy {
         AccessPolicy {
             allowed_model_ids: intersect_allow(&self.allowed_model_ids, &other.allowed_model_ids),
             denied_model_ids: union(&self.denied_model_ids, &other.denied_model_ids),
-            allowed_providers: intersect_allow(&self.allowed_providers, &other.allowed_providers),
-            denied_providers: union(&self.denied_providers, &other.denied_providers),
+            allowed_provider_ids: intersect_allow(&self.allowed_provider_ids, &other.allowed_provider_ids),
+            denied_provider_ids: union(&self.denied_provider_ids, &other.denied_provider_ids),
         }
     }
 }

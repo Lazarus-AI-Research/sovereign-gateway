@@ -187,13 +187,13 @@ fn build_embed_route_request(req: &EmbedRequest, ctx: &RequestCtx) -> RouteReque
     let mut excluded_model_ids = ctx.excluded_model_ids.clone();
     excluded_model_ids.extend(ctx.access.denied_model_ids.iter().cloned());
 
-    let mut denied_providers = ctx.excluded_providers.clone();
-    denied_providers.extend(ctx.access.denied_providers.iter().cloned());
+    let mut denied_provider_ids = ctx.excluded_provider_ids.clone();
+    denied_provider_ids.extend(ctx.access.denied_provider_ids.iter().cloned());
 
-    let enabled_providers = if ctx.access.allowed_providers.is_empty() {
+    let enabled_provider_ids = if ctx.access.allowed_provider_ids.is_empty() {
         None
     } else {
-        Some(ctx.access.allowed_providers.iter().cloned().collect())
+        Some(ctx.access.allowed_provider_ids.iter().cloned().collect())
     };
 
     let chars: usize = req
@@ -212,8 +212,8 @@ fn build_embed_route_request(req: &EmbedRequest, ctx: &RequestCtx) -> RouteReque
         has_tools: false,
         has_images: req.inputs.iter().any(|i| i.has_image()),
         excluded_model_ids,
-        enabled_providers,
-        denied_providers,
+        enabled_provider_ids,
+        denied_provider_ids,
         preferred_models: Vec::new(),
     }
 }
