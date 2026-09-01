@@ -242,10 +242,15 @@ type Sug = { value: string; label: string; hint: string };
  * A list of values edited as removable pills, completed by the backend.
  *
  * `kind` names the vocabulary the server completes (`model`, `provider`,
- * `user`). Values are stored verbatim, so for `user` a pill holds an id and
- * `labelFor` supplies the username to display. `strict` refuses anything the
- * server did not suggest — right for ids, wrong for access policies, where
- * naming a model that isn't deployed yet is a legitimate thing to do.
+ * `user`). Every vocabulary now yields ids: a pill *holds* the id and
+ * `labelFor` supplies the name to *display*, so what is stored survives a
+ * rename and what is shown stays readable.
+ *
+ * `strict` refuses anything the server did not suggest, which is right for all
+ * three — a hand-typed name is not an id, and silently storing one would read
+ * as a working rule that matches nothing. To reference a model that has no
+ * deployments yet, create it first (`POST /models {name}`); it is completable
+ * immediately and simply is not routable until something backs it.
  */
 function TokenInput({ kind, value, onChange, placeholder, labelFor, strict }: {
   kind: string; value: string[]; onChange: (v: string[]) => void;

@@ -25,6 +25,12 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
     let mut req = ChatRequest {
         model: opt_str(&v, "model").unwrap_or_default().to_string(),
         stream: opt_bool(&v, "stream"),
+        // OpenAI omits usage from a stream unless the caller asks for it here.
+        include_usage: v
+            .get("stream_options")
+            .and_then(|o| o.get("include_usage"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         max_tokens: opt_u32(&v, "max_tokens").or_else(|| opt_u32(&v, "max_completion_tokens")),
         temperature: opt_f32(&v, "temperature"),
         top_p: opt_f32(&v, "top_p"),
@@ -588,6 +594,16 @@ pub struct EmitState {
     model: String,
     tool_index: i64,
     usage: Option<Usage>,
+    /// Whether the client asked for a trailing usage chunk. Off by default,
+    /// which is what OpenAI does when `stream_options.include_usage` is unset.
+    include_usage: bool,
+    /// `[DONE]` held back until the trailing usage chunk arrives.
+    ///
+    /// A real stream sends the finish chunk, *then* a separate choices-less
+    /// usage chunk, then `[DONE]` — so `Done` reaches this encoder before the
+    /// usage does. Writing `[DONE]` eagerly would put usage after the sentinel,
+    /// where no client reads it.
+    pending_done: bool,
 }
 
 impl Default for EmitState {
@@ -597,7 +613,36 @@ impl Default for EmitState {
             model: String::new(),
             tool_index: -1,
             usage: None,
+            include_usage: false,
+            pending_done: false,
         }
+    }
+}
+
+impl EmitState {
+    /// Relay token usage on this stream, as `stream_options.include_usage`
+    /// requests. The gateway always collects usage upstream for billing; this
+    /// governs only whether it is passed on to the client.
+    pub fn set_include_usage(&mut self, on: bool) {
+        self.include_usage = on;
+    }
+
+    /// Close a stream that ended while still waiting for usage.
+    ///
+    /// Returns the bytes still owed — the usage chunk if any arrived, and the
+    /// `[DONE]` sentinel — so an upstream that hangs up after `finish_reason`
+    /// without ever sending usage still terminates the client's stream.
+    pub fn finish(&mut self) -> Vec<u8> {
+        if !self.pending_done {
+            return Vec::new();
+        }
+        self.pending_done = false;
+        let mut out = String::new();
+        if let Some(u) = self.usage {
+            write_usage_chunk(&mut out, self, &u);
+        }
+        out.push_str("data: [DONE]\n\n");
+        out.into_bytes()
     }
 }
 
@@ -646,11 +691,33 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
             }
             StreamEvent::UsageDelta { usage } => {
                 state.usage.get_or_insert_default().merge(usage);
+                // The usage we were holding [DONE] for: relay it and close.
+                if state.pending_done {
+                    if let Some(u) = state.usage {
+                        write_usage_chunk(&mut out, state, &u);
+                    }
+                    out.push_str("data: [DONE]\n\n");
+                    state.pending_done = false;
+                }
             }
             StreamEvent::Done { stop_reason } => {
                 ensure_started(&mut out, state);
                 write_chunk(&mut out, state, json!({}), Some(stop_to_finish(stop_reason)));
-                out.push_str("data: [DONE]\n\n");
+                // OpenAI sends usage as a final chunk with an empty `choices`
+                // array, after the one carrying `finish_reason` and before
+                // [DONE] — and only when the caller asked.
+                match (state.include_usage, state.usage) {
+                    // Usage already in hand (it shared a line with the finish
+                    // reason): emit and close now.
+                    (true, Some(u)) => {
+                        write_usage_chunk(&mut out, state, &u);
+                        out.push_str("data: [DONE]\n\n");
+                    }
+                    // Asked for, not yet arrived: hold [DONE] back for it. The
+                    // usual case — upstreams send it on the *next* line.
+                    (true, None) => state.pending_done = true,
+                    (false, _) => out.push_str("data: [DONE]\n\n"),
+                }
             }
         }
     }
@@ -662,6 +729,25 @@ fn ensure_started(out: &mut String, state: &mut EmitState) {
         state.started = true;
         write_chunk(out, state, json!({"role": "assistant"}), None);
     }
+}
+
+/// The trailing usage-only chunk: same envelope, no choices, a `usage` object.
+fn write_usage_chunk(out: &mut String, state: &EmitState, u: &Usage) {
+    let chunk = json!({
+        "id": "chatcmpl_stream",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": state.model,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": u.input_tokens,
+            "completion_tokens": u.output_tokens,
+            "total_tokens": u.input_tokens + u.output_tokens,
+        },
+    });
+    out.push_str("data: ");
+    out.push_str(&chunk.to_string());
+    out.push_str("\n\n");
 }
 
 fn write_chunk(out: &mut String, state: &EmitState, delta: Value, finish_reason: Option<&str>) {
@@ -707,6 +793,107 @@ mod tests {
         let v = emit(false);
         assert!(v.get("stream").is_none());
         assert!(v.get("stream_options").is_none());
+    }
+
+    #[test]
+    /// The client's `stream_options.include_usage` reaches the IR.
+    #[test]
+    fn include_usage_is_parsed_from_the_request() {
+        let on = parse_request(
+            br#"{"model":"m","messages":[],"stream":true,"stream_options":{"include_usage":true}}"#,
+        )
+        .unwrap();
+        assert!(on.include_usage);
+        // Absent, and explicitly false, both mean off.
+        let off = parse_request(br#"{"model":"m","messages":[],"stream":true}"#).unwrap();
+        assert!(!off.include_usage);
+        let explicit = parse_request(
+            br#"{"model":"m","messages":[],"stream":true,"stream_options":{"include_usage":false}}"#,
+        )
+        .unwrap();
+        assert!(!explicit.include_usage);
+    }
+
+    /// Build the events a real stream produces: text, then a finish, then usage
+    /// on its *own* line — which is the order that used to lose it.
+    fn stream_events() -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::TextDelta { text: "ok".into() },
+            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+            StreamEvent::UsageDelta {
+                usage: Usage { input_tokens: 93, output_tokens: 48, ..Default::default() },
+            },
+        ]
+    }
+
+    fn encode_all(include_usage: bool, events: &[StreamEvent]) -> String {
+        let mut st = EmitState::default();
+        st.set_include_usage(include_usage);
+        let mut out = encode_sse(events, &mut st);
+        out.extend(st.finish());
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Usage arriving *after* the finish chunk must still be relayed, ahead of
+    /// [DONE]. Upstreams send it on the next line, so the terminal event has
+    /// already been encoded by the time it shows up — the bug was writing
+    /// [DONE] eagerly and dropping the usage that followed.
+    #[test]
+    fn usage_is_relayed_when_it_arrives_after_the_finish_chunk() {
+        let got = encode_all(true, &stream_events());
+        let (before_done, _) = got.split_once("data: [DONE]").expect("stream terminates");
+        let usage_line = before_done
+            .lines()
+            .filter(|l| l.contains("\"usage\""))
+            .next_back()
+            .expect("a usage chunk precedes [DONE]");
+        let v: Value = serde_json::from_str(usage_line.trim_start_matches("data: ")).unwrap();
+        assert_eq!(v["usage"]["prompt_tokens"], 93);
+        assert_eq!(v["usage"]["completion_tokens"], 48);
+        assert_eq!(v["usage"]["total_tokens"], 141);
+        // OpenAI's shape: the usage chunk carries no choices.
+        assert_eq!(v["choices"], json!([]));
+        assert!(got.trim_end().ends_with("data: [DONE]"), "[DONE] must be last");
+    }
+
+    /// Faithful to OpenAI: no `include_usage`, no usage chunk — even though the
+    /// gateway has the counts and bills on them.
+    #[test]
+    fn usage_is_withheld_when_the_client_did_not_ask() {
+        let got = encode_all(false, &stream_events());
+        assert!(!got.contains("\"usage\""), "unrequested usage must not be relayed: {got}");
+        assert!(got.trim_end().ends_with("data: [DONE]"));
+    }
+
+    /// An upstream that hangs up after the finish chunk, never sending usage,
+    /// must still leave the client with a terminated stream rather than one
+    /// waiting forever on a [DONE] that is being held back.
+    #[test]
+    fn a_stream_that_ends_without_usage_still_terminates() {
+        let events = vec![
+            StreamEvent::TextDelta { text: "ok".into() },
+            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+        ];
+        let got = encode_all(true, &events);
+        assert!(!got.contains("\"usage\""));
+        assert_eq!(got.matches("data: [DONE]").count(), 1, "exactly one sentinel: {got}");
+        assert!(got.trim_end().ends_with("data: [DONE]"));
+    }
+
+    /// Usage sharing a line with the finish reason (some upstreams do) is
+    /// emitted immediately, and [DONE] is not written twice.
+    #[test]
+    fn usage_on_the_same_line_as_the_finish_emits_once() {
+        let events = vec![
+            StreamEvent::UsageDelta {
+                usage: Usage { input_tokens: 5, output_tokens: 7, ..Default::default() },
+            },
+            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+        ];
+        let got = encode_all(true, &events);
+        assert_eq!(got.matches("data: [DONE]").count(), 1, "{got}");
+        assert_eq!(got.matches("\"usage\"").count(), 1, "{got}");
+        assert!(got.trim_end().ends_with("data: [DONE]"));
     }
 
     #[test]

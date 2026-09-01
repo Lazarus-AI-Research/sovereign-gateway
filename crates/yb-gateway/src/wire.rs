@@ -193,6 +193,28 @@ impl Encoder {
         }
     }
 
+    /// Relay token usage on this stream, as `stream_options.include_usage`
+    /// requests. A no-op on every surface but OpenAI Chat, which is the only
+    /// one that makes usage opt-in.
+    pub fn set_include_usage(&mut self, on: bool) {
+        if let Encoder::OpenaiChat(s) = self {
+            s.set_include_usage(on);
+        }
+    }
+
+    /// Bytes still owed when the upstream stream ends.
+    ///
+    /// The OpenAI Chat surface holds `[DONE]` back while it waits for the
+    /// trailing usage chunk; if the upstream hangs up without sending one, this
+    /// closes the client's stream rather than leaving it unterminated. A no-op
+    /// on every other surface.
+    pub fn finish(&mut self) -> Vec<u8> {
+        match self {
+            Encoder::OpenaiChat(s) => s.finish(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Seed the prompt-cache echo carried on the Responses surface's response
     /// envelopes; a no-op on every other surface.
     pub fn set_prompt_cache(&mut self, key: Option<String>, retention: Option<String>) {
