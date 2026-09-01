@@ -48,7 +48,7 @@ use yb_core::config::{
 };
 use yb_core::crypto::{Encryptor, NoopEncryptor, PasswordHasher};
 use yb_core::ratelimit::Limiter;
-use yb_core::{new_id, now, DeploymentRecord, NullLogger, NullObserver, Observer, RequestLogger, Store};
+use yb_core::{NewDeployment, NullLogger, NullObserver, Observer, RequestLogger, Store};
 use yb_gateway::{DeploymentRouter, Gateway};
 use yb_otel::OtelSink;
 use yb_providers::{HttpClient, MockClient, UpstreamClient};
@@ -427,9 +427,11 @@ async fn seed_models(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut inserted = 0usize;
     for mc in models {
+        // Once per block, before its deployments: a `[[model]]` that declares
+        // only aliases still needs a model row for `seed_aliases` to target.
+        store.ensure_model(&mc.model_name).await?;
         for dc in &mc.deployments {
-            let rec = DeploymentRecord {
-                id: new_id(),
+            let rec = NewDeployment {
                 model_name: mc.model_name.clone(),
                 provider: dc.provider.clone(),
                 upstream_model: dc.upstream_model.clone(),
@@ -441,9 +443,6 @@ async fn seed_models(
                 health_check: dc.health_check,
                 health_path: dc.health_path.clone(),
                 extra: dc.extra.clone(),
-                created_at: now(),
-                updated_at: now(),
-                deleted_at: None,
             };
             if store.seed_deployment(&rec).await? {
                 inserted += 1;
@@ -461,14 +460,12 @@ async fn seed_aliases(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut count = 0usize;
     for mc in models {
+        if mc.aliases.is_empty() {
+            continue;
+        }
+        let model = store.ensure_model(&mc.model_name).await?;
         for alias in &mc.aliases {
-            store
-                .upsert_alias(&yb_core::ModelAlias {
-                    alias: alias.clone(),
-                    target: mc.model_name.clone(),
-                    created_at: now(),
-                })
-                .await?;
+            store.upsert_alias(alias, &model.id).await?;
             count += 1;
         }
     }

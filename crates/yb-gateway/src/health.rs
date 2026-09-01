@@ -258,6 +258,7 @@ mod tests {
     fn dep(fmt: UpstreamFormat, base: Option<&str>, check: HealthCheck, path: Option<&str>) -> DeploymentRecord {
         DeploymentRecord {
             id: "d1".into(),
+            model_id: "m1".into(),
             model_name: "m".into(),
             provider: "p".into(),
             upstream_model: "um".into(),

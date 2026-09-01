@@ -140,7 +140,8 @@ pub struct RequestCtx {
     /// Optional distributed-trace id.
     pub trace_id: Option<String>,
     /// Public model names excluded for this caller (denylist).
-    pub excluded_models: BTreeSet<String>,
+    /// Model **ids** excluded by policy, so a rename cannot un-exclude one.
+    pub excluded_model_ids: BTreeSet<String>,
     /// Provider attribution names excluded for this caller (denylist).
     pub excluded_providers: BTreeSet<String>,
     /// The effective model/provider access grant for this caller — the key's
@@ -493,8 +494,8 @@ impl Gateway {
     /// ∪ team), and lift its provider allow-list into the `enabled_providers`
     /// ceiling.
     fn build_route_request(&self, chat: &ChatRequest, ctx: &RequestCtx) -> RouteRequest {
-        let mut excluded_models: BTreeSet<String> = ctx.excluded_models.clone();
-        excluded_models.extend(ctx.access.denied_models.iter().cloned());
+        let mut excluded_model_ids: BTreeSet<String> = ctx.excluded_model_ids.clone();
+        excluded_model_ids.extend(ctx.access.denied_model_ids.iter().cloned());
 
         let mut denied_providers: BTreeSet<String> = ctx.excluded_providers.clone();
         denied_providers.extend(ctx.access.denied_providers.iter().cloned());
@@ -514,7 +515,7 @@ impl Gateway {
                 .iter()
                 .flat_map(|m| &m.content)
                 .any(|c| matches!(c, ContentBlock::Image { .. })),
-            excluded_models,
+            excluded_model_ids,
             enabled_providers,
             denied_providers,
             preferred_models: Vec::new(),
@@ -528,12 +529,12 @@ impl Gateway {
         candidates
             .into_iter()
             .filter(|d| {
-                if !ctx.access.permits_model(&d.model_name)
+                if !ctx.access.permits_model(&d.model_id)
                     || !ctx.access.permits_provider(&d.provider)
                 {
                     return false;
                 }
-                !ctx.excluded_models.contains(&d.model_name)
+                !ctx.excluded_model_ids.contains(&d.model_id)
                     && !ctx.excluded_providers.contains(&d.provider)
             })
             .collect()

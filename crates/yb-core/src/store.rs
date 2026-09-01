@@ -13,7 +13,7 @@ use crate::model::{
     TelemetryRecord, User,
 };
 use crate::principal::KeyAuth;
-use crate::routing::DeploymentRecord;
+use crate::routing::{DeploymentRecord, ModelRecord, NewDeployment};
 use crate::spend::{Budget, Period, RollupDelta, SpendRow, SubjectType};
 use async_trait::async_trait;
 
@@ -114,18 +114,42 @@ pub trait Store: Send + Sync {
         n: i64,
     ) -> crate::Result<i64>;
 
-    // ---- deployments (the live model list) ----------------------------
+    // ---- models (the entity behind a public model name) ----------------
+    async fn list_models(&self) -> crate::Result<Vec<ModelRecord>>;
+    async fn get_model(&self, id: &str) -> crate::Result<Option<ModelRecord>>;
+    async fn get_model_by_name(&self, name: &str) -> crate::Result<Option<ModelRecord>>;
+    /// Resolve `name` to its model, creating the row if the name is new. The
+    /// funnel every human-authored input passes through: the import file, the
+    /// admin create-deployment body, an alias target.
+    async fn ensure_model(&self, name: &str) -> crate::Result<ModelRecord>;
+    /// Rename `id` to `new_name`, leaving the previous name behind as an alias
+    /// of the same model so clients already sending it keep resolving.
+    ///
+    /// Atomic: the rename and the alias insert commit together, because a model
+    /// renamed without its alias is a silent outage for every client still
+    /// naming it.
+    ///
+    /// `NotFound` if `id` is unknown; `Conflict` if `new_name` already belongs
+    /// to another model or another model's alias. If `new_name` is an alias of
+    /// *this* model, that alias is consumed rather than conflicting — so
+    /// undoing a rename leaves no self-referential alias behind.
+    async fn rename_model(&self, id: &str, new_name: &str) -> crate::Result<ModelRecord>;
+
+    // ---- deployments (one model's upstream fan-out) --------------------
     async fn list_deployments(&self) -> crate::Result<Vec<DeploymentRecord>>;
     async fn get_deployment(&self, id: &str) -> crate::Result<Option<DeploymentRecord>>;
-    async fn create_deployment(&self, dep: &DeploymentRecord) -> crate::Result<()>;
+    /// Create a deployment, resolving (or creating) its model by name. Atomic.
+    async fn create_deployment(&self, dep: &NewDeployment) -> crate::Result<DeploymentRecord>;
     async fn delete_deployment(&self, id: &str) -> crate::Result<()>;
-    /// Idempotently seed a deployment by its natural key. Returns `true` if a new
-    /// row was inserted. Projects the file's seed `model_list` into the DB.
-    async fn seed_deployment(&self, dep: &DeploymentRecord) -> crate::Result<bool>;
+    /// Idempotently seed a deployment by its identity tuple (model + provider +
+    /// upstream model + api base). Returns `true` if a new row was inserted.
+    async fn seed_deployment(&self, dep: &NewDeployment) -> crate::Result<bool>;
 
-    // ---- model aliases (public name -> public name) -------------------
+    // ---- model aliases (extra public name -> model) --------------------
+    /// All aliases, each carrying its model's **current** canonical name in
+    /// `target` — so a rename retargets every alias with no write here.
     async fn list_aliases(&self) -> crate::Result<Vec<ModelAlias>>;
-    /// Insert or replace an alias (keyed on `alias`).
-    async fn upsert_alias(&self, alias: &ModelAlias) -> crate::Result<()>;
+    /// Insert or repoint an alias (keyed on `alias`).
+    async fn upsert_alias(&self, alias: &str, model_id: &str) -> crate::Result<ModelAlias>;
     async fn delete_alias(&self, alias: &str) -> crate::Result<()>;
 }
