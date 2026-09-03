@@ -39,6 +39,23 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop: Vec<String>,
     pub stream: bool,
+    /// The client's `input` array, kept verbatim when the surface was
+    /// Responses — replayed only on a Responses→Responses relay.
+    ///
+    /// The IR models what every provider shares, so a provider-native item has
+    /// nowhere to live in it: `reasoning` (with its `encrypted_content`),
+    /// `web_search_call`, `code_interpreter_call`, `item_reference` and the
+    /// rest are normalized away. Dropping them is right when translating to a
+    /// *different* shape, which cannot act on them — but on a same-shape relay
+    /// the upstream understands them natively, and losing them is pure damage.
+    /// Reasoning items are the sharp case: a reasoning model expects them
+    /// echoed back, and silently dropping them degrades multi-turn quality
+    /// with nothing to notice.
+    ///
+    /// Only the Responses parser sets this, and only the Responses emitter
+    /// reads it; every other surface builds from [`Self::messages`] as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_input: Option<Vec<serde_json::Value>>,
     /// The client asked for token usage on the stream
     /// (`stream_options.include_usage`, OpenAI Chat Completions only).
     ///
