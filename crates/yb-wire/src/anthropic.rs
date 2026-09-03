@@ -111,8 +111,11 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     // Anthropic requires max_tokens; fall back to a safe default.
     body.insert("max_tokens".into(), json!(req.max_tokens.unwrap_or(4096)));
 
-    if let Some(system) = &req.system {
-        body.insert("system".into(), emit_system(system));
+    // Includes inline System/Developer messages, which `emit_message` skips —
+    // without this they reach neither `system` nor `messages`.
+    let system = req.effective_system();
+    if !system.is_empty() {
+        body.insert("system".into(), emit_system(&system));
     }
 
     let messages: Vec<Value> = req.messages.iter().filter_map(emit_message).collect();

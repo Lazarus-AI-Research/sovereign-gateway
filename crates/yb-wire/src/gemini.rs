@@ -101,10 +101,13 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
         body.insert("model".into(), json!(opts.target_model));
     }
 
-    if let Some(system) = &req.system {
+    // Includes inline System/Developer messages, which `emit_content` skips —
+    // without this they reach neither `systemInstruction` nor `contents`.
+    let system = req.effective_system();
+    if !system.is_empty() {
         body.insert(
             "systemInstruction".into(),
-            json!({"parts": [{"text": join_text(system)}]}),
+            json!({"parts": [{"text": join_text(&system)}]}),
         );
     }
 

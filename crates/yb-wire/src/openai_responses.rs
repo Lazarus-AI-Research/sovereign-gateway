@@ -112,6 +112,15 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
         // `custom_tool_call` (freeform, args in `input`) and `local_shell_call`
         // (args in `action`).
         Some(t) if is_tool_call(t) => messages.push(tool_call_message(item)),
+        // `mcp_call` is the one item carrying *both* halves of an exchange —
+        // name and arguments alongside its output — and it is keyed on `id`
+        // rather than `call_id`. Emit the pair, or the output is orphaned.
+        Some("mcp_call") => {
+            messages.push(tool_call_message(item));
+            if item.get("output").is_some() {
+                messages.push(tool_result_message(item, output_text(item.get("output"))));
+            }
+        }
         Some(t) if is_tool_output(t) => {
             messages.push(tool_result_message(item, output_text(item.get("output"))))
         }
@@ -129,7 +138,10 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
 }
 
 fn is_tool_call(t: &str) -> bool {
-    matches!(t, "function_call" | "custom_tool_call" | "local_shell_call")
+    matches!(
+        t,
+        "function_call" | "custom_tool_call" | "local_shell_call" | "computer_call"
+    )
 }
 
 fn is_tool_output(t: &str) -> bool {
@@ -153,6 +165,12 @@ fn call_id_of(item: &Value) -> String {
 }
 
 fn tool_call_message(item: &Value) -> Message {
+    // `computer_call` names its tool only by its type, so fall back to that
+    // rather than emitting a nameless call the upstream cannot dispatch.
+    let name = opt_str(item, "name")
+        .or_else(|| opt_str(item, "type"))
+        .unwrap_or_default()
+        .to_string();
     // Freeform tools carry their payload in `input`; `local_shell_call` in
     // `action`. Whichever is present, it becomes the call's arguments.
     let raw = opt_str(item, "arguments").or_else(|| opt_str(item, "input"));
@@ -165,11 +183,7 @@ fn tool_call_message(item: &Value) -> Message {
     };
     Message::new(
         Role::Assistant,
-        vec![ContentBlock::ToolUse {
-            id: call_id_of(item),
-            name: opt_str(item, "name").unwrap_or_default().to_string(),
-            input,
-        }],
+        vec![ContentBlock::ToolUse { id: call_id_of(item), name, input }],
     )
 }
 
@@ -1043,6 +1057,15 @@ mod tool_pairing_tests {
             // An unknown vocabulary, matched on shape alone.
             ("unknown_tool_call_output", call_item("function_call", id),
              json!({"type": "some_future_tool_output", "call_id": id, "output": "hi"})),
+            // `computer_call` names its tool only by its type, and its args
+            // live in `action`. Without both fallbacks the call was dropped
+            // while its output survived — an orphan `tool` message, which an
+            // upstream rejects just as surely as an unanswered call.
+            ("computer_call",
+             json!({"type": "computer_call", "call_id": id,
+                    "action": {"type": "screenshot"}}),
+             json!({"type": "computer_call_output", "call_id": id,
+                    "output": {"type": "computer_screenshot"}})),
         ];
         for (label, call, result) in cases {
             let roles = upstream_roles(json!([call, result]));
@@ -1074,6 +1097,47 @@ mod tool_pairing_tests {
         assert_eq!(msgs[1]["content"], "hi");
     }
 
+    /// `mcp_call` carries both halves of an exchange in one item, keyed on
+    /// `id` rather than `call_id`, so it was dropped entirely.
+    #[test]
+    fn an_mcp_call_yields_both_halves() {
+        let roles = upstream_roles(json!([
+            {"type": "mcp_call", "id": "m:0", "name": "search",
+             "arguments": "{}", "output": "found", "server_label": "s"}
+        ]));
+        assert_eq!(roles, vec!["assistant+tool_calls".to_string(), "tool".to_string()]);
+    }
+
+    /// A `developer` (or `system`) instruction sent inline in `input` must
+    /// reach every upstream, including the ones that carry the system prompt
+    /// out-of-band.
+    ///
+    /// Anthropic and Gemini build their system field from `req.system` alone,
+    /// and their message mappers skip those roles — so an inline instruction
+    /// reached neither, and vanished with no error at all. That is worse than
+    /// the chat surface's `role 'developer' is not allowed`, which at least
+    /// fails loudly.
+    #[test]
+    fn an_inline_developer_instruction_reaches_every_upstream() {
+        let body = json!({"model":"m","stream":false,"input":[
+            {"type":"message","role":"developer","content":"SENTINEL-INSTRUCTION"},
+            {"type":"message","role":"user","content":"hi"}]});
+        let req = parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let opts = EmitOptions::new("t");
+        for (name, bytes) in [
+            ("anthropic", crate::anthropic::emit_request(&req, &opts).unwrap().0),
+            ("gemini", crate::gemini::emit_request(&req, &opts).unwrap().0),
+            ("openai_chat", crate::openai_chat::emit_request(&req, &opts).unwrap().0),
+            ("openai_responses", crate::openai_responses::emit_request(&req, &opts).unwrap().0),
+        ] {
+            let s = String::from_utf8(bytes).unwrap();
+            assert!(
+                s.contains("SENTINEL-INSTRUCTION"),
+                "{name}: the developer instruction was dropped"
+            );
+        }
+    }
+
     /// An item with no tool linkage at all is still ignored — the shape
     /// fallback must not turn arbitrary metadata into a phantom tool message.
     #[test]
@@ -1081,8 +1145,15 @@ mod tool_pairing_tests {
         let roles = upstream_roles(json!([
             {"type": "reasoning", "summary": []},
             {"type": "some_future_thing", "note": "no call_id here"},
+            // id + name, but no tool exchange to relay — must not become a
+            // phantom tool call, which is why the shape fallback keys on
+            // `call_id` and never on a bare `id`.
+            {"type": "mcp_approval_request", "id": "a:0", "name": "search"},
+            {"type": "item_reference", "id": "r:0"},
             {"type": "message", "role": "user", "content": "hi"},
         ]));
         assert_eq!(roles, vec!["user".to_string()]);
     }
 }
+
+
