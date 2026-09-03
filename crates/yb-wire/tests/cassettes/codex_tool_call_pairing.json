@@ -1,0 +1,98 @@
+{
+  "_comment": "A Codex turn on the Responses surface, relayed to an OpenAI-compatible upstream. Codex's freeform tools emit `custom_tool_call` / `custom_tool_call_output` (args in `input`, not `arguments`), which used to fall through a catch-all in parse_input_item and vanish \u2014 leaving an assistant `tool_calls` with no answering `tool` message, which the upstream rejects: \"The following tool_call_ids did not have response messages: exec_command:0\". Pins the pairing, and the `developer` role downgrade that most OpenAI-compatible servers require.",
+  "inbound_format": "openai_responses",
+  "inbound_body": {
+    "model": "k3",
+    "stream": true,
+    "input": [
+      {
+        "type": "message",
+        "role": "developer",
+        "content": "You are a shell agent."
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "count the lines in words.txt"
+          }
+        ]
+      },
+      {
+        "type": "custom_tool_call",
+        "call_id": "exec_command:0",
+        "name": "exec_command",
+        "input": "wc -l words.txt"
+      },
+      {
+        "type": "custom_tool_call_output",
+        "call_id": "exec_command:0",
+        "output": "3 words.txt"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "name": "exec_command",
+        "description": "run a shell command",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    ]
+  },
+  "target_format": "openai_chat",
+  "target_model": "k3",
+  "expected_upstream_body": {
+    "messages": [
+      {
+        "content": "You are a shell agent.",
+        "role": "system"
+      },
+      {
+        "content": "count the lines in words.txt",
+        "role": "user"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "\"wc -l words.txt\"",
+              "name": "exec_command"
+            },
+            "id": "exec_command:0",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "3 words.txt",
+        "role": "tool",
+        "tool_call_id": "exec_command:0"
+      }
+    ],
+    "model": "k3",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "tools": [
+      {
+        "function": {
+          "description": "run a shell command",
+          "name": "exec_command",
+          "parameters": {
+            "properties": {},
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  }
+}

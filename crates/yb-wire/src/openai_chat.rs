@@ -179,7 +179,13 @@ fn emit_messages(req: &ChatRequest) -> Result<Vec<Value>> {
                 out.push(json!({"role": "system", "content": m.text()}));
             }
             Role::Developer => {
-                out.push(json!({"role": "developer", "content": m.text()}));
+                // `developer` is an OpenAI-only role, and most
+                // OpenAI-*compatible* servers reject it outright ("role
+                // 'developer' is not allowed"), which fails the whole turn.
+                // `system` is accepted everywhere and carries the same intent,
+                // and it is how the Anthropic and Gemini surfaces already
+                // collapse this role.
+                out.push(json!({"role": "system", "content": m.text()}));
             }
             Role::Assistant => out.push(emit_assistant(m)?),
             Role::User | Role::Tool => {
