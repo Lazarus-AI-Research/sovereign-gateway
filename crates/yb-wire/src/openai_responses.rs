@@ -448,7 +448,7 @@ pub fn parse_response(bytes: &[u8]) -> Result<ChatResponse> {
                         })
                         .unwrap_or_default();
                     if !text.is_empty() {
-                        content.push(ContentBlock::Thinking { text });
+                        content.push(ContentBlock::Thinking { text, signature: None });
                     }
                 }
                 _ => {}

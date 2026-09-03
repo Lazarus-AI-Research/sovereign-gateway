@@ -164,6 +164,9 @@ fn emit_content(m: &Message) -> Option<Value> {
 
 fn emit_part(b: &ContentBlock) -> Option<Value> {
     match b {
+        // A block only another provider understands has no Gemini equivalent,
+        // so it is skipped rather than mistranslated.
+        ContentBlock::Native { .. } => None,
         ContentBlock::Text { text } => Some(json!({"text": text})),
         ContentBlock::Image { media_type, data, url } => match (data, url) {
             (Some(data), _) => Some(json!({"inline_data": {

@@ -288,9 +288,23 @@ fn parse_block(b: &Value) -> Result<ContentBlock> {
             is_error: opt_bool(b, "is_error"),
         }),
         Some("thinking") => Ok(ContentBlock::Thinking {
+            signature: opt_str(b, "signature").map(str::to_string),
             text: opt_str(b, "thinking").unwrap_or_default().to_string(),
         }),
-        Some(other) => Err(WireError::invalid("content[].type", format!("unknown {other}"))),
+        // An unmodeled block is carried, not rejected. Anthropic's own
+        // `redacted_thinking` arrives here, and it must survive a round trip or
+        // extended thinking fails on the next turn — refusing to parse it broke
+        // the whole request.
+        Some(other) => Ok(ContentBlock::Native {
+            format: "anthropic".to_string(),
+            raw: {
+                let mut r = b.clone();
+                if let Some(o) = r.as_object_mut() {
+                    o.insert("type".into(), json!(other));
+                }
+                r
+            },
+        }),
         None => Err(WireError::missing("content[].type")),
     }
 }
@@ -322,7 +336,20 @@ fn emit_block(b: &ContentBlock) -> Value {
             }
             Value::Object(o)
         }
-        ContentBlock::Thinking { text } => json!({"type": "thinking", "thinking": text}),
+        ContentBlock::Thinking { text, signature } => {
+            let mut o = serde_json::Map::new();
+            o.insert("type".into(), json!("thinking"));
+            o.insert("thinking".into(), json!(text));
+            // Anthropic requires its own signature echoed back, or extended
+            // thinking breaks on the next turn.
+            if let Some(sig) = signature {
+                o.insert("signature".into(), json!(sig));
+            }
+            Value::Object(o)
+        }
+        // Replayed only on an Anthropic upstream; other surfaces skip it.
+        ContentBlock::Native { format, raw } if format == "anthropic" => raw.clone(),
+        ContentBlock::Native { .. } => json!({"type": "text", "text": ""}),
     }
 }
 
