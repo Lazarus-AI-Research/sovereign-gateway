@@ -272,6 +272,17 @@ fn openai_stream_to_anthropic() {
 /// `stream_options.include_usage`. The upstream's trailing choices-less usage
 /// chunk was being decoded, accumulated for billing, and then dropped on the
 /// way out, so a downstream metering proxy saw nothing.
+/// A Codex turn's tool exchange must survive translation to a chat upstream.
+///
+/// Recorded from the shapes Codex actually sends: `custom_tool_call` /
+/// `custom_tool_call_output` for freeform tools like `exec_command`. Losing
+/// either half leaves an assistant `tool_calls` unanswered, and the upstream
+/// rejects the whole turn.
+#[test]
+fn codex_tool_call_pairing() {
+    run("codex_tool_call_pairing");
+}
+
 #[test]
 fn openai_stream_usage_relay() {
     run("openai_stream_usage_relay");

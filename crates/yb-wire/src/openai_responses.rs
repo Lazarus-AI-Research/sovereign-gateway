@@ -74,43 +74,147 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
     Ok(req)
 }
 
+/// Fold one `input` item into the IR message list.
+///
+/// The Responses `input` array is an open vocabulary: beyond `message`,
+/// `function_call` and `function_call_output`, clients emit tool items of their
+/// own — Codex alone sends `custom_tool_call` for freeform tools and
+/// `local_shell_call` for its shell, each with a matching `*_output`. Dropping
+/// one of those loses half a tool exchange, and an assistant `tool_calls` with
+/// no answering `tool` message is rejected outright by the upstream:
+///
+/// > an assistant message with 'tool_calls' must be followed by tool messages
+/// > responding to each 'tool_call_id'
+///
+/// So unknown types are matched on **shape** rather than dropped: anything
+/// carrying a `call_id` plus an `output` is a tool result, and anything
+/// carrying a `call_id` plus a name is a tool call. Only items with no tool
+/// linkage at all are ignored.
 fn parse_input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
     match opt_str(item, "type") {
         Some("message") | None => {
-            let role = match opt_str(item, "role") {
-                Some("assistant") => Role::Assistant,
-                Some("system") => Role::System,
-                Some("developer") => Role::Developer,
-                _ => Role::User,
-            };
-            messages.push(Message::new(role, parse_content_parts(item.get("content"))));
+            match opt_str(item, "role") {
+                // A tool result can arrive as a message with role `tool`; its
+                // id lives in `tool_call_id` (chat spelling) or `call_id`.
+                Some("tool") => messages.push(tool_result_message(item, join_parts(item))),
+                role => {
+                    let role = match role {
+                        Some("assistant") => Role::Assistant,
+                        Some("system") => Role::System,
+                        Some("developer") => Role::Developer,
+                        _ => Role::User,
+                    };
+                    messages.push(Message::new(role, parse_content_parts(item.get("content"))));
+                }
+            }
         }
-        Some("function_call") => {
-            messages.push(Message::new(
-                Role::Assistant,
-                vec![ContentBlock::ToolUse {
-                    id: opt_str(item, "call_id")
-                        .or_else(|| opt_str(item, "id"))
-                        .unwrap_or_default()
-                        .to_string(),
-                    name: opt_str(item, "name").unwrap_or_default().to_string(),
-                    input: parse_arguments(opt_str(item, "arguments")),
-                }],
-            ));
+        // Every tool-call spelling: `function_call`, plus Codex's
+        // `custom_tool_call` (freeform, args in `input`) and `local_shell_call`
+        // (args in `action`).
+        Some(t) if is_tool_call(t) => messages.push(tool_call_message(item)),
+        // `mcp_call` is the one item carrying *both* halves of an exchange —
+        // name and arguments alongside its output — and it is keyed on `id`
+        // rather than `call_id`. Emit the pair, or the output is orphaned.
+        Some("mcp_call") => {
+            messages.push(tool_call_message(item));
+            if item.get("output").is_some() {
+                messages.push(tool_result_message(item, output_text(item.get("output"))));
+            }
         }
-        Some("function_call_output") => {
-            messages.push(Message::new(
-                Role::Tool,
-                vec![ContentBlock::ToolResult {
-                    tool_use_id: opt_str(item, "call_id").unwrap_or_default().to_string(),
-                    content: vec![ContentBlock::text(output_text(item.get("output")))],
-                    is_error: false,
-                }],
-            ));
+        Some(t) if is_tool_output(t) => {
+            messages.push(tool_result_message(item, output_text(item.get("output"))))
+        }
+        // Unknown type: fall back to shape, so a client's own tool vocabulary
+        // still round-trips instead of silently losing an exchange.
+        Some(_) if has_call_id(item) && item.get("output").is_some() => {
+            messages.push(tool_result_message(item, output_text(item.get("output"))))
+        }
+        Some(_) if has_call_id(item) && opt_str(item, "name").is_some() => {
+            messages.push(tool_call_message(item))
         }
         Some(_) => {}
     }
     Ok(())
+}
+
+fn is_tool_call(t: &str) -> bool {
+    matches!(
+        t,
+        "function_call" | "custom_tool_call" | "local_shell_call" | "computer_call"
+    )
+}
+
+fn is_tool_output(t: &str) -> bool {
+    matches!(
+        t,
+        "function_call_output" | "custom_tool_call_output" | "local_shell_call_output"
+    )
+}
+
+fn has_call_id(item: &Value) -> bool {
+    opt_str(item, "call_id").is_some() || opt_str(item, "tool_call_id").is_some()
+}
+
+/// The id linking a call to its result, under any of its spellings.
+fn call_id_of(item: &Value) -> String {
+    opt_str(item, "call_id")
+        .or_else(|| opt_str(item, "tool_call_id"))
+        .or_else(|| opt_str(item, "id"))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn tool_call_message(item: &Value) -> Message {
+    // `computer_call` names its tool only by its type, so fall back to that
+    // rather than emitting a nameless call the upstream cannot dispatch.
+    let name = opt_str(item, "name")
+        .or_else(|| opt_str(item, "type"))
+        .unwrap_or_default()
+        .to_string();
+    // Freeform tools carry their payload in `input`; `local_shell_call` in
+    // `action`. Whichever is present, it becomes the call's arguments.
+    let raw = opt_str(item, "arguments").or_else(|| opt_str(item, "input"));
+    let input = match raw {
+        Some(s) => parse_arguments(Some(s)),
+        None => match item.get("action") {
+            Some(a) => a.clone(),
+            None => parse_arguments(None),
+        },
+    };
+    Message::new(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse { id: call_id_of(item), name, input }],
+    )
+}
+
+fn tool_result_message(item: &Value, text: String) -> Message {
+    Message::new(
+        Role::Tool,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: call_id_of(item),
+            content: vec![ContentBlock::text(text)],
+            is_error: false,
+        }],
+    )
+}
+
+/// Text of a `message`-shaped item, whose content may be a string or parts.
+fn join_parts(item: &Value) -> String {
+    match item.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        other => other
+            .map(|v| {
+                parse_content_parts(Some(v))
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default(),
+    }
 }
 
 fn parse_content_parts(v: Option<&Value>) -> Vec<ContentBlock> {
@@ -888,3 +992,168 @@ mod tests {
         assert_eq!(c["response"]["usage"], Value::Null);
     }
 }
+
+#[cfg(test)]
+mod tool_pairing_tests {
+    use super::*;
+    use crate::EmitOptions;
+
+    /// Translate a Responses `input` history into the chat body we'd send
+    /// upstream, and report the role of each message.
+    fn upstream_roles(input: Value) -> Vec<String> {
+        let body = json!({"model": "m", "input": input, "stream": true});
+        let req = parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let (bytes, _) =
+            crate::openai_chat::emit_request(&req, &EmitOptions::new("k3".to_string())).unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let role = m["role"].as_str().unwrap().to_string();
+                if m.get("tool_calls").is_some() {
+                    format!("{role}+tool_calls")
+                } else {
+                    role
+                }
+            })
+            .collect()
+    }
+
+    fn call_item(kind: &str, id: &str) -> Value {
+        match kind {
+            "custom_tool_call" => json!({"type": kind, "call_id": id, "name": "exec_command",
+                                         "input": "echo hi"}),
+            "local_shell_call" => json!({"type": kind, "call_id": id, "name": "exec_command",
+                                         "action": {"command": ["echo", "hi"]}}),
+            _ => json!({"type": kind, "call_id": id, "name": "exec_command", "arguments": "{}"}),
+        }
+    }
+
+    /// Every tool-exchange spelling must yield an assistant `tool_calls`
+    /// followed by an answering `tool` message.
+    ///
+    /// Without this, `custom_tool_call_output` (Codex freeform tools, e.g.
+    /// `exec_command`) and `local_shell_call_output` fell through a catch-all
+    /// and vanished, and a `role: "tool"` message was demoted to `user`. The
+    /// upstream then rejected the whole turn:
+    ///
+    /// > The following tool_call_ids did not have response messages:
+    /// > exec_command:0
+    #[test]
+    fn every_tool_exchange_spelling_pairs_call_with_result() {
+        let id = "exec_command:0";
+        let cases: Vec<(&str, Value, Value)> = vec![
+            ("function_call", call_item("function_call", id),
+             json!({"type": "function_call_output", "call_id": id, "output": "hi"})),
+            ("custom_tool_call", call_item("custom_tool_call", id),
+             json!({"type": "custom_tool_call_output", "call_id": id, "output": "hi"})),
+            ("local_shell_call", call_item("local_shell_call", id),
+             json!({"type": "local_shell_call_output", "call_id": id, "output": "hi"})),
+            // A result delivered as a message with role `tool`.
+            ("message role=tool", call_item("function_call", id),
+             json!({"type": "message", "role": "tool", "tool_call_id": id, "content": "hi"})),
+            // An unknown vocabulary, matched on shape alone.
+            ("unknown_tool_call_output", call_item("function_call", id),
+             json!({"type": "some_future_tool_output", "call_id": id, "output": "hi"})),
+            // `computer_call` names its tool only by its type, and its args
+            // live in `action`. Without both fallbacks the call was dropped
+            // while its output survived — an orphan `tool` message, which an
+            // upstream rejects just as surely as an unanswered call.
+            ("computer_call",
+             json!({"type": "computer_call", "call_id": id,
+                    "action": {"type": "screenshot"}}),
+             json!({"type": "computer_call_output", "call_id": id,
+                    "output": {"type": "computer_screenshot"}})),
+        ];
+        for (label, call, result) in cases {
+            let roles = upstream_roles(json!([call, result]));
+            assert_eq!(
+                roles,
+                vec!["assistant+tool_calls".to_string(), "tool".to_string()],
+                "{label}: a tool_calls message must be answered by a tool message, got {roles:?}"
+            );
+        }
+    }
+
+    /// The id must survive under every spelling, or the upstream cannot match
+    /// the result to the call even when both messages are present.
+    #[test]
+    fn the_call_id_survives_translation() {
+        let id = "exec_command:0";
+        let body = json!({"model": "m", "stream": true, "input": [
+            call_item("custom_tool_call", id),
+            json!({"type": "custom_tool_call_output", "call_id": id, "output": "hi"}),
+        ]});
+        let req = parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let (bytes, _) =
+            crate::openai_chat::emit_request(&req, &EmitOptions::new("k3".to_string())).unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["tool_calls"][0]["id"], id);
+        assert_eq!(msgs[0]["tool_calls"][0]["function"]["name"], "exec_command");
+        assert_eq!(msgs[1]["tool_call_id"], id);
+        assert_eq!(msgs[1]["content"], "hi");
+    }
+
+    /// `mcp_call` carries both halves of an exchange in one item, keyed on
+    /// `id` rather than `call_id`, so it was dropped entirely.
+    #[test]
+    fn an_mcp_call_yields_both_halves() {
+        let roles = upstream_roles(json!([
+            {"type": "mcp_call", "id": "m:0", "name": "search",
+             "arguments": "{}", "output": "found", "server_label": "s"}
+        ]));
+        assert_eq!(roles, vec!["assistant+tool_calls".to_string(), "tool".to_string()]);
+    }
+
+    /// A `developer` (or `system`) instruction sent inline in `input` must
+    /// reach every upstream, including the ones that carry the system prompt
+    /// out-of-band.
+    ///
+    /// Anthropic and Gemini build their system field from `req.system` alone,
+    /// and their message mappers skip those roles — so an inline instruction
+    /// reached neither, and vanished with no error at all. That is worse than
+    /// the chat surface's `role 'developer' is not allowed`, which at least
+    /// fails loudly.
+    #[test]
+    fn an_inline_developer_instruction_reaches_every_upstream() {
+        let body = json!({"model":"m","stream":false,"input":[
+            {"type":"message","role":"developer","content":"SENTINEL-INSTRUCTION"},
+            {"type":"message","role":"user","content":"hi"}]});
+        let req = parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let opts = EmitOptions::new("t");
+        for (name, bytes) in [
+            ("anthropic", crate::anthropic::emit_request(&req, &opts).unwrap().0),
+            ("gemini", crate::gemini::emit_request(&req, &opts).unwrap().0),
+            ("openai_chat", crate::openai_chat::emit_request(&req, &opts).unwrap().0),
+            ("openai_responses", crate::openai_responses::emit_request(&req, &opts).unwrap().0),
+        ] {
+            let s = String::from_utf8(bytes).unwrap();
+            assert!(
+                s.contains("SENTINEL-INSTRUCTION"),
+                "{name}: the developer instruction was dropped"
+            );
+        }
+    }
+
+    /// An item with no tool linkage at all is still ignored — the shape
+    /// fallback must not turn arbitrary metadata into a phantom tool message.
+    #[test]
+    fn items_without_tool_linkage_are_ignored() {
+        let roles = upstream_roles(json!([
+            {"type": "reasoning", "summary": []},
+            {"type": "some_future_thing", "note": "no call_id here"},
+            // id + name, but no tool exchange to relay — must not become a
+            // phantom tool call, which is why the shape fallback keys on
+            // `call_id` and never on a bare `id`.
+            {"type": "mcp_approval_request", "id": "a:0", "name": "search"},
+            {"type": "item_reference", "id": "r:0"},
+            {"type": "message", "role": "user", "content": "hi"},
+        ]));
+        assert_eq!(roles, vec!["user".to_string()]);
+    }
+}
+
+

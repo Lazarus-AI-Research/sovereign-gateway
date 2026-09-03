@@ -350,3 +350,28 @@ mod usage_tests {
         assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (7, 3));
     }
 }
+
+impl ChatRequest {
+    /// The system content this turn should actually carry.
+    ///
+    /// System and developer instructions reach the IR two ways: hoisted into
+    /// [`Self::system`] by a surface that has a dedicated field for them, or
+    /// left in [`Self::messages`] as a `System`/`Developer` message by one that
+    /// does not — the Responses `input` array, for instance, where Codex sends
+    /// `{"role": "developer"}` inline.
+    ///
+    /// Upstreams that carry the system prompt out-of-band (Anthropic's `system`,
+    /// Gemini's `systemInstruction`) must consult both, or an inline
+    /// instruction is dropped on the floor: their message mappers skip those
+    /// roles, so anything not gathered here never reaches the model at all —
+    /// silently, with no error to notice.
+    pub fn effective_system(&self) -> Vec<ContentBlock> {
+        let mut out: Vec<ContentBlock> = self.system.clone().unwrap_or_default();
+        for m in &self.messages {
+            if matches!(m.role, Role::System | Role::Developer) {
+                out.extend(m.content.iter().cloned());
+            }
+        }
+        out
+    }
+}
