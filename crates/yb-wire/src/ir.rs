@@ -39,6 +39,23 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop: Vec<String>,
     pub stream: bool,
+    /// The client's `input` array, kept verbatim when the surface was
+    /// Responses — replayed only on a Responses→Responses relay.
+    ///
+    /// The IR models what every provider shares, so a provider-native item has
+    /// nowhere to live in it: `reasoning` (with its `encrypted_content`),
+    /// `web_search_call`, `code_interpreter_call`, `item_reference` and the
+    /// rest are normalized away. Dropping them is right when translating to a
+    /// *different* shape, which cannot act on them — but on a same-shape relay
+    /// the upstream understands them natively, and losing them is pure damage.
+    /// Reasoning items are the sharp case: a reasoning model expects them
+    /// echoed back, and silently dropping them degrades multi-turn quality
+    /// with nothing to notice.
+    ///
+    /// Only the Responses parser sets this, and only the Responses emitter
+    /// reads it; every other surface builds from [`Self::messages`] as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_input: Option<Vec<serde_json::Value>>,
     /// The client asked for token usage on the stream
     /// (`stream_options.include_usage`, OpenAI Chat Completions only).
     ///
@@ -146,7 +163,25 @@ pub enum ContentBlock {
         is_error: bool,
     },
     /// Extended-thinking / reasoning text from the assistant.
-    Thinking { text: String },
+    ///
+    /// `signature` is Anthropic's attestation over the thinking block. It must
+    /// be echoed back on the next turn or extended thinking breaks, so it rides
+    /// with the text rather than being normalized away.
+    Thinking {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// A provider-native block the IR does not model.
+    ///
+    /// The IR describes what providers share; anything only one of them knows
+    /// — Anthropic's `redacted_thinking`, say — has no shared meaning to
+    /// translate into. Dropping it silently corrupts a same-shape relay, and
+    /// refusing to parse it fails the turn outright, so it is carried verbatim
+    /// and tagged with the format that produced it. An emitter replays it only
+    /// when the tag matches its own wire format; every other surface skips it,
+    /// because there is nothing it could faithfully say.
+    Native { format: String, raw: Value },
 }
 
 impl ContentBlock {
@@ -373,5 +408,79 @@ impl ChatRequest {
             }
         }
         out
+    }
+}
+
+
+#[cfg(test)]
+mod passthrough_tests {
+    use crate::{anthropic, openai_chat, openai_responses, EmitOptions};
+    use serde_json::{json, Value};
+
+    fn relay(
+        parse: fn(&[u8]) -> crate::Result<crate::ChatRequest>,
+        emit: fn(&crate::ChatRequest, &EmitOptions) -> crate::Result<(Vec<u8>, Vec<(String, String)>)>,
+        body: Value,
+    ) -> String {
+        let req = parse(&serde_json::to_vec(&body).unwrap()).expect("parses");
+        let (out, _) = emit(&req, &EmitOptions::new("t")).expect("emits");
+        String::from_utf8(out).unwrap()
+    }
+
+    /// A same-shape relay is passthrough: whatever the client sent, the
+    /// upstream that speaks the same dialect must still receive.
+    ///
+    /// Anthropic's thinking `signature` and `redacted_thinking` both have to
+    /// survive or extended thinking breaks on the next turn — and
+    /// `redacted_thinking` did worse than vanish, it failed the parse and took
+    /// the whole request with it.
+    #[test]
+    fn anthropic_to_anthropic_preserves_thinking() {
+        let s = relay(anthropic::parse_request, anthropic::emit_request, json!({
+            "model":"m","max_tokens":16,"messages":[
+              {"role":"assistant","content":[
+                 {"type":"thinking","thinking":"deep","signature":"SIG-BLOB"},
+                 {"type":"redacted_thinking","data":"REDACTED-BLOB"}]},
+              {"role":"user","content":"hi"}]}));
+        assert!(s.contains("SIG-BLOB"), "thinking signature dropped: {s}");
+        assert!(s.contains("REDACTED-BLOB"), "redacted_thinking dropped: {s}");
+    }
+
+    /// An unmodeled Anthropic block must parse, not 400.
+    #[test]
+    fn an_unknown_anthropic_block_does_not_fail_the_request() {
+        let body = json!({"model":"m","max_tokens":16,"messages":[
+            {"role":"user","content":[{"type":"some_future_block","payload":"X"}]}]});
+        let req = anthropic::parse_request(&serde_json::to_vec(&body).unwrap());
+        assert!(req.is_ok(), "an unknown block must not fail the turn: {req:?}");
+    }
+
+    /// Assistant reasoning must round-trip a chat history, as it already does
+    /// on the stream.
+    #[test]
+    fn chat_to_chat_preserves_reasoning() {
+        let s = relay(openai_chat::parse_request, openai_chat::emit_request, json!({
+            "model":"m","messages":[
+              {"role":"assistant","content":"hi","reasoning_content":"REASON-BLOB"},
+              {"role":"user","content":"yo"}]}));
+        assert!(s.contains("REASON-BLOB"), "reasoning_content dropped: {s}");
+    }
+
+    /// The control, and the reason the Native block is tagged: a block only
+    /// Anthropic understands must not be forwarded to a different provider.
+    #[test]
+    fn native_blocks_do_not_leak_across_providers() {
+        let body = json!({"model":"m","max_tokens":16,"messages":[
+            {"role":"assistant","content":[
+               {"type":"redacted_thinking","data":"REDACTED-BLOB"}]}]});
+        let req = anthropic::parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
+        for (name, bytes) in [
+            ("openai_chat", openai_chat::emit_request(&req, &EmitOptions::new("t")).unwrap().0),
+            ("openai_responses",
+             openai_responses::emit_request(&req, &EmitOptions::new("t")).unwrap().0),
+        ] {
+            let s = String::from_utf8(bytes).unwrap();
+            assert!(!s.contains("REDACTED-BLOB"), "{name} received an Anthropic-only block");
+        }
     }
 }

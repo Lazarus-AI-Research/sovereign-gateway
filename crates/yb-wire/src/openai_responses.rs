@@ -35,6 +35,10 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
         req.system = Some(vec![ContentBlock::text(instr)]);
     }
 
+    // Kept verbatim for a same-shape relay; see `ChatRequest::native_input`.
+    if let Some(Value::Array(items)) = v.get("input") {
+        req.native_input = Some(items.clone());
+    }
     match v.get("input") {
         Some(Value::String(s)) => {
             req.messages
@@ -267,10 +271,22 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
         body.insert("instructions".into(), json!(join_text(system)));
     }
 
-    let mut input: Vec<Value> = Vec::new();
-    for m in &req.messages {
-        emit_input_items(m, &mut input)?;
-    }
+    // A Responses→Responses relay forwards the client's `input` untouched, so
+    // provider-native items the IR cannot model — `reasoning` and its
+    // `encrypted_content` above all — reach the upstream that understands
+    // them. Rebuilding from `messages` would silently drop every one.
+    // `instructions` is unaffected: it comes from the request's top-level
+    // field, never from an input item, so there is nothing to duplicate.
+    let input: Vec<Value> = match &req.native_input {
+        Some(items) => items.clone(),
+        None => {
+            let mut out = Vec::new();
+            for m in &req.messages {
+                emit_input_items(m, &mut out)?;
+            }
+            out
+        }
+    };
     body.insert("input".into(), Value::Array(input));
 
     if !req.tools.is_empty() {
@@ -432,7 +448,7 @@ pub fn parse_response(bytes: &[u8]) -> Result<ChatResponse> {
                         })
                         .unwrap_or_default();
                     if !text.is_empty() {
-                        content.push(ContentBlock::Thinking { text });
+                        content.push(ContentBlock::Thinking { text, signature: None });
                     }
                 }
                 _ => {}
@@ -1138,6 +1154,60 @@ mod tool_pairing_tests {
         }
     }
 
+    /// A Responses→Responses relay must forward provider-native items, not
+    /// normalize them away.
+    ///
+    /// The IR has no home for `reasoning` (least of all its
+    /// `encrypted_content`), `web_search_call`, `code_interpreter_call` or
+    /// `item_reference`, so rebuilding the request from `messages` dropped
+    /// every one — silently, and with real cost: a reasoning model expects its
+    /// reasoning items echoed back.
+    #[test]
+    fn a_same_shape_relay_forwards_provider_native_items() {
+        let input = json!([
+            {"type":"message","role":"user","content":"hi"},
+            {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"ENCRYPTED-BLOB"},
+            {"type":"web_search_call","id":"ws_1","status":"completed"},
+            {"type":"code_interpreter_call","id":"ci_1","code":"1+1"},
+            {"type":"item_reference","id":"ir_1"},
+        ]);
+        let body = json!({"model":"m","stream":false,"input":input.clone()});
+        let req = parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let (out, _) = emit_request(&req, &EmitOptions::new("t")).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["input"], input, "the client's input array must survive verbatim");
+        // And `instructions` is not conjured from the inline items.
+        assert!(v.get("instructions").is_none());
+    }
+
+    /// Top-level `instructions` still round-trips, and is not duplicated into
+    /// the replayed `input`.
+    #[test]
+    fn top_level_instructions_survive_a_same_shape_relay() {
+        let body = json!({"model":"m","stream":false,"instructions":"BE-TERSE",
+                          "input":[{"type":"message","role":"user","content":"hi"}]});
+        let req = parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let (out, _) = emit_request(&req, &EmitOptions::new("t")).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["instructions"], "BE-TERSE");
+        assert_eq!(v["input"].as_array().unwrap().len(), 1, "no duplicated instruction item");
+    }
+
+    /// Cross-shape translation still normalizes: a chat upstream cannot act on
+    /// a `reasoning` item, so it must not be forwarded there.
+    #[test]
+    fn a_cross_shape_relay_still_normalizes() {
+        let body = json!({"model":"m","stream":false,"input":[
+            {"type":"message","role":"user","content":"hi"},
+            {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"ENCRYPTED-BLOB"}]});
+        let req = parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let (out, _) =
+            crate::openai_chat::emit_request(&req, &EmitOptions::new("t")).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("ENCRYPTED-BLOB"), "a chat upstream must not receive reasoning items");
+        assert!(s.contains("\"role\":\"user\""));
+    }
+
     /// An item with no tool linkage at all is still ignored — the shape
     /// fallback must not turn arbitrary metadata into a phantom tool message.
     #[test]
@@ -1155,5 +1225,6 @@ mod tool_pairing_tests {
         assert_eq!(roles, vec!["user".to_string()]);
     }
 }
+
 
 

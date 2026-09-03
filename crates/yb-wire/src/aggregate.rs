@@ -76,7 +76,7 @@ impl Aggregator {
     pub fn into_response(self, id: impl Into<String>) -> ChatResponse {
         let mut content = Vec::new();
         if !self.thinking.is_empty() {
-            content.push(ContentBlock::Thinking { text: self.thinking });
+            content.push(ContentBlock::Thinking { text: self.thinking, signature: None });
         }
         if !self.text.is_empty() {
             content.push(ContentBlock::Text { text: self.text });
@@ -126,7 +126,7 @@ pub fn events_from_response(resp: &ChatResponse) -> Vec<StreamEvent> {
 
     for block in &resp.content {
         match block {
-            ContentBlock::Thinking { text } => {
+            ContentBlock::Thinking { text, .. } => {
                 events.push(StreamEvent::ThinkingDelta { text: text.clone() })
             }
             ContentBlock::Text { text } => {

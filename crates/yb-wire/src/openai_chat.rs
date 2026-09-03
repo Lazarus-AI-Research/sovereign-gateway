@@ -214,6 +214,7 @@ fn emit_messages(req: &ChatRequest) -> Result<Vec<Value>> {
 
 fn emit_assistant(m: &Message) -> Result<Value> {
     let mut text = String::new();
+    let mut thinking = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     for b in &m.content {
         match b {
@@ -226,12 +227,17 @@ fn emit_assistant(m: &Message) -> Result<Value> {
                 }));
             }
             // Reasoning has no representation in chat completions; drop it.
-            ContentBlock::Thinking { .. } => {}
+            ContentBlock::Thinking { text: t, .. } => thinking.push_str(t),
             _ => {}
         }
     }
     let mut o = Map::new();
     o.insert("role".into(), json!("assistant"));
+    // Echo the model's own prior reasoning back, as the stream path already
+    // does; a reasoning model that never sees its earlier thinking loses it.
+    if !thinking.is_empty() {
+        o.insert("reasoning_content".into(), json!(thinking));
+    }
     if tool_calls.is_empty() {
         o.insert("content".into(), json!(text));
     } else {
@@ -422,6 +428,16 @@ fn image_from_url(url: &str) -> ContentBlock {
 }
 
 fn parse_assistant(m: &Value) -> Result<Vec<ContentBlock>> {
+    // Reasoning text rides on the assistant message; the stream path already
+    // round-trips it, and a resent history must too or a reasoning model loses
+    // its own prior thinking.
+    let mut pre: Vec<ContentBlock> = Vec::new();
+    if let Some(rc) = opt_str(m, "reasoning_content") {
+        if !rc.is_empty() {
+            pre.push(ContentBlock::Thinking { text: rc.to_string(), signature: None });
+        }
+    }
+
     let mut blocks = Vec::new();
     if let Some(text) = opt_str(m, "content") {
         if !text.is_empty() {
@@ -438,7 +454,9 @@ fn parse_assistant(m: &Value) -> Result<Vec<ContentBlock>> {
             });
         }
     }
-    Ok(blocks)
+    let mut out = pre;
+    out.extend(blocks);
+    Ok(out)
 }
 
 /// Parse a tool-call `arguments` JSON *string* into a value (empty string -> {}).
