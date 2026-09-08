@@ -46,6 +46,35 @@ const FORMATS = ['openai_chat', 'openai_responses', 'anthropic', 'gemini', 'open
 const PERIODS = ['day', 'week', 'month', 'total'];
 const SUBJECTS = ['key', 'user', 'team'];
 
+/**
+ * "~1h ago", with the exact local time on hover.
+ *
+ * Coarse on purpose: a health check's value is "recent or stale", and a
+ * to-the-second reading invites reading precision that isn't there. The
+ * `title` carries the exact instant in the viewer's own timezone, which is
+ * what you actually want when correlating against an incident.
+ */
+const ago = (iso: string): string => {
+  const then = new Date(iso).getTime();
+  if (!isFinite(then)) return '';
+  const secs = Math.max(0, (Date.now() - then) / 1000);
+  if (secs < 45) return 'just now';
+  if (secs < 90) return '~1m ago';
+  const mins = secs / 60;
+  if (mins < 45) return `~${Math.round(mins)}m ago`;
+  const hours = mins / 60;
+  if (hours < 36) return `~${Math.round(hours)}h ago`;
+  return `~${Math.round(hours / 24)}d ago`;
+};
+
+/** The exact instant, in the viewer's timezone, for a tooltip. */
+const exactTime = (iso: string): string => {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return `${d.toLocaleString(undefined, { timeZoneName: 'short' })}  (${tz})`;
+};
+
 const usd = (micros: number) => '$' + (micros / 1e6).toFixed(2);
 const uuid = () => (crypto as any).randomUUID();
 const nowIso = () => new Date().toISOString();
@@ -472,6 +501,33 @@ function ModelName({ model, admin, onRenamed }: { model: any; admin: boolean; on
  * never the key, so an edit that leaves the field blank keeps the stored one
  * rather than blanking it. The placeholder says which of those is happening.
  */
+/**
+ * A deployment's last health result: a coloured bubble and when it was taken.
+ *
+ * Grey means never checked — deliberately distinct from red, because "we have
+ * not looked" and "we looked and it failed" are different facts and collapsing
+ * them would invent a failure. The bubble's tooltip carries the exact local
+ * time, the check that ran, the upstream status and any error detail.
+ */
+function HealthDot({ rec, busy }: { rec: any; busy?: boolean }) {
+  if (busy) return <span class="dot busy" title="checking…">●</span>;
+  if (!rec) return <span class="dot none" title="never checked">●</span>;
+  const bits = [
+    rec.healthy ? 'healthy' : 'unhealthy',
+    `check: ${rec.check_kind}`,
+    rec.status ? `HTTP ${rec.status}` : '',
+    `${rec.latency_ms} ms`,
+    exactTime(rec.checked_at),
+    rec.detail || '',
+  ].filter(Boolean);
+  return (
+    <span class="hstat">
+      <span class={'dot ' + (rec.healthy ? 'ok' : 'bad')} title={bits.join('\n')}>●</span>
+      <span class="mut" title={exactTime(rec.checked_at)}>{ago(rec.checked_at)}</span>
+    </span>
+  );
+}
+
 function Providers({ admin, data, error, reload }: {
   admin: boolean; data: any[] | null; error: string; reload: () => void;
 }) {
@@ -636,6 +692,35 @@ function Models({ admin }: { admin: boolean }) {
   };
   const closeAdd = () => { setShowAdd(false); setFound(null); setPicked({}); setMsg(''); };
   const del = async (id: string) => { if (confirm('Delete this deployment?')) { await api('/deployments/' + id, { method: 'DELETE' }); reload(); reloadModels(); reloadProviders(); } };
+  // Cached results only: opening the page must not call every upstream, which
+  // would cost real tokens on every render.
+  const [{ data: healthData }, reloadHealth] = useAsync<any[]>(() => api('/health/last'));
+  const [checking, setChecking] = useState<Record<string, boolean>>({});
+  const healthFor = (depId: string) => (healthData || []).find((h) => h.deployment_id === depId);
+  const mark = (ids: string[], on: boolean) =>
+    setChecking((s) => { const n = { ...s }; for (const i of ids) { if (on) n[i] = true; else delete n[i]; } return n; });
+  const checkDeployment = async (depId: string) => {
+    mark([depId], true);
+    try { await api('/deployments/' + encodeURIComponent(depId) + '/health', { method: 'POST' }); }
+    catch (e: any) { alert(e.message); }
+    finally { mark([depId], false); reloadHealth(); }
+  };
+  const checkModel = async (model: any) => {
+    const ids = deploymentsFor(model.id).map((d: any) => d.id);
+    if (!ids.length) return;
+    mark(ids, true);
+    try { await api('/models/' + encodeURIComponent(model.id) + '/health', { method: 'POST' }); }
+    catch (e: any) { alert(e.message); }
+    finally { mark(ids, false); reloadHealth(); }
+  };
+  /** A model is healthy only if every deployment behind it is. */
+  const modelHealth = (model: any) => {
+    const recs = deploymentsFor(model.id).map((d: any) => healthFor(d.id));
+    if (!recs.length || recs.some((r: any) => !r)) return null;
+    const worst = recs.find((r: any) => !r.healthy);
+    return worst || recs.reduce((a: any, b: any) =>
+      new Date(a.checked_at) < new Date(b.checked_at) ? a : b);
+  };
   const [{ data: aliasData }, reloadAliases] = useAsync<any[]>(() => api('/aliases'));
   const aliasesFor = (modelId: string) => (aliasData || []).filter((a) => a.model_id === modelId);
   const addAlias = async (target: string) => {
@@ -661,13 +746,17 @@ function Models({ admin }: { admin: boolean }) {
           : (
             <div class="tablewrap">
               <table style="margin-top:10px">
-                <thead><tr><th>provider</th><th>upstream_model</th><th>format</th><th>api_base</th>{admin && <th></th>}</tr></thead>
+                <thead><tr><th>provider</th><th>upstream_model</th><th>format</th><th>api_base</th><th>health</th>{admin && <th></th>}</tr></thead>
                 {modelData.map((model) => (
                   <tbody key={model.id}>
                     <tr class="grp">
-                      <td colSpan={admin ? 5 : 4}>
+                      <td colSpan={admin ? 6 : 5}>
                         <div class="pills">
                           <ModelName model={model} admin={admin} onRenamed={afterRename} />
+                          <HealthDot rec={modelHealth(model)}
+                                     busy={deploymentsFor(model.id).some((d: any) => checking[d.id])} />
+                          {admin && !!deploymentsFor(model.id).length &&
+                            <a class="link" style="font-size:12px" onClick={() => checkModel(model)}>check</a>}
                           {aliasesFor(model.id).map((a) => (
                             <span key={a.alias} class="pill mono">{a.alias}{admin && <a class="x" title="Remove alias" onClick={() => delAlias(a.alias)}>×</a>}</span>
                           ))}
@@ -681,11 +770,18 @@ function Models({ admin }: { admin: boolean }) {
                         <td class="mono nowrap">{m.upstream_model}</td>
                         <td><span class="pill">{m.upstream_format}</span></td>
                         <td class="mono mut">{m.api_base || <span class="mut">format default</span>}</td>
+                        <td>
+                          <div class="row" style="gap:8px">
+                            <HealthDot rec={healthFor(m.id)} busy={checking[m.id]} />
+                            {admin && <a class="link" style="font-size:12px"
+                                         onClick={() => checkDeployment(m.id)}>check</a>}
+                          </div>
+                        </td>
                         {admin && <td><button class="ghost del" onClick={() => del(m.id)}>delete</button></td>}
                       </tr>
                     ))}
                     {!deploymentsFor(model.id).length && (
-                      <tr><td colSpan={admin ? 5 : 4} class="mut" style="padding-left:18px">
+                      <tr><td colSpan={admin ? 6 : 5} class="mut" style="padding-left:18px">
                         no deployments — this model is not routable
                       </td></tr>
                     )}
@@ -987,7 +1083,7 @@ function Keys({ admin }: { admin: boolean }) {
               })()}</td>
               <td class="row"><button class="ghost" onClick={() => setEditing(editing === k.id ? '' : k.id)}>access</button><button class="ghost del" onClick={() => del(k.id)}>revoke</button></td>
             </tr>
-            {editing === k.id && <tr><td colSpan={admin ? 5 : 4}><AccessEditor key={k.id} value={k.access || {}} onSave={(p) => saveAccess(k.id, p)} /></td></tr>}
+            {editing === k.id && <tr><td colSpan={admin ? 6 : 5}><AccessEditor key={k.id} value={k.access || {}} onSave={(p) => saveAccess(k.id, p)} /></td></tr>}
           </Fragment>
         ))}</tbody>
       </table>

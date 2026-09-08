@@ -42,6 +42,19 @@ pub struct HealthReport {
 
 impl Gateway {
     /// Run the configured health check for one deployment.
+    /// Check `dep`, forcing a live 1-token probe regardless of its configured
+    /// method.
+    ///
+    /// The configured check is what runs unattended; `none` is the default, so
+    /// an operator clicking "check" on an ordinary deployment would otherwise
+    /// get "no health check configured" — a non-answer. An explicit click
+    /// means "actually call the model", so it does.
+    pub async fn probe_deployment(&self, dep: &DeploymentRecord) -> HealthReport {
+        let mut forced = dep.clone();
+        forced.health_check = HealthCheck::Probe;
+        self.check_deployment(&forced).await
+    }
+
     pub async fn check_deployment(&self, dep: &DeploymentRecord) -> HealthReport {
         let started = Instant::now();
         let mut report = HealthReport {

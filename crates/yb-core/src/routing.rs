@@ -173,6 +173,23 @@ pub struct ModelRecord {
     pub updated_at: crate::ids::Timestamp,
 }
 
+/// The last health-check result recorded for a deployment.
+///
+/// Cached so the console can colour a status bubble on load without calling
+/// every upstream — an on-demand check is an explicit click, not a page render.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthRecord {
+    pub deployment_id: crate::ids::Id,
+    pub healthy: bool,
+    /// Which check produced this (`probe`, `http_ok`, …), so the console can
+    /// say what was actually measured rather than implying a live call.
+    pub check_kind: String,
+    pub status: Option<u16>,
+    pub latency_ms: u64,
+    pub detail: Option<String>,
+    pub checked_at: crate::ids::Timestamp,
+}
+
 /// A provider: one upstream endpoint, its credentials, and the deployments
 /// served through it.
 ///

@@ -69,6 +69,8 @@ pub fn router() -> Router<AppState> {
         .route("/deployments/health", get(health_all_models))
         .route("/deployments/:id", delete(delete_deployment))
         .route("/deployments/:id/health", post(health_one_model))
+        .route("/models/:id/health", post(health_model))
+        .route("/health/last", get(last_health))
         // providers (an endpoint, its credentials, its deployments)
         .route("/providers", get(list_providers).post(create_provider))
         .route("/providers/:id", put(update_provider).delete(delete_provider))
@@ -1396,7 +1398,69 @@ async fn health_one_model(
         Ok(None) => return error_response(&Error::NotFound("deployment".into())),
         Err(e) => return error_response(&e),
     };
-    Json(state.gateway.check_deployment(&dep).await).into_response()
+    // An explicit click means "call the model", not "run whatever passive
+    // check happens to be configured" — which for most deployments is none.
+    let report = state.gateway.probe_deployment(&dep).await;
+    remember(&state, &report).await;
+    Json(report).into_response()
+}
+
+/// Persist a check result so the console can colour a bubble without calling
+/// the upstream again.
+async fn remember(state: &AppState, r: &yb_gateway::HealthReport) {
+    let rec = yb_core::HealthRecord {
+        deployment_id: r.deployment_id.clone(),
+        healthy: r.healthy,
+        check_kind: r.check.to_string(),
+        status: r.status,
+        latency_ms: r.latency_ms,
+        detail: r.detail.clone(),
+        checked_at: now(),
+    };
+    if let Err(e) = state.store.record_health(&rec).await {
+        // A check that ran is still a useful answer; only the cache is lost.
+        tracing::warn!(error = %e, deployment = %r.deployment_id, "recording health failed");
+    }
+}
+
+/// `GET /health/last` — the last recorded result per deployment (member+).
+///
+/// Deliberately reads only what is stored: a page load must not fan out to
+/// every upstream, which would make opening the console cost real tokens.
+async fn last_health(principal: Principal, State(state): State<AppState>) -> Response {
+    if let Err(r) = authz(&principal, Action::ReadCatalog) {
+        return r;
+    }
+    respond(state.store.list_health().await)
+}
+
+/// `POST /models/:id/health` — probe every live deployment of one model.
+///
+/// A model is only as healthy as the deployments behind it, so this reports
+/// each one rather than collapsing them; the console rolls them up.
+async fn health_model(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authz(&principal, Action::ReadCatalog) {
+        return r;
+    }
+    let deps = match state.store.list_deployments().await {
+        Ok(d) => d,
+        Err(e) => return error_response(&e),
+    };
+    let mine: Vec<_> = deps.into_iter().filter(|d| d.model_id == id).collect();
+    if mine.is_empty() {
+        return error_response(&Error::NotFound("model has no deployments".into()));
+    }
+    let mut out = Vec::new();
+    for d in &mine {
+        let r = state.gateway.probe_deployment(d).await;
+        remember(&state, &r).await;
+        out.push(r);
+    }
+    respond(Ok(out))
 }
 
 // ---- model aliases -------------------------------------------------------

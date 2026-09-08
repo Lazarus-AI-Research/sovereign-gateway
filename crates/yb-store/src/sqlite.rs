@@ -18,7 +18,7 @@ use yb_core::model::{
     TelemetryRecord, User,
 };
 use yb_core::principal::KeyAuth;
-use yb_core::routing::{DeploymentRecord, ModelRecord, NewDeployment, ProviderRecord};
+use yb_core::routing::{DeploymentRecord, HealthRecord, ModelRecord, NewDeployment, ProviderRecord};
 use yb_core::spend::{Budget, BudgetAction, Period, RollupDelta, SpendRow, SubjectType};
 use yb_core::{new_id, now, Error, LimitColumns, Micros, Result, Store, Timestamp};
 
@@ -1267,6 +1267,55 @@ impl Store for SqliteStore {
         }
         self.create_deployment(dep).await?;
         Ok(true)
+    }
+
+    // ---- health (last observed state per deployment) -------------------
+    async fn list_health(&self) -> Result<Vec<HealthRecord>> {
+        let rows = sqlx::query(
+            "SELECT deployment_id, healthy, check_kind, status, latency_ms, detail, checked_at \
+             FROM deployment_health",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        rows.iter()
+            .map(|r| {
+                let status: Option<i64> = r.get("status");
+                let latency: i64 = r.get("latency_ms");
+                Ok(HealthRecord {
+                    deployment_id: r.get("deployment_id"),
+                    healthy: r.get::<i64, _>("healthy") != 0,
+                    check_kind: r.get("check_kind"),
+                    status: status.map(|s| s as u16),
+                    latency_ms: latency.max(0) as u64,
+                    detail: r.get("detail"),
+                    checked_at: parse_ts(&r.get::<String, _>("checked_at"))?,
+                })
+            })
+            .collect()
+    }
+
+    async fn record_health(&self, rec: &HealthRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO deployment_health \
+             (deployment_id, healthy, check_kind, status, latency_ms, detail, checked_at) \
+             VALUES (?,?,?,?,?,?,?) \
+             ON CONFLICT(deployment_id) DO UPDATE SET \
+               healthy = excluded.healthy, check_kind = excluded.check_kind, \
+               status = excluded.status, latency_ms = excluded.latency_ms, \
+               detail = excluded.detail, checked_at = excluded.checked_at",
+        )
+        .bind(&rec.deployment_id)
+        .bind(i64::from(rec.healthy))
+        .bind(&rec.check_kind)
+        .bind(rec.status.map(i64::from))
+        .bind(rec.latency_ms as i64)
+        .bind(&rec.detail)
+        .bind(ts(&rec.checked_at))
+        .execute(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        Ok(())
     }
 
     // ---- model aliases (extra public name -> model) --------------------
