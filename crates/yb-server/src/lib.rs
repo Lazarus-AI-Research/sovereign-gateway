@@ -21,7 +21,7 @@ pub mod state;
 pub mod ui;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -95,7 +95,15 @@ pub fn build_router(state: AppState) -> Router {
             .fallback(spa_fallback);
     }
 
-    router.with_state(state)
+    // A proxy should not be the thing that decides a turn is too big. The
+    // framework's own default is 2 MiB, which a real request passes easily — a
+    // long conversation, a large system prompt, a couple of base64 images — and
+    // the caller gets a bare `413 Failed to buffer the request body` that says
+    // nothing about size. 100 MiB matches what the upstream APIs accept, so the
+    // limit that applies is theirs rather than one we invented.
+    router
+        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
+        .with_state(state)
 }
 
 /// Fallback: 404 (JSON) for unmatched API paths, otherwise the SPA shell so
