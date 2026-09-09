@@ -13,7 +13,7 @@ use crate::model::{
     TelemetryRecord, User,
 };
 use crate::principal::KeyAuth;
-use crate::routing::{DeploymentRecord, ModelRecord, NewDeployment, ProviderRecord};
+use crate::routing::{DeploymentRecord, HealthRecord, ModelRecord, NewDeployment, ProviderRecord};
 use crate::spend::{Budget, Period, RollupDelta, SpendRow, SubjectType};
 use async_trait::async_trait;
 
@@ -165,6 +165,12 @@ pub trait Store: Send + Sync {
     /// Idempotently seed a deployment by its identity tuple (model + provider +
     /// upstream model + api base). Returns `true` if a new row was inserted.
     async fn seed_deployment(&self, dep: &NewDeployment) -> crate::Result<bool>;
+
+    // ---- health (last observed state per deployment) -------------------
+    /// Every recorded result, for the console's status bubbles.
+    async fn list_health(&self) -> crate::Result<Vec<HealthRecord>>;
+    /// Record the outcome of a check, replacing any previous result.
+    async fn record_health(&self, rec: &HealthRecord) -> crate::Result<()>;
 
     // ---- model aliases (extra public name -> model) --------------------
     /// All aliases, each carrying its model's **current** canonical name in

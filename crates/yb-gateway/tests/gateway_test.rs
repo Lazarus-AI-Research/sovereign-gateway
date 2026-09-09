@@ -238,6 +238,12 @@ impl Store for RecordingStore {
     async fn seed_deployment(&self, _dep: &yb_core::NewDeployment) -> Result<bool> {
         Ok(true)
     }
+    async fn list_health(&self) -> Result<Vec<yb_core::HealthRecord>> {
+        Ok(vec![])
+    }
+    async fn record_health(&self, _rec: &yb_core::HealthRecord) -> Result<()> {
+        Ok(())
+    }
     async fn list_providers(&self) -> Result<Vec<yb_core::ProviderRecord>> {
         Ok(vec![])
     }

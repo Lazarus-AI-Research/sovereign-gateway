@@ -49,6 +49,13 @@
   .pills { display:flex; flex-wrap:wrap; align-items:center; gap:5px; }
   .nowrap { white-space:nowrap; }
   .tablewrap { overflow-x:auto; }
+  /* Health bubbles. Grey is "never checked", which is not a failure. */
+  .hstat { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; }
+  .dot { font-size:11px; line-height:1; cursor:default; }
+  .dot.ok { color:var(--ok); }
+  .dot.bad { color:var(--bad); }
+  .dot.none { color:var(--line); }
+  .dot.busy { color:var(--acc); }
   /* Model group header: one row per model, its deployments listed beneath. */
   tr.grp > td { background:var(--panel2); border-top:1px solid var(--line); padding:9px 10px; }
   .pencil { margin-left:2px; cursor:pointer; opacity:.45; font-size:12px; text-decoration:none; }
