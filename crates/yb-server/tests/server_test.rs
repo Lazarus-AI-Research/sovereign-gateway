@@ -237,6 +237,28 @@ async fn x_gateway_key_header_authenticates() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// Google's own clients send the key in `x-goog-api-key`; the Gemini surface
+/// accepts it as the others accept theirs.
+#[tokio::test]
+async fn x_goog_api_key_header_authenticates() {
+    let (state, token) = setup().await;
+    let app = build_router(state);
+    let body = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1beta/models/my-model:generateContent")
+                .header("content-type", "application/json")
+                .header("x-goog-api-key", token)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 // ---------------------------------------------------------------------------
 // Pluggable admin auth: the `sso` provider (direct code flow) against a mock IdP
 // ---------------------------------------------------------------------------
