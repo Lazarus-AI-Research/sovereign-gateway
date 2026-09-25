@@ -104,8 +104,43 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
     }
     req.prompt_cache_key = opt_str(&v, "prompt_cache_key").map(str::to_string);
     req.prompt_cache_retention = opt_str(&v, "prompt_cache_retention").map(str::to_string);
+    req.native_request = v.as_object().cloned();
 
     Ok(req)
+}
+
+/// A same-shape request: the client's own body with the deployment's model,
+/// the streaming the gateway asked for, and any forced reasoning effort.
+fn emit_native_request(
+    native: &Map<String, Value>,
+    model: String,
+    opts: &EmitOptions,
+) -> Result<EmittedRequest> {
+    let mut body = native.clone();
+    body.insert("model".into(), json!(model));
+    if opts.stream {
+        body.insert("stream".into(), json!(true));
+        // The gateway needs the counts whatever the client asked for; the
+        // surface still relays usage only when the client wanted it.
+        let options = body.entry("stream_options").or_insert_with(|| json!({}));
+        match options.as_object_mut() {
+            Some(options) => {
+                options.insert("include_usage".into(), json!(true));
+            }
+            None => *options = json!({"include_usage": true}),
+        }
+    } else {
+        body.remove("stream");
+        body.remove("stream_options");
+    }
+    if let Some(effort) = &opts.force_reasoning_effort {
+        body.insert("reasoning_effort".into(), json!(effort));
+    }
+    let bytes = serde_json::to_vec(&Value::Object(body))?;
+    Ok((
+        bytes,
+        vec![("content-type".to_string(), "application/json".to_string())],
+    ))
 }
 
 /// Emit an IR request as an OpenAI Chat Completions request body plus headers.
@@ -116,6 +151,9 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     } else {
         opts.target_model.clone()
     };
+    if let Some(native) = &req.native_request {
+        return emit_native_request(native, model, opts);
+    }
     body.insert("model".into(), json!(model));
     body.insert("messages".into(), Value::Array(emit_messages(req)?));
 
@@ -346,10 +384,12 @@ pub fn parse_response(bytes: &[u8]) -> Result<ChatResponse> {
 /// Emit an IR response as an OpenAI Chat Completions response body.
 pub fn emit_response(resp: &ChatResponse) -> Result<Vec<u8>> {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     for b in &resp.content {
         match b {
             ContentBlock::Text { text: t } => text.push_str(t),
+            ContentBlock::Thinking { text: t, .. } => reasoning.push_str(t),
             ContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                 "id": id,
                 "type": "function",
@@ -370,6 +410,11 @@ pub fn emit_response(resp: &ChatResponse) -> Result<Vec<u8>> {
     );
     if !tool_calls.is_empty() {
         message.insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+    // The stream relays reasoning as `reasoning_content` deltas; a
+    // non-streaming answer carries the same text, or it is lost.
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".into(), json!(reasoning));
     }
 
     let u = &resp.usage;

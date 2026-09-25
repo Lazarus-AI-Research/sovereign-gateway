@@ -56,6 +56,23 @@ pub struct ChatRequest {
     /// reads it; every other surface builds from [`Self::messages`] as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_input: Option<Vec<serde_json::Value>>,
+    /// The client's whole request object, kept verbatim when the surface was
+    /// OpenAI Chat Completions — replayed only on a Chat→Chat relay.
+    ///
+    /// The IR carries what every provider shares, so the fields only an
+    /// OpenAI-compatible server acts on (`response_format`, `seed`, `n`, the
+    /// penalties, `logprobs`, `logit_bias`, `user`, `parallel_tool_calls`) and
+    /// the engine extensions a local server takes (`top_k`,
+    /// `repetition_penalty`, `chat_template_kwargs`, guided decoding) have no
+    /// place in it. A structured-output client that loses `response_format`
+    /// gets prose back with nothing to notice, so a same-shape relay forwards
+    /// the request as it came, changing only the model and the streaming the
+    /// gateway needs.
+    ///
+    /// Only the Chat Completions parser sets this, and only its emitter reads
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_request: Option<Map<String, Value>>,
     /// The client asked for token usage on the stream
     /// (`stream_options.include_usage`, OpenAI Chat Completions only).
     ///
@@ -525,5 +542,80 @@ mod passthrough_tests {
                 "{name} received an Anthropic-only block"
             );
         }
+    }
+
+    /// A Chat→Chat relay forwards what only an OpenAI-compatible server acts
+    /// on — structured output, sampling controls, engine extensions — changing
+    /// only the model and asking for the usage the gateway bills from.
+    #[test]
+    fn chat_to_chat_relay_keeps_every_field() {
+        let body = json!({
+            "model": "assistant", "stream": false,
+            "messages": [{"role": "user", "content": "hi", "name": "sam"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": {}}},
+            "seed": 7, "n": 1, "presence_penalty": 0.5, "frequency_penalty": 0.25,
+            "logprobs": true, "logit_bias": {"42": -100}, "user": "sam",
+            "parallel_tool_calls": false, "top_k": 20, "repetition_penalty": 1.1,
+            "chat_template_kwargs": {"enable_thinking": false}
+        });
+        let req = openai_chat::parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let opts = EmitOptions {
+            stream: true,
+            ..EmitOptions::new("upstream-model")
+        };
+        let sent: Value =
+            serde_json::from_slice(&openai_chat::emit_request(&req, &opts).unwrap().0).unwrap();
+        assert_eq!(sent["model"], "upstream-model");
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["stream_options"]["include_usage"], true);
+        for field in [
+            "response_format",
+            "seed",
+            "n",
+            "presence_penalty",
+            "frequency_penalty",
+            "logprobs",
+            "logit_bias",
+            "user",
+            "parallel_tool_calls",
+            "top_k",
+            "repetition_penalty",
+            "chat_template_kwargs",
+            "messages",
+        ] {
+            assert_eq!(
+                sent[field], body[field],
+                "{field} must reach the upstream unchanged"
+            );
+        }
+    }
+
+    /// A non-streaming answer carries the model's reasoning as the stream does.
+    #[test]
+    fn a_non_streaming_answer_keeps_its_reasoning() {
+        let response = crate::ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            content: vec![
+                crate::ContentBlock::Thinking {
+                    text: "weighing it".into(),
+                    signature: None,
+                },
+                crate::ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            stop_reason: crate::StopReason::EndTurn,
+            usage: crate::Usage::default(),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+        let body: Value =
+            serde_json::from_slice(&openai_chat::emit_response(&response).unwrap()).unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["reasoning_content"],
+            "weighing it"
+        );
+        assert_eq!(body["choices"][0]["message"]["content"], "answer");
     }
 }
