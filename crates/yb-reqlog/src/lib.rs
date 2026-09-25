@@ -167,7 +167,9 @@ impl DuckLogger {
             }
             Err(_) => {
                 let _ = handle.join();
-                Err(Error::Internal("reqlog: worker exited during startup".into()))
+                Err(Error::Internal(
+                    "reqlog: worker exited during startup".into(),
+                ))
             }
         }
     }
@@ -351,7 +353,9 @@ impl Worker {
         }
         let records = std::mem::take(&mut self.buf);
 
-        self.conn.execute_batch("BEGIN TRANSACTION").map_err(map_db)?;
+        self.conn
+            .execute_batch("BEGIN TRANSACTION")
+            .map_err(map_db)?;
         let insert = (|| -> Result<()> {
             let mut stmt = self.conn.prepare(INSERT_TURN).map_err(map_db)?;
             let max = self.cfg.max_body_bytes;
@@ -428,7 +432,9 @@ impl Worker {
 
     /// Current size of `wal.duckdb` in bytes (0 if it cannot be stat'd).
     fn wal_size(&self) -> u64 {
-        std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&self.db_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
     }
 
     /// Flush, write a compressed Parquet shard if `turns` is non-empty, truncate
@@ -481,7 +487,11 @@ impl Worker {
             .replace("{shard}", &shard.to_string_lossy())
             .replace("{dir}", &self.cfg.dir.to_string_lossy());
 
-        match std::process::Command::new("sh").arg("-c").arg(&script).status() {
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+        {
             Ok(s) if s.success() => {
                 tracing::info!(shard = %shard.display(), "reqlog: roll hook ok")
             }
@@ -602,7 +612,11 @@ mod tests {
         logger.force_rotate().unwrap();
 
         // WAL buffer is emptied by rotation.
-        assert_eq!(logger.turns_count().unwrap(), 0, "turns truncated after rotate");
+        assert_eq!(
+            logger.turns_count().unwrap(),
+            0,
+            "turns truncated after rotate"
+        );
 
         // Exactly one compressed Parquet shard was written.
         let shards: Vec<_> = std::fs::read_dir(dir.join("shards"))
@@ -644,8 +658,14 @@ mod tests {
 
         let recorded = std::fs::read_to_string(&marker)
             .expect("roll hook should have written the marker file");
-        assert!(recorded.ends_with(".parquet"), "hook got the shard path: {recorded}");
-        assert!(std::path::Path::new(&recorded).exists(), "the shard the hook named exists");
+        assert!(
+            recorded.ends_with(".parquet"),
+            "hook got the shard path: {recorded}"
+        );
+        assert!(
+            std::path::Path::new(&recorded).exists(),
+            "the shard the hook named exists"
+        );
 
         logger.shutdown().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

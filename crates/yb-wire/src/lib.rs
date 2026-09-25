@@ -17,26 +17,28 @@
 //! **not** depend on `yb-core`. At the gateway boundary a [`WireError`] is
 //! mapped onto `yb_core::Error::Wire`.
 
-pub mod anthropic;
-pub mod embed;
 mod aggregate;
+pub mod anthropic;
 mod common;
+pub mod embed;
 pub mod error;
 pub mod gemini;
 pub mod ir;
+pub mod media;
 pub mod openai_chat;
 pub mod openai_responses;
 
 pub use aggregate::{events_from_response, Aggregator};
-pub use error::{Result, WireError};
 pub use embed::{
     EmbedEmitOptions, EmbedInput, EmbedPart, EmbedRequest, EmbedResponse, EmbedUsage,
     EncodingFormat,
 };
+pub use error::{Result, WireError};
 pub use ir::{
     ChatRequest, ChatResponse, ContentBlock, Message, Reasoning, Role, StopReason, StreamEvent,
     Tool, ToolChoice, Usage,
 };
+pub use media::{route_media_request, MediaRequest};
 
 /// An emitted upstream request: the serialized body plus the format-specific
 /// headers (`content-type`, `anthropic-version`, …) the caller should send.

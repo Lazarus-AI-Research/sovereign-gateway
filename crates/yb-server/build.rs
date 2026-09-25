@@ -18,7 +18,10 @@ fn main() {
 
     // Rebuild the bundle whenever the TSX sources or tsconfig change.
     println!("cargo:rerun-if-changed={}", frontend.join("src").display());
-    println!("cargo:rerun-if-changed={}", frontend.join("tsconfig.json").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        frontend.join("tsconfig.json").display()
+    );
 
     let options = BundlerOptions {
         input: Some(vec![InputItem {

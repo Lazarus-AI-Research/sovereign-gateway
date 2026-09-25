@@ -82,7 +82,11 @@ pub fn parse_response(body: &[u8]) -> Result<EmbedResponse> {
         .iter()
         .map(|row| {
             row.as_array()
-                .map(|nums| nums.iter().map(|n| n.as_f64().unwrap_or(0.0) as f32).collect())
+                .map(|nums| {
+                    nums.iter()
+                        .map(|n| n.as_f64().unwrap_or(0.0) as f32)
+                        .collect()
+                })
                 .unwrap_or_default()
         })
         .collect();

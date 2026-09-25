@@ -18,8 +18,10 @@ use yb_core::model::{
     TelemetryRecord, User,
 };
 use yb_core::principal::KeyAuth;
-use yb_core::routing::{DeploymentRecord, HealthRecord, ModelRecord, NewDeployment, ProviderRecord};
-use yb_core::spend::{Budget, BudgetAction, Period, RollupDelta, SpendRow, SubjectType};
+use yb_core::routing::{
+    DeploymentRecord, HealthRecord, ModelRecord, NewDeployment, ProviderRecord,
+};
+use yb_core::spend::{Budget, BudgetAction, Period, RollupDelta, SpendRow, SubjectType, UsageRow};
 use yb_core::{new_id, now, Error, LimitColumns, Micros, Result, Store, Timestamp};
 
 use crate::common::{dec_access, enc_access, parse_ts, parse_ts_opt, storage_err};
@@ -90,7 +92,8 @@ fn dec_extra(raw: Option<String>) -> yb_core::Extra {
 
 /// Encode optional pricing as JSON text (`None` → SQL NULL).
 fn enc_pricing(p: &Option<yb_core::catalog::ModelPrice>) -> Option<String> {
-    p.as_ref().map(|p| serde_json::to_string(p).unwrap_or_default())
+    p.as_ref()
+        .map(|p| serde_json::to_string(p).unwrap_or_default())
 }
 
 /// Map a `providers` row to a [`ProviderRecord`].
@@ -264,7 +267,8 @@ fn map_budget(r: &SqliteRow) -> Result<Budget> {
     Ok(Budget {
         id: r.try_get("id").map_err(storage_err)?,
         subject_type: SubjectType::parse(
-            &r.try_get::<String, _>("subject_type").map_err(storage_err)?,
+            &r.try_get::<String, _>("subject_type")
+                .map_err(storage_err)?,
         )?,
         subject_id: r.try_get("subject_id").map_err(storage_err)?,
         period: Period::parse(&r.try_get::<String, _>("period").map_err(storage_err)?)?,
@@ -283,7 +287,10 @@ fn map_spend_row(r: &SqliteRow) -> Result<SpendRow> {
         subject_type: r.try_get("subject_type").map_err(storage_err)?,
         subject_id: r.try_get("subject_id").map_err(storage_err)?,
         period: r.try_get("period").map_err(storage_err)?,
-        period_start: parse_ts(&r.try_get::<String, _>("period_start").map_err(storage_err)?)?,
+        period_start: parse_ts(
+            &r.try_get::<String, _>("period_start")
+                .map_err(storage_err)?,
+        )?,
         spend_micros: r.try_get("spend_micros").map_err(storage_err)?,
         request_count: r.try_get("request_count").map_err(storage_err)?,
         input_tokens: r.try_get("input_tokens").map_err(storage_err)?,
@@ -428,12 +435,10 @@ impl Store for SqliteStore {
     }
 
     async fn count_admins(&self) -> Result<i64> {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(storage_err)
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage_err)
     }
 
     // ---- web sessions (cookie token → user) ---------------------------
@@ -594,6 +599,16 @@ impl Store for SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(storage_err)?;
+        Ok(())
+    }
+
+    async fn rename_api_key(&self, id: &str, name: Option<&str>) -> Result<()> {
+        sqlx::query("UPDATE api_keys SET name = ? WHERE id = ?")
+            .bind(name)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(storage_err)?;
         Ok(())
     }
 
@@ -807,6 +822,8 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    // Spend is rolled up by day only; a week, month or total is the sum of
+    // the days since the period began.
     async fn period_spend(
         &self,
         subject_type: SubjectType,
@@ -815,20 +832,16 @@ impl Store for SqliteStore {
         period_start: Timestamp,
     ) -> Result<Micros> {
         let row = sqlx::query(
-            "SELECT spend_micros FROM spend_rollup \
-             WHERE subject_type = ? AND subject_id = ? AND period = ? AND period_start = ?",
+            "SELECT COALESCE(SUM(spend_micros), 0) AS spend_micros FROM spend_rollup \
+             WHERE subject_type = ? AND subject_id = ? AND period = 'day' AND period_start >= ?",
         )
         .bind(subject_type.as_str())
         .bind(subject_id)
-        .bind(period.as_str())
-        .bind(ts(&period_start))
-        .fetch_optional(&self.pool)
+        .bind(ts(&period.bucket_start(period_start)))
+        .fetch_one(&self.pool)
         .await
         .map_err(storage_err)?;
-        match row {
-            Some(r) => r.try_get("spend_micros").map_err(storage_err),
-            None => Ok(0),
-        }
+        row.try_get("spend_micros").map_err(storage_err)
     }
 
     async fn list_budgets(
@@ -911,6 +924,39 @@ impl Store for SqliteStore {
         .await
         .map_err(storage_err)?;
         rows.iter().map(map_spend_row).collect()
+    }
+
+    async fn usage(&self, from: Timestamp, to: Timestamp) -> Result<Vec<UsageRow>> {
+        let rows = sqlx::query(
+            "SELECT substr(created_at, 1, 10) AS day, api_key_id, user_id, requested_model, surface, \
+                    COUNT(*) AS requests, SUM(is_error) AS errors, \
+                    SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, \
+                    SUM(cost_micros) AS cost_micros \
+             FROM request_telemetry WHERE created_at >= ? AND created_at < ? \
+             GROUP BY 1, api_key_id, user_id, requested_model, surface \
+             ORDER BY 1, api_key_id, requested_model",
+        )
+        .bind(ts(&from))
+        .bind(ts(&to))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        rows.iter()
+            .map(|row| {
+                Ok(UsageRow {
+                    day: row.try_get("day").map_err(storage_err)?,
+                    api_key_id: row.try_get("api_key_id").map_err(storage_err)?,
+                    user_id: row.try_get("user_id").map_err(storage_err)?,
+                    model: row.try_get("requested_model").map_err(storage_err)?,
+                    surface: row.try_get("surface").map_err(storage_err)?,
+                    requests: row.try_get("requests").map_err(storage_err)?,
+                    errors: row.try_get("errors").map_err(storage_err)?,
+                    input_tokens: row.try_get("input_tokens").map_err(storage_err)?,
+                    output_tokens: row.try_get("output_tokens").map_err(storage_err)?,
+                    cost_micros: row.try_get("cost_micros").map_err(storage_err)?,
+                })
+            })
+            .collect()
     }
 
     // ---- rate-limit counters ------------------------------------------
@@ -1029,7 +1075,9 @@ impl Store for SqliteStore {
             .await
             .map_err(storage_err)?;
         if taken.is_some() {
-            return Err(Error::Conflict(format!("model \"{new_name}\" already exists")));
+            return Err(Error::Conflict(format!(
+                "model \"{new_name}\" already exists"
+            )));
         }
 
         // ...nor to another model's alias. An alias of *this* model is consumed
@@ -1085,28 +1133,34 @@ impl Store for SqliteStore {
 
     // ---- providers (an endpoint, its credentials, its deployments) -----
     async fn list_providers(&self) -> Result<Vec<ProviderRecord>> {
-        let rows = sqlx::query(&format!("SELECT {PROVIDER_COLS} FROM providers ORDER BY name"))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage_err)?;
+        let rows = sqlx::query(&format!(
+            "SELECT {PROVIDER_COLS} FROM providers ORDER BY name"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_err)?;
         rows.iter().map(map_provider).collect()
     }
 
     async fn get_provider(&self, id: &str) -> Result<Option<ProviderRecord>> {
-        let row = sqlx::query(&format!("SELECT {PROVIDER_COLS} FROM providers WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(storage_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {PROVIDER_COLS} FROM providers WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_err)?;
         row.as_ref().map(map_provider).transpose()
     }
 
     async fn get_provider_by_name(&self, name: &str) -> Result<Option<ProviderRecord>> {
-        let row = sqlx::query(&format!("SELECT {PROVIDER_COLS} FROM providers WHERE name = ?"))
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(storage_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {PROVIDER_COLS} FROM providers WHERE name = ?"
+        ))
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_err)?;
         row.as_ref().map(map_provider).transpose()
     }
 
@@ -1142,7 +1196,9 @@ impl Store for SqliteStore {
             .await
             .map_err(storage_err)?;
         if taken.is_some() {
-            return Err(Error::Conflict(format!("provider \"{name}\" already exists")));
+            return Err(Error::Conflict(format!(
+                "provider \"{name}\" already exists"
+            )));
         }
         // `api_key = NULL` means "leave it alone": the admin API never reads a
         // key back out, so an edit round-trip must not blank one by omission.
@@ -1165,13 +1221,12 @@ impl Store for SqliteStore {
     }
 
     async fn delete_provider(&self, id: &str) -> Result<()> {
-        let in_use = sqlx::query(
-            "SELECT 1 FROM deployments WHERE provider_id = ? AND deleted_at IS NULL",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage_err)?;
+        let in_use =
+            sqlx::query("SELECT 1 FROM deployments WHERE provider_id = ? AND deleted_at IS NULL")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(storage_err)?;
         if in_use.is_some() {
             return Err(Error::Conflict(
                 "provider still has deployments; delete them first".into(),

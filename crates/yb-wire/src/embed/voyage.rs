@@ -61,7 +61,9 @@ pub fn parse_request(body: &[u8]) -> Result<EmbedRequest> {
             }
         }
         if parts.is_empty() {
-            return Err(WireError::InvalidRequest("inputs[].content is empty".into()));
+            return Err(WireError::InvalidRequest(
+                "inputs[].content is empty".into(),
+            ));
         }
         inputs.push(EmbedInput { parts });
     }
@@ -106,7 +108,11 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
         for p in &input.parts {
             match p {
                 EmbedPart::Text { text } => content.push(json!({"type": "text", "text": text})),
-                EmbedPart::Image { media_type, data, url } => match (data, url) {
+                EmbedPart::Image {
+                    media_type,
+                    data,
+                    url,
+                } => match (data, url) {
                     (Some(_), _) => content.push(json!({
                         "type": "image_base64",
                         "image_base64": image_to_data_uri(media_type.as_deref(), data.as_deref())?,
@@ -142,9 +148,10 @@ pub fn parse_response(body: &[u8]) -> Result<EmbedResponse> {
     for (pos, item) in data.iter().enumerate() {
         let index = opt_u32(item, "index").map(|i| i as usize).unwrap_or(pos);
         let emb = match item.get("embedding") {
-            Some(Value::Array(nums)) => {
-                nums.iter().map(|n| n.as_f64().unwrap_or(0.0) as f32).collect()
-            }
+            Some(Value::Array(nums)) => nums
+                .iter()
+                .map(|n| n.as_f64().unwrap_or(0.0) as f32)
+                .collect(),
             Some(Value::String(s)) => base64_to_f32s(s)?,
             _ => return Err(WireError::missing("data[].embedding")),
         };
@@ -172,8 +179,11 @@ pub fn emit_response(resp: &EmbedResponse, req: &EmbedRequest) -> Result<Vec<u8>
         .iter()
         .enumerate()
         .map(|(index, emb)| {
-            let embedding: Value =
-                if base64 { json!(f32s_to_base64(emb)) } else { json!(emb) };
+            let embedding: Value = if base64 {
+                json!(f32s_to_base64(emb))
+            } else {
+                json!(emb)
+            };
             json!({"object": "embedding", "index": index, "embedding": embedding})
         })
         .collect();

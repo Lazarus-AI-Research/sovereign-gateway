@@ -46,11 +46,14 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
                     system.extend(parse_user_content(m.get("content")));
                 }
                 Some("user") => {
-                    req.messages
-                        .push(Message::new(Role::User, parse_user_content(m.get("content"))));
+                    req.messages.push(Message::new(
+                        Role::User,
+                        parse_user_content(m.get("content")),
+                    ));
                 }
                 Some("assistant") => {
-                    req.messages.push(Message::new(Role::Assistant, parse_assistant(m)?));
+                    req.messages
+                        .push(Message::new(Role::Assistant, parse_assistant(m)?));
                 }
                 Some("tool") => {
                     let tool_use_id = opt_str(m, "tool_call_id").unwrap_or_default().to_string();
@@ -65,7 +68,10 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
                     ));
                 }
                 Some(other) => {
-                    return Err(WireError::invalid("messages[].role", format!("unknown {other}")))
+                    return Err(WireError::invalid(
+                        "messages[].role",
+                        format!("unknown {other}"),
+                    ))
                 }
                 None => return Err(WireError::missing("messages[].role")),
             }
@@ -98,8 +104,43 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
     }
     req.prompt_cache_key = opt_str(&v, "prompt_cache_key").map(str::to_string);
     req.prompt_cache_retention = opt_str(&v, "prompt_cache_retention").map(str::to_string);
+    req.native_request = v.as_object().cloned();
 
     Ok(req)
+}
+
+/// A same-shape request: the client's own body with the deployment's model,
+/// the streaming the gateway asked for, and any forced reasoning effort.
+fn emit_native_request(
+    native: &Map<String, Value>,
+    model: String,
+    opts: &EmitOptions,
+) -> Result<EmittedRequest> {
+    let mut body = native.clone();
+    body.insert("model".into(), json!(model));
+    if opts.stream {
+        body.insert("stream".into(), json!(true));
+        // The gateway needs the counts whatever the client asked for; the
+        // surface still relays usage only when the client wanted it.
+        let options = body.entry("stream_options").or_insert_with(|| json!({}));
+        match options.as_object_mut() {
+            Some(options) => {
+                options.insert("include_usage".into(), json!(true));
+            }
+            None => *options = json!({"include_usage": true}),
+        }
+    } else {
+        body.remove("stream");
+        body.remove("stream_options");
+    }
+    if let Some(effort) = &opts.force_reasoning_effort {
+        body.insert("reasoning_effort".into(), json!(effort));
+    }
+    let bytes = serde_json::to_vec(&Value::Object(body))?;
+    Ok((
+        bytes,
+        vec![("content-type".to_string(), "application/json".to_string())],
+    ))
 }
 
 /// Emit an IR request as an OpenAI Chat Completions request body plus headers.
@@ -110,6 +151,9 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     } else {
         opts.target_model.clone()
     };
+    if let Some(native) = &req.native_request {
+        return emit_native_request(native, model, opts);
+    }
     body.insert("model".into(), json!(model));
     body.insert("messages".into(), Value::Array(emit_messages(req)?));
 
@@ -193,7 +237,12 @@ fn emit_messages(req: &ChatRequest) -> Result<Vec<Value>> {
                 // stays in a `user` message (emitted after the tool results).
                 let mut others: Vec<&ContentBlock> = Vec::new();
                 for b in &m.content {
-                    if let ContentBlock::ToolResult { tool_use_id, content, .. } = b {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } = b
+                    {
                         out.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_use_id,
@@ -243,7 +292,11 @@ fn emit_assistant(m: &Message) -> Result<Value> {
     } else {
         o.insert(
             "content".into(),
-            if text.is_empty() { Value::Null } else { json!(text) },
+            if text.is_empty() {
+                Value::Null
+            } else {
+                json!(text)
+            },
         );
         o.insert("tool_calls".into(), Value::Array(tool_calls));
     }
@@ -252,7 +305,10 @@ fn emit_assistant(m: &Message) -> Result<Value> {
 
 /// Build OpenAI user `content`: a plain string when all-text, else a parts array.
 fn emit_user_content(blocks: &[&ContentBlock]) -> Value {
-    if blocks.iter().all(|b| matches!(b, ContentBlock::Text { .. })) {
+    if blocks
+        .iter()
+        .all(|b| matches!(b, ContentBlock::Text { .. }))
+    {
         let mut s = String::new();
         for b in blocks {
             if let ContentBlock::Text { text } = b {
@@ -265,7 +321,11 @@ fn emit_user_content(blocks: &[&ContentBlock]) -> Value {
         .iter()
         .filter_map(|b| match b {
             ContentBlock::Text { text } => Some(json!({"type": "text", "text": text})),
-            ContentBlock::Image { media_type, data, url } => {
+            ContentBlock::Image {
+                media_type,
+                data,
+                url,
+            } => {
                 let u = match (url, data) {
                     (Some(url), _) => url.clone(),
                     (None, Some(data)) => build_data_url(media_type.as_deref(), data),
@@ -324,10 +384,12 @@ pub fn parse_response(bytes: &[u8]) -> Result<ChatResponse> {
 /// Emit an IR response as an OpenAI Chat Completions response body.
 pub fn emit_response(resp: &ChatResponse) -> Result<Vec<u8>> {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     for b in &resp.content {
         match b {
             ContentBlock::Text { text: t } => text.push_str(t),
+            ContentBlock::Thinking { text: t, .. } => reasoning.push_str(t),
             ContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                 "id": id,
                 "type": "function",
@@ -348,6 +410,11 @@ pub fn emit_response(resp: &ChatResponse) -> Result<Vec<u8>> {
     );
     if !tool_calls.is_empty() {
         message.insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+    // The stream relays reasoning as `reasoning_content` deltas; a
+    // non-streaming answer carries the same text, or it is lost.
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".into(), json!(reasoning));
     }
 
     let u = &resp.usage;
@@ -434,7 +501,10 @@ fn parse_assistant(m: &Value) -> Result<Vec<ContentBlock>> {
     let mut pre: Vec<ContentBlock> = Vec::new();
     if let Some(rc) = opt_str(m, "reasoning_content") {
         if !rc.is_empty() {
-            pre.push(ContentBlock::Thinking { text: rc.to_string(), signature: None });
+            pre.push(ContentBlock::Thinking {
+                text: rc.to_string(),
+                signature: None,
+            });
         }
     }
 
@@ -491,7 +561,10 @@ fn parse_tool_choice(v: &Value) -> Result<ToolChoice> {
             "auto" => Ok(ToolChoice::Auto),
             "none" => Ok(ToolChoice::None),
             "required" => Ok(ToolChoice::Required),
-            other => Err(WireError::invalid("tool_choice", format!("unknown {other}"))),
+            other => Err(WireError::invalid(
+                "tool_choice",
+                format!("unknown {other}"),
+            )),
         },
         Value::Object(_) => {
             let name = v
@@ -501,7 +574,10 @@ fn parse_tool_choice(v: &Value) -> Result<ToolChoice> {
                 .unwrap_or_default();
             Ok(ToolChoice::Tool(name.to_string()))
         }
-        _ => Err(WireError::invalid("tool_choice", "expected string or object")),
+        _ => Err(WireError::invalid(
+            "tool_choice",
+            "expected string or object",
+        )),
     }
 }
 
@@ -572,12 +648,16 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
         let delta = choice.get("delta").unwrap_or(&Value::Null);
         if let Some(rc) = opt_str(delta, "reasoning_content") {
             if !rc.is_empty() {
-                out.push(StreamEvent::ThinkingDelta { text: rc.to_string() });
+                out.push(StreamEvent::ThinkingDelta {
+                    text: rc.to_string(),
+                });
             }
         }
         if let Some(text) = opt_str(delta, "content") {
             if !text.is_empty() {
-                out.push(StreamEvent::TextDelta { text: text.to_string() });
+                out.push(StreamEvent::TextDelta {
+                    text: text.to_string(),
+                });
             }
         }
         if let Some(calls) = opt_arr(delta, "tool_calls") {
@@ -593,7 +673,9 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
                 }
                 if let Some(args) = opt_str(f, "arguments") {
                     if !args.is_empty() {
-                        out.push(StreamEvent::ToolUseDelta { partial_json: args.to_string() });
+                        out.push(StreamEvent::ToolUseDelta {
+                            partial_json: args.to_string(),
+                        });
                     }
                 }
             }
@@ -603,7 +685,9 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
     // Usage (if present) must precede `Done` so re-encoders can fold it into
     // their terminal event.
     if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-        out.push(StreamEvent::UsageDelta { usage: parse_usage(Some(u)) });
+        out.push(StreamEvent::UsageDelta {
+            usage: parse_usage(Some(u)),
+        });
     }
     if let Some(stop_reason) = finish {
         out.push(StreamEvent::Done { stop_reason });
@@ -726,7 +810,12 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
             }
             StreamEvent::Done { stop_reason } => {
                 ensure_started(&mut out, state);
-                write_chunk(&mut out, state, json!({}), Some(stop_to_finish(stop_reason)));
+                write_chunk(
+                    &mut out,
+                    state,
+                    json!({}),
+                    Some(stop_to_finish(stop_reason)),
+                );
                 // OpenAI sends usage as a final chunk with an empty `choices`
                 // array, after the one carrying `finish_reason` and before
                 // [DONE] — and only when the caller asked.
@@ -797,7 +886,10 @@ mod tests {
     use crate::ir::ChatRequest;
 
     fn emit(stream: bool) -> Value {
-        let opts = EmitOptions { stream, ..EmitOptions::new("m") };
+        let opts = EmitOptions {
+            stream,
+            ..EmitOptions::new("m")
+        };
         let (body, _) = emit_request(&ChatRequest::default(), &opts).unwrap();
         serde_json::from_slice(&body).unwrap()
     }
@@ -819,7 +911,6 @@ mod tests {
         assert!(v.get("stream_options").is_none());
     }
 
-    #[test]
     /// The client's `stream_options.include_usage` reaches the IR.
     #[test]
     fn include_usage_is_parsed_from_the_request() {
@@ -843,9 +934,15 @@ mod tests {
     fn stream_events() -> Vec<StreamEvent> {
         vec![
             StreamEvent::TextDelta { text: "ok".into() },
-            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+            },
             StreamEvent::UsageDelta {
-                usage: Usage { input_tokens: 93, output_tokens: 48, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 93,
+                    output_tokens: 48,
+                    ..Default::default()
+                },
             },
         ]
     }
@@ -868,8 +965,7 @@ mod tests {
         let (before_done, _) = got.split_once("data: [DONE]").expect("stream terminates");
         let usage_line = before_done
             .lines()
-            .filter(|l| l.contains("\"usage\""))
-            .next_back()
+            .rfind(|l| l.contains("\"usage\""))
             .expect("a usage chunk precedes [DONE]");
         let v: Value = serde_json::from_str(usage_line.trim_start_matches("data: ")).unwrap();
         assert_eq!(v["usage"]["prompt_tokens"], 93);
@@ -877,7 +973,10 @@ mod tests {
         assert_eq!(v["usage"]["total_tokens"], 141);
         // OpenAI's shape: the usage chunk carries no choices.
         assert_eq!(v["choices"], json!([]));
-        assert!(got.trim_end().ends_with("data: [DONE]"), "[DONE] must be last");
+        assert!(
+            got.trim_end().ends_with("data: [DONE]"),
+            "[DONE] must be last"
+        );
     }
 
     /// Faithful to OpenAI: no `include_usage`, no usage chunk — even though the
@@ -885,7 +984,10 @@ mod tests {
     #[test]
     fn usage_is_withheld_when_the_client_did_not_ask() {
         let got = encode_all(false, &stream_events());
-        assert!(!got.contains("\"usage\""), "unrequested usage must not be relayed: {got}");
+        assert!(
+            !got.contains("\"usage\""),
+            "unrequested usage must not be relayed: {got}"
+        );
         assert!(got.trim_end().ends_with("data: [DONE]"));
     }
 
@@ -896,11 +998,17 @@ mod tests {
     fn a_stream_that_ends_without_usage_still_terminates() {
         let events = vec![
             StreamEvent::TextDelta { text: "ok".into() },
-            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+            },
         ];
         let got = encode_all(true, &events);
         assert!(!got.contains("\"usage\""));
-        assert_eq!(got.matches("data: [DONE]").count(), 1, "exactly one sentinel: {got}");
+        assert_eq!(
+            got.matches("data: [DONE]").count(),
+            1,
+            "exactly one sentinel: {got}"
+        );
         assert!(got.trim_end().ends_with("data: [DONE]"));
     }
 
@@ -910,9 +1018,15 @@ mod tests {
     fn usage_on_the_same_line_as_the_finish_emits_once() {
         let events = vec![
             StreamEvent::UsageDelta {
-                usage: Usage { input_tokens: 5, output_tokens: 7, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 5,
+                    output_tokens: 7,
+                    ..Default::default()
+                },
             },
-            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+            },
         ];
         let got = encode_all(true, &events);
         assert_eq!(got.matches("data: [DONE]").count(), 1, "{got}");

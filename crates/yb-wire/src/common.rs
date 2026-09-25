@@ -64,7 +64,11 @@ pub(crate) fn build_data_url(media_type: Option<&str>, data: &str) -> String {
 }
 
 /// Insert `key => value` into a map only when the option is `Some`.
-pub(crate) fn insert_opt<T: Into<Value>>(map: &mut Map<String, Value>, key: &str, value: Option<T>) {
+pub(crate) fn insert_opt<T: Into<Value>>(
+    map: &mut Map<String, Value>,
+    key: &str,
+    value: Option<T>,
+) {
     if let Some(v) = value {
         map.insert(key.to_string(), v.into());
     }

@@ -25,7 +25,12 @@ pub fn parse_request(body: &[u8]) -> Result<EmbedRequest> {
     let has_texts = v.get("texts").is_some();
     let has_images = v.get("images").is_some();
     let has_inputs = v.get("inputs").is_some();
-    if [has_texts, has_images, has_inputs].iter().filter(|b| **b).count() > 1 {
+    if [has_texts, has_images, has_inputs]
+        .iter()
+        .filter(|b| **b)
+        .count()
+        > 1
+    {
         return Err(WireError::InvalidRequest(
             "texts, images, and inputs are mutually exclusive".into(),
         ));
@@ -34,18 +39,24 @@ pub fn parse_request(body: &[u8]) -> Result<EmbedRequest> {
     let mut inputs = Vec::new();
     if let Some(texts) = opt_arr(&v, "texts") {
         for t in texts {
-            let s = t.as_str().ok_or_else(|| WireError::invalid("texts[]", "not a string"))?;
+            let s = t
+                .as_str()
+                .ok_or_else(|| WireError::invalid("texts[]", "not a string"))?;
             inputs.push(EmbedInput::text(s));
         }
     } else if let Some(images) = opt_arr(&v, "images") {
         for i in images {
-            let s = i.as_str().ok_or_else(|| WireError::invalid("images[]", "not a string"))?;
-            inputs.push(EmbedInput { parts: vec![data_uri_to_part(s)?] });
+            let s = i
+                .as_str()
+                .ok_or_else(|| WireError::invalid("images[]", "not a string"))?;
+            inputs.push(EmbedInput {
+                parts: vec![data_uri_to_part(s)?],
+            });
         }
     } else if let Some(items) = opt_arr(&v, "inputs") {
         for item in items {
-            let content = opt_arr(item, "content")
-                .ok_or_else(|| WireError::missing("inputs[].content"))?;
+            let content =
+                opt_arr(item, "content").ok_or_else(|| WireError::missing("inputs[].content"))?;
             let mut parts = Vec::new();
             for block in content {
                 match opt_str(block, "type") {
@@ -56,7 +67,9 @@ pub fn parse_request(body: &[u8]) -> Result<EmbedRequest> {
                         let url = block
                             .get("image_url")
                             .and_then(|u| opt_str(u, "url"))
-                            .ok_or_else(|| WireError::missing("inputs[].content[].image_url.url"))?;
+                            .ok_or_else(|| {
+                                WireError::missing("inputs[].content[].image_url.url")
+                            })?;
                         parts.push(if url.starts_with("data:") {
                             data_uri_to_part(url)?
                         } else {
@@ -76,7 +89,9 @@ pub fn parse_request(body: &[u8]) -> Result<EmbedRequest> {
                 }
             }
             if parts.is_empty() {
-                return Err(WireError::InvalidRequest("inputs[].content is empty".into()));
+                return Err(WireError::InvalidRequest(
+                    "inputs[].content is empty".into(),
+                ));
             }
             inputs.push(EmbedInput { parts });
         }
@@ -118,7 +133,9 @@ pub fn parse_request(body: &[u8]) -> Result<EmbedRequest> {
     Ok(EmbedRequest {
         model,
         inputs,
-        input_type: opt_str(&v, "input_type").and_then(cohere_to_input_type).map(str::to_string),
+        input_type: opt_str(&v, "input_type")
+            .and_then(cohere_to_input_type)
+            .map(str::to_string),
         output_dimensions: opt_u32(&v, "output_dimension"),
         truncate,
         encoding_format: None,
@@ -129,9 +146,13 @@ pub fn parse_request(body: &[u8]) -> Result<EmbedRequest> {
 
 /// A Cohere image string (must be a data URI) → an image part.
 fn data_uri_to_part(s: &str) -> Result<EmbedPart> {
-    let (media_type, data) = parse_data_url(s)
-        .ok_or_else(|| WireError::invalid("images[]", "expected a data: URI"))?;
-    Ok(EmbedPart::Image { media_type: Some(media_type), data: Some(data), url: None })
+    let (media_type, data) =
+        parse_data_url(s).ok_or_else(|| WireError::invalid("images[]", "expected a data: URI"))?;
+    Ok(EmbedPart::Image {
+        media_type: Some(media_type),
+        data: Some(data),
+        url: None,
+    })
 }
 
 /// Emit an IR request as a Cohere v2 embed body plus headers. All-text inputs
@@ -145,13 +166,21 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
         opts.target_model.clone()
     };
     body.insert("model".into(), json!(model));
-    body.insert("input_type".into(), json!(input_type_to_cohere(req.input_type.as_deref())));
+    body.insert(
+        "input_type".into(),
+        json!(input_type_to_cohere(req.input_type.as_deref())),
+    );
 
     let all_text = req.inputs.iter().all(|i| i.as_single_text().is_some());
     if all_text {
         body.insert(
             "texts".into(),
-            Value::Array(req.inputs.iter().map(|i| json!(i.as_single_text().unwrap())).collect()),
+            Value::Array(
+                req.inputs
+                    .iter()
+                    .map(|i| json!(i.as_single_text().unwrap()))
+                    .collect(),
+            ),
         );
     } else {
         let mut items = Vec::with_capacity(req.inputs.len());
@@ -160,7 +189,11 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
             for p in &input.parts {
                 match p {
                     EmbedPart::Text { text } => content.push(json!({"type": "text", "text": text})),
-                    EmbedPart::Image { media_type, data, url: _ } => {
+                    EmbedPart::Image {
+                        media_type,
+                        data,
+                        url: _,
+                    } => {
                         let uri = image_to_data_uri(media_type.as_deref(), data.as_deref())?;
                         content.push(json!({"type": "image_url", "image_url": {"url": uri}}));
                     }
@@ -194,7 +227,11 @@ pub fn parse_response(body: &[u8]) -> Result<EmbedResponse> {
         .iter()
         .map(|row| {
             row.as_array()
-                .map(|nums| nums.iter().map(|n| n.as_f64().unwrap_or(0.0) as f32).collect())
+                .map(|nums| {
+                    nums.iter()
+                        .map(|n| n.as_f64().unwrap_or(0.0) as f32)
+                        .collect()
+                })
                 .unwrap_or_default()
         })
         .collect();
@@ -227,7 +264,11 @@ pub fn emit_response(resp: &EmbedResponse, req: &EmbedRequest) -> Result<Vec<u8>
     if requested.contains(&"base64") {
         embeddings.insert(
             "base64".into(),
-            json!(resp.embeddings.iter().map(|e| f32s_to_base64(e)).collect::<Vec<_>>()),
+            json!(resp
+                .embeddings
+                .iter()
+                .map(|e| f32s_to_base64(e))
+                .collect::<Vec<_>>()),
         );
     }
     let body = json!({
@@ -287,7 +328,10 @@ mod tests {
         assert_eq!(req.inputs[0].parts.len(), 2);
         let (up, _) = emit_request(&req, &EmbedEmitOptions::default()).unwrap();
         let up: Value = serde_json::from_slice(&up).unwrap();
-        assert_eq!(up["inputs"][0]["content"][1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        assert_eq!(
+            up["inputs"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,QUJD"
+        );
         assert!(up.get("texts").is_none());
     }
 
@@ -341,6 +385,9 @@ mod tests {
         };
         let out: Value = serde_json::from_slice(&emit_response(&resp, &req).unwrap()).unwrap();
         assert_eq!(out["embeddings"]["float"][0][1], 2.0);
-        assert_eq!(out["embeddings"]["base64"][0], json!(f32s_to_base64(&[1.0, 2.0])));
+        assert_eq!(
+            out["embeddings"]["base64"][0],
+            json!(f32s_to_base64(&[1.0, 2.0]))
+        );
     }
 }

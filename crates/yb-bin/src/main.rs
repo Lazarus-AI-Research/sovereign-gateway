@@ -89,7 +89,9 @@ async fn main() {
 
 /// The positional arg at `idx`, or the default config path.
 fn arg_or_default(args: &[String], idx: usize) -> String {
-    args.get(idx).cloned().unwrap_or_else(|| DEFAULT_CONFIG.to_string())
+    args.get(idx)
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_CONFIG.to_string())
 }
 
 /// Initialise the global tracing subscriber. Honours `RUST_LOG`; defaults to
@@ -111,8 +113,14 @@ async fn run_setup(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--user" | "-u" => { i += 1; username = args.get(i).cloned().unwrap_or(username); }
-            "--password" | "-p" => { i += 1; password = args.get(i).cloned().unwrap_or(password); }
+            "--user" | "-u" => {
+                i += 1;
+                username = args.get(i).cloned().unwrap_or(username);
+            }
+            "--password" | "-p" => {
+                i += 1;
+                password = args.get(i).cloned().unwrap_or(password);
+            }
             other if !other.starts_with('-') => config_path = other.to_string(),
             other => return Err(format!("unknown setup flag: {other}").into()),
         }
@@ -125,7 +133,11 @@ async fn run_setup(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("database initialized ({})", describe_db(&cfg.database));
 
     let created = upsert_admin(store.as_ref(), &username, &password).await?;
-    let verb = if created { "created" } else { "reset password for" };
+    let verb = if created {
+        "created"
+    } else {
+        "reset password for"
+    };
     println!("{verb} admin user \"{username}\".");
     if password == "admin" {
         println!("  ↳ default password is \"admin\" — change it after first sign-in.");
@@ -144,7 +156,9 @@ async fn upsert_admin(
     let hash = Argon2Hasher::new().hash(password)?;
     if let Some(existing) = store.get_user_by_username(username).await? {
         store.set_user_password(&existing.id, &hash).await?;
-        store.set_user_role(&existing.id, yb_core::Role::Admin).await?;
+        store
+            .set_user_role(&existing.id, yb_core::Role::Admin)
+            .await?;
         Ok(false)
     } else {
         store
@@ -170,8 +184,12 @@ async fn upsert_admin(
 /// password (sso/saml login only), so an operator can designate an admin *before*
 /// that person's first sign-in. Idempotent.
 async fn run_set_role(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let username = args.get(2).ok_or("usage: gateway set-role <user> <admin|member> [config]")?;
-    let role_str = args.get(3).ok_or("usage: gateway set-role <user> <admin|member> [config]")?;
+    let username = args
+        .get(2)
+        .ok_or("usage: gateway set-role <user> <admin|member> [config]")?;
+    let role_str = args
+        .get(3)
+        .ok_or("usage: gateway set-role <user> <admin|member> [config]")?;
     let config_path = arg_or_default(args, 4);
     let role = yb_core::Role::parse(role_str)?;
 
@@ -276,7 +294,15 @@ async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> 
     store.migrate().await?;
     tracing::info!("store migrated");
 
-    if store.count_users().await.unwrap_or(0) == 0 {
+    if let Some(variable) = &cfg.security.control_key_env {
+        let token = std::env::var(variable)
+            .map_err(|_| format!("security.control_key_env names {variable}, which is not set"))?;
+        if token.trim().is_empty() {
+            return Err(format!("{variable} is empty; the control key needs a value").into());
+        }
+        yb_store::ensure_control_key(store.as_ref(), token.trim()).await?;
+        tracing::info!(variable = %variable, "control key ensured");
+    } else if store.count_users().await.unwrap_or(0) == 0 {
         // First run: implicitly create a default admin user so the console is
         // usable immediately. Customize with `gateway setup --user … --password …`.
         match upsert_admin(store.as_ref(), "admin", "admin").await {
@@ -296,7 +322,10 @@ async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> 
              (`gateway import <file>` or POST /admin/v1/models)"
         );
     }
-    tracing::info!(deployments = deployments.len(), "model deployments loaded from db");
+    tracing::info!(
+        deployments = deployments.len(),
+        "model deployments loaded from db"
+    );
     let aliases: std::collections::HashMap<String, String> = store
         .list_aliases()
         .await?
@@ -315,7 +344,11 @@ async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> 
     let logger: Arc<dyn RequestLogger> = build_reqlog(&cfg.reqlog)?;
     let observer: Arc<dyn Observer> = if cfg.telemetry.enabled {
         tracing::info!(
-            otlp = cfg.telemetry.otlp_endpoint.as_deref().unwrap_or("(push off)"),
+            otlp = cfg
+                .telemetry
+                .otlp_endpoint
+                .as_deref()
+                .unwrap_or("(push off)"),
             prometheus = cfg.telemetry.prometheus,
             "telemetry export enabled (metrics + per-turn events/spans)"
         );
@@ -323,7 +356,12 @@ async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> 
     } else {
         Arc::new(NullObserver)
     };
-    if cfg.upstream.cloudflare_access.as_ref().is_some_and(|c| c.is_complete()) {
+    if cfg
+        .upstream
+        .cloudflare_access
+        .as_ref()
+        .is_some_and(|c| c.is_complete())
+    {
         tracing::info!(
             "cloudflare access service token loaded; deployments flagged \
              extra.cloudflare_access will present it"
@@ -360,7 +398,10 @@ async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> 
         .and_then(yb_server::sso::SsoClient::from_config)
         .map(Arc::new);
     if auth.has(yb_core::config::AuthProvider::Sso) {
-        tracing::info!(configured = sso.is_some(), "admin auth: sso provider enabled");
+        tracing::info!(
+            configured = sso.is_some(),
+            "admin auth: sso provider enabled"
+        );
     }
 
     let state = AppState {
@@ -411,12 +452,19 @@ async fn build_store(db: &DatabaseConfig) -> Result<Arc<dyn Store>, Box<dyn std:
             Ok(Arc::new(SqliteStore::connect(&db.path).await?))
         }
         DbBackend::Postgres => {
-            let dsn = db
-                .dsn
-                .as_deref()
-                .ok_or("database.backend = \"postgres\" requires database.dsn")?;
+            let dsn = match (&db.dsn, &db.dsn_env) {
+                (Some(dsn), _) => dsn.clone(),
+                (None, Some(variable)) => std::env::var(variable)
+                    .map_err(|_| format!("database.dsn_env names {variable}, which is not set"))?,
+                (None, None) => {
+                    return Err(
+                        "database.backend = \"postgres\" requires database.dsn or database.dsn_env"
+                            .into(),
+                    )
+                }
+            };
             tracing::info!(backend = "postgres", "opening store");
-            Ok(Arc::new(PostgresStore::connect(dsn).await?))
+            Ok(Arc::new(PostgresStore::connect(&dsn).await?))
         }
     }
 }
@@ -528,7 +576,10 @@ async fn hoist_legacy_deployment_credentials(
                     &dc.extra,
                 )
                 .await?;
-            hoisted.insert(dc.provider.clone(), (dc.api_base.clone(), dc.api_key.clone()));
+            hoisted.insert(
+                dc.provider.clone(),
+                (dc.api_base.clone(), dc.api_key.clone()),
+            );
         }
     }
     Ok(hoisted.len())
@@ -576,8 +627,12 @@ const MOCK_ANTHROPIC_RESPONSE: &str = r#"{
 fn build_upstream_client(mode: UpstreamMode) -> Arc<dyn UpstreamClient> {
     match mode {
         UpstreamMode::Mock => {
-            tracing::warn!("upstream.mode = mock: upstream calls return a canned response (offline)");
-            Arc::new(MockClient::json(MOCK_ANTHROPIC_RESPONSE.as_bytes().to_vec()))
+            tracing::warn!(
+                "upstream.mode = mock: upstream calls return a canned response (offline)"
+            );
+            Arc::new(MockClient::json(
+                MOCK_ANTHROPIC_RESPONSE.as_bytes().to_vec(),
+            ))
         }
         UpstreamMode::Http => Arc::new(HttpClient::new()),
     }
@@ -651,7 +706,9 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         _ => None,
     };
     s.as_bytes()
-        .chunks_exact(2)
-        .map(|p| Some((nibble(p[0])? << 4) | nibble(p[1])?))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[high, low]| Some((nibble(*high)? << 4) | nibble(*low)?))
         .collect()
 }

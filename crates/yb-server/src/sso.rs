@@ -99,8 +99,14 @@ impl SsoClient {
             return Err(Error::Unauthorized(format!("sso start rejected: {err}")));
         }
         Ok(StartOutcome {
-            dev_code: v.get("dev_code").and_then(|c| c.as_str()).map(str::to_string),
-            dev_link: v.get("dev_link").and_then(|c| c.as_str()).map(str::to_string),
+            dev_code: v
+                .get("dev_code")
+                .and_then(|c| c.as_str())
+                .map(str::to_string),
+            dev_link: v
+                .get("dev_link")
+                .and_then(|c| c.as_str())
+                .map(str::to_string),
         })
     }
 

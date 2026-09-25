@@ -14,7 +14,7 @@ use yb_wire::{
 };
 
 /// Map a `yb-wire` error into the domain error type.
-fn wire_err(e: yb_wire::WireError) -> Error {
+pub(crate) fn wire_err(e: yb_wire::WireError) -> Error {
     Error::Wire(e.to_string())
 }
 
@@ -30,7 +30,11 @@ pub fn parse_request(fmt: WireFormat, body: &[u8]) -> Result<ChatRequest> {
 }
 
 /// Emit an IR request as an upstream body (+ headers) in `fmt`.
-pub fn emit_request(fmt: WireFormat, req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequest> {
+pub fn emit_request(
+    fmt: WireFormat,
+    req: &ChatRequest,
+    opts: &EmitOptions,
+) -> Result<EmittedRequest> {
     match fmt {
         WireFormat::Anthropic => anthropic::emit_request(req, opts),
         WireFormat::OpenaiChat => openai_chat::emit_request(req, opts),

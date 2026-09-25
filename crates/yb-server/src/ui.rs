@@ -21,8 +21,7 @@ const INDEX_HTML: &str = include_str!("../frontend/index.html");
 const APP_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"));
 
 /// A short content hash of the bundle, used as its cache-busting version.
-static APP_HASH: LazyLock<String> =
-    LazyLock::new(|| crate::hex_sha256(APP_JS)[..12].to_string());
+static APP_HASH: LazyLock<String> = LazyLock::new(|| crate::hex_sha256(APP_JS)[..12].to_string());
 
 /// The shell with the bundle's `src` pinned to the current build's hash.
 ///

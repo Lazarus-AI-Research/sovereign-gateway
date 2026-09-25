@@ -32,7 +32,7 @@ use yb_core::model::{AccessPolicy, ApiKey, KeyScope, Role, Session, Team, TeamMe
 use yb_core::principal::Principal as CorePrincipal;
 use yb_core::rbac::{authorize, Action};
 use yb_core::spend::{Budget, SubjectType};
-use yb_core::{new_id, now, Error};
+use yb_core::{new_id, now, Error, LimitColumns};
 
 use crate::error_response;
 use crate::sso::SsoUser;
@@ -65,7 +65,10 @@ pub fn router() -> Router<AppState> {
         .route("/models", get(list_models).post(create_model))
         .route("/models/:id/name", put(rename_model))
         // deployments (one model's upstream fan-out)
-        .route("/deployments", get(list_deployments).post(create_deployment))
+        .route(
+            "/deployments",
+            get(list_deployments).post(create_deployment),
+        )
         .route("/deployments/health", get(health_all_models))
         .route("/deployments/:id", delete(delete_deployment))
         .route("/deployments/:id/health", post(health_one_model))
@@ -73,7 +76,10 @@ pub fn router() -> Router<AppState> {
         .route("/health/last", get(last_health))
         // providers (an endpoint, its credentials, its deployments)
         .route("/providers", get(list_providers).post(create_provider))
-        .route("/providers/:id", put(update_provider).delete(delete_provider))
+        .route(
+            "/providers/:id",
+            put(update_provider).delete(delete_provider),
+        )
         .route("/providers/:id/discover", post(discover_provider_models))
         .route("/deployments/bulk", post(create_deployments_bulk))
         // model aliases (extra public name -> model)
@@ -81,7 +87,10 @@ pub fn router() -> Router<AppState> {
         .route("/aliases/:alias", delete(delete_alias))
         // keys (owned by users; admin sees all)
         .route("/keys", get(list_keys).post(create_key))
-        .route("/keys/:id", delete(delete_key))
+        .route(
+            "/keys/:id",
+            get(get_key).patch(update_key).delete(delete_key),
+        )
         .route("/keys/:id/access", put(key_access))
         // teams
         .route("/teams", get(list_teams).post(create_team))
@@ -96,6 +105,7 @@ pub fn router() -> Router<AppState> {
         .route("/complete", get(complete))
         // spend
         .route("/spend", get(spend))
+        .route("/usage", get(usage))
 }
 
 // ---- principal extraction ------------------------------------------------
@@ -132,7 +142,11 @@ impl FromRequestParts<AppState> for Principal {
         // the control-plane path. The key acts as its owner user; the role is
         // read fresh so demotions apply immediately.
         if let Some(bearer) = bearer_of(&parts.headers) {
-            let auth = match state.store.verify_api_key(&crate::hex_sha256(&bearer)).await {
+            let auth = match state
+                .store
+                .verify_api_key(&crate::hex_sha256(&bearer))
+                .await
+            {
                 Ok(Some(a)) => a,
                 Ok(None) => return Err(unauthorized()),
                 Err(e) => return Err(error_response(&e)),
@@ -342,7 +356,9 @@ struct MemberBody {
 // ---- auth (login / logout / me) ------------------------------------------
 
 fn set_cookie(token: &str) -> String {
-    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}")
+    format!(
+        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
+    )
 }
 
 fn clear_cookie() -> String {
@@ -407,10 +423,17 @@ fn append_shared_cookie(resp: &mut Response, state: &AppState, sso_user: &SsoUse
     let (Some(token), Some(cfg)) = (sso_user.session.as_deref(), state.auth.sso.as_ref()) else {
         return;
     };
-    let Some(domain) = cfg.session_cookie_domain.as_deref().filter(|d| !d.is_empty()) else {
+    let Some(domain) = cfg
+        .session_cookie_domain
+        .as_deref()
+        .filter(|d| !d.is_empty())
+    else {
         return;
     };
-    let name = cfg.session_cookie.clone().unwrap_or_else(|| "lzr_session".to_string());
+    let name = cfg
+        .session_cookie
+        .clone()
+        .unwrap_or_else(|| "lzr_session".to_string());
     let cookie = format!(
         "{name}={token}; Domain={domain}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={SESSION_TTL_SECS}"
     );
@@ -448,7 +471,10 @@ async fn auth_sso_start(State(state): State<AppState>, Json(body): Json<SsoStart
     let Some(sso) = sso_or_disabled(&state) else {
         return error_response(&Error::Forbidden("sso login is not enabled".into()));
     };
-    match sso.start(&body.email, body.turnstile_token.as_deref()).await {
+    match sso
+        .start(&body.email, body.turnstile_token.as_deref())
+        .await
+    {
         Ok(out) => {
             let mut resp = json!({ "ok": true });
             if let Some(code) = out.dev_code {
@@ -578,14 +604,18 @@ async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }
     // Global logout: invalidate the shared IdP session (so every *.lzrlab.dev app
     // drops), and clear the domain-scoped cookie.
-    let shared = state
-        .auth
-        .sso
-        .as_ref()
-        .and_then(|c| c.session_cookie_domain.as_deref().filter(|d| !d.is_empty()).map(|d| (c, d)));
+    let shared = state.auth.sso.as_ref().and_then(|c| {
+        c.session_cookie_domain
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .map(|d| (c, d))
+    });
     let mut cleared_shared: Option<String> = None;
     if let Some((cfg, domain)) = shared {
-        let name = cfg.session_cookie.clone().unwrap_or_else(|| "lzr_session".to_string());
+        let name = cfg
+            .session_cookie
+            .clone()
+            .unwrap_or_else(|| "lzr_session".to_string());
         if let Some(token) = cookie_value(&headers, &name) {
             if let Some(sso) = &state.sso {
                 let _ = sso.logout(&token).await;
@@ -628,7 +658,10 @@ async fn change_my_password(
         Ok(None) => return error_response(&Error::Unauthorized("sign in required".into())),
         Err(e) => return error_response(&e),
     };
-    if !state.hasher.verify(&body.current_password, &user.password_hash) {
+    if !state
+        .hasher
+        .verify(&body.current_password, &user.password_hash)
+    {
         return error_response(&Error::Unauthorized("current password is incorrect".into()));
     }
     if body.new_password.is_empty() {
@@ -951,7 +984,9 @@ async fn create_provider(
         Err(r) => return r,
     };
     if let Ok(Some(_)) = state.store.get_provider_by_name(&name).await {
-        return error_response(&Error::Conflict(format!("provider \"{name}\" already exists")));
+        return error_response(&Error::Conflict(format!(
+            "provider \"{name}\" already exists"
+        )));
     }
     let created = match state.store.ensure_provider(&name).await {
         Ok(p) => p,
@@ -1139,15 +1174,16 @@ async fn create_deployments_bulk(
             // Already present: the identity index says this exact binding
             // exists, which is the common case when re-running discovery.
             Ok(false) => skipped += 1,
-            Err(e) => errors.push(
-                json!({ "upstream_model": entry.upstream_model, "error": e.to_string() }),
-            ),
+            Err(e) => errors
+                .push(json!({ "upstream_model": entry.upstream_model, "error": e.to_string() })),
         }
     }
     if let Err(e) = state.reload_models().await {
         return error_response(&e);
     }
-    respond(Ok(json!({ "created": created, "skipped": skipped, "errors": errors })))
+    respond(Ok(
+        json!({ "created": created, "skipped": skipped, "errors": errors }),
+    ))
 }
 
 /// `DELETE /providers/:id` — remove a provider with no deployments (admin only).
@@ -1227,7 +1263,9 @@ async fn list_models(principal: Principal, State(state): State<AppState>) -> Res
 fn validate_public_name(s: &str) -> std::result::Result<String, Response> {
     let t = s.trim();
     if t.is_empty() {
-        return Err(error_response(&Error::BadRequest("name is required".into())));
+        return Err(error_response(&Error::BadRequest(
+            "name is required".into(),
+        )));
     }
     if t.chars().count() > 200 {
         return Err(error_response(&Error::BadRequest(
@@ -1503,9 +1541,7 @@ async fn create_alias(
     // never resolved; it is a 404 now.
     let target = match state.store.get_model_by_name(&body.target).await {
         Ok(Some(m)) => m,
-        Ok(None) => {
-            return error_response(&Error::NotFound(format!("model \"{}\"", body.target)))
-        }
+        Ok(None) => return error_response(&Error::NotFound(format!("model \"{}\"", body.target))),
         Err(e) => return error_response(&e),
     };
     // A name is either a model's or an alias's, never both — otherwise the
@@ -1629,8 +1665,7 @@ async fn complete(
                 for p in providers {
                     if let Some(r) = rank(&p.name, &needle) {
                         let n = deps.iter().filter(|d| d.provider_id == p.id).count();
-                        let mut hint =
-                            format!("{n} deployment{}", if n == 1 { "" } else { "s" });
+                        let mut hint = format!("{n} deployment{}", if n == 1 { "" } else { "s" });
                         if let Some(base) = p.api_base.as_deref() {
                             hint.push_str(" \u{b7} ");
                             hint.push_str(base);
@@ -1676,9 +1711,8 @@ async fn complete(
                 for (model_id, (model, providers, mut names)) in by_model {
                     // An alias is a legitimate way to *find* a model, so match on
                     // it too — but the value stays the model id.
-                    let r = rank(&model, &needle).or_else(|| {
-                        names.iter().filter_map(|a| rank(a, &needle)).min()
-                    });
+                    let r = rank(&model, &needle)
+                        .or_else(|| names.iter().filter_map(|a| rank(a, &needle)).min());
                     let Some(r) = r else { continue };
                     names.sort();
                     let mut hint = providers.into_iter().collect::<Vec<_>>().join(", ");
@@ -1743,7 +1777,10 @@ async fn list_keys(principal: Principal, State(state): State<AppState>) -> Respo
     let r = if principal.is_admin() {
         state.store.list_api_keys().await
     } else {
-        state.store.list_api_keys_for_user(principal.user_id()).await
+        state
+            .store
+            .list_api_keys_for_user(principal.user_id())
+            .await
     };
     respond(r)
 }
@@ -1765,7 +1802,11 @@ async fn create_key(
     };
     // The grant set is a JSON array; default to inference-only. parse_set
     // validates + dedupes each name.
-    let raw = body.scopes.as_ref().map(|l| l.join(" ")).unwrap_or_else(|| "inference".into());
+    let raw = body
+        .scopes
+        .as_ref()
+        .map(|l| l.join(" "))
+        .unwrap_or_else(|| "inference".into());
     let scopes = match KeyScope::parse_set(&raw) {
         Ok(v) => v,
         Err(e) => return error_response(&e),
@@ -1820,9 +1861,7 @@ async fn own_key_or_admin(
         Err(e) => return Err(error_response(&e)),
     };
     if !principal.is_admin() && key.owner_user_id != principal.user_id() {
-        return Err(error_response(&Error::Forbidden(
-            "not your key".into(),
-        )));
+        return Err(error_response(&Error::Forbidden("not your key".into())));
     }
     Ok(key)
 }
@@ -1837,6 +1876,70 @@ async fn delete_key(
         return r;
     }
     respond_unit(state.store.delete_api_key(&id).await)
+}
+
+/// `GET /keys/:id` — one key's metadata (owner or admin).
+async fn get_key(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match own_key_or_admin(&state, &principal, &id).await {
+        Ok(key) => Json(key).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `PATCH /keys/:id` — change a key's name and limits after it was issued
+/// (owner or admin). A field left out keeps its value; `null` clears it.
+async fn update_key(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Map<String, serde_json::Value>>,
+) -> Response {
+    let key = match own_key_or_admin(&state, &principal, &id).await {
+        Ok(key) => key,
+        Err(r) => return r,
+    };
+    let limit = |field: &str, current: Option<i64>| -> Result<Option<i64>, Response> {
+        match body.get(field) {
+            None => Ok(current),
+            Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => match value.as_i64() {
+                Some(n) if n >= 0 => Ok(Some(n)),
+                _ => Err(error_response(&Error::BadRequest(format!(
+                    "{field} must be a non-negative integer or null"
+                )))),
+            },
+        }
+    };
+    let limits = match (
+        limit("rpm_limit", key.rpm_limit),
+        limit("tpm_limit", key.tpm_limit),
+        limit("max_concurrent", key.max_concurrent),
+    ) {
+        (Ok(rpm), Ok(tpm), Ok(max_concurrent)) => LimitColumns {
+            rpm,
+            tpm,
+            max_concurrent,
+        },
+        (Err(r), _, _) | (_, Err(r), _) | (_, _, Err(r)) => return r,
+    };
+    if let Some(name) = body.get("name") {
+        let name = match name {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(name) => Some(name.as_str()),
+            _ => return error_response(&Error::BadRequest("name must be a string or null".into())),
+        };
+        if let Err(e) = state.store.rename_api_key(&id, name).await {
+            return error_response(&e);
+        }
+    }
+    if let Err(e) = state.store.update_api_key_limits(&id, limits).await {
+        return error_response(&e);
+    }
+    respond(state.store.get_api_key(&id).await)
 }
 
 /// `PUT /keys/:id/access` — edit a key's access policy (owner or admin).
@@ -1996,4 +2099,30 @@ async fn spend(principal: Principal, State(state): State<AppState>) -> Response 
         return r;
     }
     respond(state.store.spend_rows().await)
+}
+
+/// The days a usage report covers, both inclusive.
+#[derive(Deserialize)]
+struct UsageQuery {
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+}
+
+/// `GET /usage?from=YYYY-MM-DD&to=YYYY-MM-DD` — traffic per UTC day, key,
+/// person, model and surface (admins only): what a control plane reports
+/// usage from without reading every turn.
+async fn usage(
+    principal: Principal,
+    State(state): State<AppState>,
+    Query(query): Query<UsageQuery>,
+) -> Response {
+    if !principal.is_admin() {
+        return error_response(&Error::Forbidden("usage is for administrators".into()));
+    }
+    if query.to < query.from {
+        return error_response(&Error::BadRequest("to is before from".into()));
+    }
+    let midnight = |day: chrono::NaiveDate| day.and_time(chrono::NaiveTime::MIN).and_utc();
+    let end = midnight(query.to) + chrono::Duration::days(1);
+    respond(state.store.usage(midnight(query.from), end).await)
 }

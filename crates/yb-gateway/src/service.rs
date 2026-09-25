@@ -24,8 +24,8 @@ use bytes::Bytes;
 use futures::{stream, StreamExt};
 
 use yb_core::catalog::{builtin_price, ModelPrice};
-use yb_core::spend::{Period, RollupDelta, SubjectType};
 use yb_core::config::CloudflareAccessConfig;
+use yb_core::spend::{Period, RollupDelta, SubjectType};
 use yb_core::{
     new_id, now, AccessPolicy, ApiKey, Deployment, Error, Extra, NullObserver, Observer,
     RequestLogRecord, RequestLogger, Result, RouteRequest, Router, Store, TelemetryRecord,
@@ -33,8 +33,7 @@ use yb_core::{
 };
 use yb_providers::{
     append_headers, auth_headers, build_url, cloudflare_access_headers, is_model_not_found,
-    is_retryable,
-    ByteStream, ResponseBody, UpstreamClient, UpstreamRequest,
+    is_retryable, ByteStream, ResponseBody, UpstreamClient, UpstreamRequest,
 };
 use yb_wire::{ChatRequest, ContentBlock, EmitOptions, StreamEvent, Usage};
 
@@ -127,6 +126,28 @@ impl Drop for TurnGuard {
 /// the gateway runs. Carries the authenticated identity (the key and its owner
 /// user/team) and the access exclusions already distilled from the key/team
 /// policy.
+/// Counts a finished turn's tokens against the caller's tokens-per-minute
+/// limit. Tokens are known only once the upstream answers, so admission can
+/// check the limit but only the end of the turn can charge it.
+#[derive(Clone)]
+pub struct TokenMeter(Arc<dyn Fn(i64) + Send + Sync>);
+
+impl TokenMeter {
+    pub fn new(charge: impl Fn(i64) + Send + Sync + 'static) -> Self {
+        TokenMeter(Arc::new(charge))
+    }
+
+    fn charge(&self, tokens: i64) {
+        (self.0)(tokens)
+    }
+}
+
+impl std::fmt::Debug for TokenMeter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenMeter")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RequestCtx {
     /// The virtual key the request authenticated with, if any.
@@ -148,6 +169,8 @@ pub struct RequestCtx {
     /// The effective model/provider access grant for this caller — the key's
     /// policy merged with its team's. Deny wins, allow-lists are ceilings.
     pub access: AccessPolicy,
+    /// Charges the turn's tokens to the caller's tokens-per-minute limit.
+    pub token_meter: Option<TokenMeter>,
 }
 
 impl RequestCtx {
@@ -196,7 +219,9 @@ impl GatewayResponse {
     /// The HTTP status of either variant.
     pub fn status(&self) -> u16 {
         match self {
-            GatewayResponse::Full { status, .. } | GatewayResponse::Stream { status, .. } => *status,
+            GatewayResponse::Full { status, .. } | GatewayResponse::Stream { status, .. } => {
+                *status
+            }
         }
     }
 }
@@ -278,6 +303,7 @@ impl Gateway {
         let mut headers = match fmt {
             yb_core::UpstreamFormat::Chat(f) => auth_headers(f, key),
             yb_core::UpstreamFormat::Embed(f) => yb_providers::embed_auth_headers(f, key),
+            yb_core::UpstreamFormat::Media(_) => yb_providers::media_auth_headers(key),
         };
         append_headers(&mut headers, self.extra_headers(extra, label));
 
@@ -405,7 +431,7 @@ impl Gateway {
             // deployments are a different universe (see Gateway::handle_embed).
             let upstream_fmt = match deployment.upstream_format {
                 yb_core::UpstreamFormat::Chat(f) => f,
-                yb_core::UpstreamFormat::Embed(_) => continue,
+                yb_core::UpstreamFormat::Embed(_) | yb_core::UpstreamFormat::Media(_) => continue,
             };
             saw_embed_only = false;
             let opts = EmitOptions {
@@ -468,10 +494,16 @@ impl Gateway {
                 // and surface it.
                 guard.disarm();
                 let rctx = self.record_ctx(
-                    &ctx, surface.as_str(), &chat.model, &deployment,
-                    body.to_vec(), started, created_at,
+                    &ctx,
+                    surface.as_str(),
+                    &chat.model,
+                    &deployment,
+                    body.to_vec(),
+                    started,
+                    created_at,
                 );
-                rctx.finish(Usage::default(), status, true, Vec::new(), 0).await;
+                rctx.finish(Usage::default(), status, true, Vec::new(), 0)
+                    .await;
                 return Err(Error::Upstream {
                     provider: deployment.provider.clone(),
                     status,
@@ -489,12 +521,20 @@ impl Gateway {
             //      client stream     + upstream full    → expand body → one SSE
             guard.disarm();
             let rctx = self.record_ctx(
-                &ctx, surface.as_str(), &chat.model, &deployment,
-                body.to_vec(), started, created_at,
+                &ctx,
+                surface.as_str(),
+                &chat.model,
+                &deployment,
+                body.to_vec(),
+                started,
+                created_at,
             );
             // The Responses response object echoes the request's prompt-cache
             // fields; when the upstream doesn't echo them, fill from the request.
-            let cache_echo = (chat.prompt_cache_key.clone(), chat.prompt_cache_retention.clone());
+            let cache_echo = (
+                chat.prompt_cache_key.clone(),
+                chat.prompt_cache_retention.clone(),
+            );
             return match (stream_requested, resp.body) {
                 (false, ResponseBody::Stream(up)) => {
                     aggregate_stream(up, upstream_fmt, surface, rctx, status, cache_echo).await
@@ -505,9 +545,15 @@ impl Gateway {
                     emit_full(surface, resp, rctx, status).await
                 }
                 (true, ResponseBody::Stream(up)) => {
-                    let stream =
-                        translate_stream(up, upstream_fmt, surface, rctx, status, cache_echo,
-                                         chat.include_usage);
+                    let stream = translate_stream(
+                        up,
+                        upstream_fmt,
+                        surface,
+                        rctx,
+                        status,
+                        cache_echo,
+                        chat.include_usage,
+                    );
                     Ok(GatewayResponse::Stream {
                         status,
                         headers: sse_headers(),
@@ -596,7 +642,11 @@ impl Gateway {
     /// Apply the access ceilings the router does not model: the effective grant's
     /// `allowed_models` / `allowed_providers` allow-lists, plus a belt-and-braces
     /// re-check of the context denylists.
-    pub(crate) fn filter_access(&self, candidates: Vec<Deployment>, ctx: &RequestCtx) -> Vec<Deployment> {
+    pub(crate) fn filter_access(
+        &self,
+        candidates: Vec<Deployment>,
+        ctx: &RequestCtx,
+    ) -> Vec<Deployment> {
         candidates
             .into_iter()
             .filter(|d| {
@@ -639,6 +689,8 @@ impl Gateway {
             request_body,
             start: started,
             created_at,
+            token_meter: ctx.token_meter.clone(),
+            reports_usage: true,
         }
     }
 }
@@ -647,7 +699,12 @@ impl Gateway {
 /// as routing signal; never billed.
 fn estimate_tokens(chat: &ChatRequest) -> u32 {
     let mut chars = 0usize;
-    for block in chat.system.iter().flatten().chain(chat.messages.iter().flat_map(|m| &m.content)) {
+    for block in chat
+        .system
+        .iter()
+        .flatten()
+        .chain(chat.messages.iter().flat_map(|m| &m.content))
+    {
         if let ContentBlock::Text { text } = block {
             chars += text.len();
         }
@@ -701,6 +758,10 @@ pub(crate) struct RecordCtx {
     request_body: Vec<u8>,
     start: Instant,
     created_at: Timestamp,
+    token_meter: Option<TokenMeter>,
+    /// False for a turn that never reports tokens (an image or speech), so a
+    /// zero count is not taken for an upstream fault.
+    pub(crate) reports_usage: bool,
 }
 
 impl RecordCtx {
@@ -729,7 +790,7 @@ impl RecordCtx {
         // writing a zero row — this is how a whole provider silently stops
         // billing (an OpenAI-compatible stream omits usage entirely unless
         // `stream_options.include_usage` is set, for instance).
-        if !is_error && (200..300).contains(&status) && usage.is_empty() {
+        if self.reports_usage && !is_error && (200..300).contains(&status) && usage.is_empty() {
             tracing::warn!(
                 provider = %self.deployment.provider,
                 model = %self.deployment.model_name,
@@ -745,6 +806,11 @@ impl RecordCtx {
         let cache_write = usage.cache_write_tokens as i64;
         let cost = price.cost_micros(input, output, cache_read, cache_write);
         let latency_ms = self.start.elapsed().as_millis() as i64;
+        if let Some(meter) = &self.token_meter {
+            if input + output > 0 {
+                meter.charge(input + output);
+            }
+        }
 
         let telemetry = TelemetryRecord {
             id: new_id(),
@@ -839,9 +905,7 @@ const UPSTREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 /// `upstream.next()` with the idle guard applied: a stall becomes a transport
 /// error item.
-async fn next_or_stall(
-    upstream: &mut ByteStream,
-) -> Option<std::result::Result<Bytes, Error>> {
+async fn next_or_stall(upstream: &mut ByteStream) -> Option<std::result::Result<Bytes, Error>> {
     match tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, upstream.next()).await {
         Ok(item) => item,
         Err(_) => Some(Err(Error::Upstream {
@@ -898,7 +962,8 @@ async fn emit_full(
     // The reqlog captures the IR (normalized ChatResponse JSON), not the
     // client-native bytes: one uniform schema across all surfaces.
     let ir_json = serde_json::to_vec(&resp).unwrap_or_default();
-    rctx.finish(resp.usage, status, false, ir_json, resp_len).await;
+    rctx.finish(resp.usage, status, false, ir_json, resp_len)
+        .await;
     Ok(GatewayResponse::Full {
         status,
         headers: json_headers(surface),

@@ -121,6 +121,9 @@ impl Store for RecordingStore {
     async fn update_api_key_limits(&self, _id: &str, _limits: LimitColumns) -> Result<()> {
         Ok(())
     }
+    async fn rename_api_key(&self, _id: &str, _name: Option<&str>) -> Result<()> {
+        Ok(())
+    }
 
     // ---- external keys ---------------------------------------------------
     async fn upsert_external_key(&self, _key: &ExternalKey) -> Result<()> {
@@ -205,6 +208,13 @@ impl Store for RecordingStore {
         Ok(())
     }
     async fn spend_rows(&self) -> Result<Vec<SpendRow>> {
+        Ok(vec![])
+    }
+    async fn usage(
+        &self,
+        _from: Timestamp,
+        _to: Timestamp,
+    ) -> Result<Vec<yb_core::spend::UsageRow>> {
         Ok(vec![])
     }
 
@@ -470,7 +480,11 @@ async fn aggregates_streaming_upstream_for_nonstreaming_client() {
         "messages": [{"role": "user", "content": "hi"}]
     });
     let resp = gateway
-        .handle(WireFormat::Anthropic, &serde_json::to_vec(&inbound).unwrap(), RequestCtx::new())
+        .handle(
+            WireFormat::Anthropic,
+            &serde_json::to_vec(&inbound).unwrap(),
+            RequestCtx::new(),
+        )
         .await
         .expect("handle succeeds");
 
@@ -482,8 +496,14 @@ async fn aggregates_streaming_upstream_for_nonstreaming_client() {
         GatewayResponse::Stream { .. } => panic!("non-streaming client must get a buffered body"),
     };
     let v: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["type"], "message", "aggregated into an Anthropic envelope");
-    assert_eq!(v["content"][0]["text"], "Hello world", "deltas were concatenated");
+    assert_eq!(
+        v["type"], "message",
+        "aggregated into an Anthropic envelope"
+    );
+    assert_eq!(
+        v["content"][0]["text"], "Hello world",
+        "deltas were concatenated"
+    );
 
     let rows = store.telemetry();
     assert_eq!(rows.len(), 1, "one telemetry row for the aggregated turn");
@@ -607,4 +627,122 @@ async fn kind_mismatch_is_a_clean_400_both_ways() {
     // Both failed turns were still recorded (guard).
     assert_eq!(store.telemetry().len(), 2);
     assert!(store.telemetry().iter().all(|t| t.is_error));
+}
+
+fn media_router() -> DeploymentRouter {
+    let deployment = |name: &str, upstream: &str, format: yb_core::MediaFormat| ModelConfig {
+        model_name: name.into(),
+        aliases: vec![],
+        deployments: vec![DeploymentConfig {
+            provider: "host-agent".into(),
+            upstream_model: upstream.into(),
+            api_base: Some(format!("http://agent:9100/deployments/{name}/v1")),
+            api_key: Some("env:YB_TEST_AGENT_TOKEN".into()),
+            upstream_format: format.into(),
+            weight: 1,
+            pricing: None,
+            health_check: Default::default(),
+            health_path: None,
+            extra: Default::default(),
+        }],
+    };
+    DeploymentRouter::from_models(
+        vec![
+            deployment(
+                "assistant-speech",
+                "piper",
+                yb_core::MediaFormat::OpenaiSpeech,
+            ),
+            deployment(
+                "assistant-transcribe",
+                "whisper",
+                yb_core::MediaFormat::OpenaiTranscription,
+            ),
+        ],
+        HashMap::new(),
+        HashMap::new(),
+        Strategy::Simple,
+    )
+}
+
+/// Speech is forwarded to the deployment's endpoint with its model and key,
+/// and the audio comes back untouched under the upstream's content type.
+#[tokio::test]
+async fn speech_is_forwarded_and_recorded() {
+    std::env::set_var("YB_TEST_AGENT_TOKEN", "agent-secret");
+    let audio = b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec();
+    let mock = Arc::new(MockClient::full(audio.clone()).with_header("content-type", "audio/wav"));
+    let client: Arc<dyn UpstreamClient> = mock.clone();
+    let store = Arc::new(RecordingStore::default());
+    let gateway = Gateway::new(
+        client,
+        Arc::new(media_router()),
+        store.clone(),
+        Arc::new(NullLogger),
+    );
+
+    let body = br#"{"model":"assistant-speech","input":"hello","voice":"default"}"#;
+    let resp = gateway
+        .handle_media(
+            yb_core::MediaFormat::OpenaiSpeech,
+            body,
+            "application/json",
+            RequestCtx::new(),
+        )
+        .await
+        .unwrap();
+    let GatewayResponse::Full {
+        status,
+        headers,
+        body: answer,
+    } = resp
+    else {
+        panic!("expected a buffered response")
+    };
+    assert_eq!(status, 200);
+    assert_eq!(answer, audio);
+    assert!(headers.contains(&("content-type".to_string(), "audio/wav".to_string())));
+
+    let sent = mock.last_request().expect("the upstream was called");
+    assert_eq!(
+        sent.url,
+        "http://agent:9100/deployments/assistant-speech/v1/audio/speech"
+    );
+    assert!(sent.headers.contains(&(
+        "authorization".to_string(),
+        "Bearer agent-secret".to_string()
+    )));
+    let sent_body: Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(sent_body["model"], "piper");
+    assert_eq!(sent_body["input"], "hello");
+
+    let telemetry = store.telemetry();
+    assert_eq!(telemetry.len(), 1);
+    assert_eq!(telemetry[0].surface, "openai_speech");
+    assert_eq!(telemetry[0].requested_model, "assistant-speech");
+    assert!(!telemetry[0].is_error);
+}
+
+/// A model that serves another endpoint refuses the request plainly.
+#[tokio::test]
+async fn media_goes_only_to_the_endpoint_a_model_serves() {
+    let client: Arc<dyn UpstreamClient> = Arc::new(MockClient::full(Vec::new()));
+    let store = Arc::new(RecordingStore::default());
+    let gateway = Gateway::new(
+        client,
+        Arc::new(media_router()),
+        store.clone(),
+        Arc::new(NullLogger),
+    );
+    let err = gateway
+        .handle_media(
+            yb_core::MediaFormat::OpenaiSpeech,
+            br#"{"model":"assistant-transcribe","input":"x"}"#,
+            "application/json",
+            RequestCtx::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.http_status(), 400, "{err}");
+    assert_eq!(store.telemetry().len(), 1);
 }

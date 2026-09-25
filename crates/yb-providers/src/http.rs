@@ -67,9 +67,9 @@ fn collect_headers(map: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
         .map(|(k, v)| {
             (
                 k.as_str().to_string(),
-                v.to_str().map(str::to_string).unwrap_or_else(|_| {
-                    String::from_utf8_lossy(v.as_bytes()).into_owned()
-                }),
+                v.to_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(v.as_bytes()).into_owned()),
             )
         })
         .collect()

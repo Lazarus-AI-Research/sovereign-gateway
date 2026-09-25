@@ -47,7 +47,13 @@ impl Encryptor for AesGcmEncryptor {
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ct = self
             .cipher
-            .encrypt(&nonce, Payload { msg: plaintext, aad })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|e| Error::Crypto(format!("encrypt failed: {e}")))?;
         let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
         out.extend_from_slice(nonce.as_slice());

@@ -97,8 +97,12 @@ impl Registry {
         let mut snap = self.snapshot();
         // Deterministic output: stable ordering across scrapes.
         snap.sort_by(|a, b| {
-            (&a.0.surface, &a.0.model, &a.0.provider, a.0.status)
-                .cmp(&(&b.0.surface, &b.0.model, &b.0.provider, b.0.status))
+            (&a.0.surface, &a.0.model, &a.0.provider, a.0.status).cmp(&(
+                &b.0.surface,
+                &b.0.model,
+                &b.0.provider,
+                b.0.status,
+            ))
         });
         let mut out = String::new();
 
@@ -114,11 +118,19 @@ impl Registry {
 
         out.push_str("# TYPE gateway_requests_total counter\n");
         for (l, s) in &snap {
-            out.push_str(&format!("gateway_requests_total{{{}}} {}\n", label_str(l), s.requests));
+            out.push_str(&format!(
+                "gateway_requests_total{{{}}} {}\n",
+                label_str(l),
+                s.requests
+            ));
         }
         out.push_str("# TYPE gateway_errors_total counter\n");
         for (l, s) in &snap {
-            out.push_str(&format!("gateway_errors_total{{{}}} {}\n", label_str(l), s.errors));
+            out.push_str(&format!(
+                "gateway_errors_total{{{}}} {}\n",
+                label_str(l),
+                s.errors
+            ));
         }
         out.push_str("# TYPE gateway_tokens_total counter\n");
         for (l, s) in &snap {
@@ -170,7 +182,9 @@ impl Registry {
 
 /// Escape a Prometheus label value (backslash, quote, newline).
 fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[cfg(test)]

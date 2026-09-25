@@ -17,7 +17,9 @@ pub mod schema;
 pub mod sqlite;
 
 pub use crypto::{AesGcmEncryptor, Argon2Hasher};
-pub use keys::{generate_api_key, hash_token, issue_api_key, KEY_PREFIX};
+pub use keys::{
+    ensure_control_key, generate_api_key, hash_token, issue_api_key, CONTROL_USERNAME, KEY_PREFIX,
+};
 pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
 

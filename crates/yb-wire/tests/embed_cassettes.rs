@@ -42,7 +42,8 @@ fn emit_request(format: &str, req: &EmbedRequest, opts: &EmbedEmitOptions) -> Ve
         "ollama_embed" => embed::ollama::emit_request(req, opts),
         other => panic!("unknown target_format {other}"),
     };
-    r.unwrap_or_else(|e| panic!("emit_request({format}) failed: {e}")).0
+    r.unwrap_or_else(|e| panic!("emit_request({format}) failed: {e}"))
+        .0
 }
 
 fn parse_response(format: &str, body: &[u8]) -> EmbedResponse {
@@ -70,7 +71,10 @@ fn emit_response(format: &str, resp: &EmbedResponse, req: &EmbedRequest) -> Vec<
 }
 
 fn load(name: &str) -> Value {
-    let path = format!("{}/tests/cassettes/embed/{name}.json", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/tests/cassettes/embed/{name}.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse cassette {name}: {e}"))
 }
@@ -88,7 +92,8 @@ fn run(name: &str) {
     let emitted = emit_request(target_format, &req, &EmbedEmitOptions::new(target_model));
     let got: Value = serde_json::from_slice(&emitted).unwrap();
     assert_eq!(
-        got, c["expected_upstream_body"],
+        got,
+        c["expected_upstream_body"],
         "[{name}] request {inbound_format} -> {target_format} mismatch\n got: {}\nwant: {}",
         serde_json::to_string_pretty(&got).unwrap(),
         serde_json::to_string_pretty(&c["expected_upstream_body"]).unwrap(),
@@ -100,7 +105,8 @@ fn run(name: &str) {
     let out = emit_response(inbound_format, &parsed, &req);
     let got: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(
-        got, c["expected_client_body"],
+        got,
+        c["expected_client_body"],
         "[{name}] response {target_format} -> {inbound_format} mismatch\n got: {}\nwant: {}",
         serde_json::to_string_pretty(&got).unwrap(),
         serde_json::to_string_pretty(&c["expected_client_body"]).unwrap(),

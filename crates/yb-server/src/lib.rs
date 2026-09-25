@@ -33,8 +33,10 @@ use yb_core::config::DeploymentMode;
 use yb_core::principal::KeyAuth;
 use yb_core::ratelimit::Limits;
 use yb_core::spend::{BudgetAction, SubjectType};
-use yb_core::{AccessPolicy, EmbedFormat, UpstreamFormat, new_id, now, Error, WireFormat};
-use yb_gateway::{GatewayResponse, RequestCtx};
+use yb_core::{
+    new_id, now, AccessPolicy, EmbedFormat, Error, MediaFormat, UpstreamFormat, WireFormat,
+};
+use yb_gateway::{GatewayResponse, RequestCtx, TokenMeter};
 
 pub use state::AppState;
 
@@ -63,6 +65,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/embeddings", post(openai_embeddings))
         .route("/v1/multimodalembeddings", post(voyage_embeddings))
         .route("/v2/embed", post(cohere_embed))
+        .route("/v1/images/generations", post(openai_images))
+        .route("/v1/audio/speech", post(openai_speech))
+        .route("/v1/audio/transcriptions", post(openai_transcription))
         // Gemini: GET lists models, POST does inference (one wildcard, two
         // methods — avoids a static-vs-catch-all route conflict).
         .route("/v1beta/*path", get(gemini_models).post(gemini))
@@ -74,6 +79,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/openai/v1/chat/completions", post(openai_chat))
         .route("/openai/v1/responses", post(openai_responses))
         .route("/openai/v1/embeddings", post(openai_embeddings))
+        .route("/openai/v1/images/generations", post(openai_images))
+        .route("/openai/v1/audio/speech", post(openai_speech))
+        .route(
+            "/openai/v1/audio/transcriptions",
+            post(openai_transcription),
+        )
         .route("/voyage/v1/multimodalembeddings", post(voyage_embeddings))
         .route("/cohere/v2/embed", post(cohere_embed))
         .route("/openai/v1/models", get(models_openai))
@@ -194,19 +205,51 @@ async fn discovery_access(state: &AppState, headers: &HeaderMap) -> Result<Acces
 /// only the model name would keep advertising a model whose sole provider is
 /// denied, and every call to it would come back "no eligible provider".
 async fn model_names(state: &AppState, access: &AccessPolicy) -> Vec<String> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut names = Vec::new();
+    listed_models(state, access)
+        .await
+        .into_iter()
+        .map(|model| model.name)
+        .collect()
+}
+
+/// A model discovery lists, with what its reachable deployments say it does.
+struct ListedModel {
+    name: String,
+    /// What the model answers: `chat`, `embedding`, `image_generation`,
+    /// `audio_speech` or `audio_transcription`.
+    mode: &'static str,
+    vision: bool,
+}
+
+/// The reachable models, in stable order, as [`model_names`] decides them.
+async fn listed_models(state: &AppState, access: &AccessPolicy) -> Vec<ListedModel> {
+    let mut models: Vec<ListedModel> = Vec::new();
     if let Ok(deployments) = state.store.list_deployments().await {
         for d in deployments {
             if !access.permits_model(&d.model_id) || !access.permits_provider(&d.provider_id) {
                 continue;
             }
-            if seen.insert(d.model_name.clone()) {
-                names.push(d.model_name);
+            match models.iter_mut().find(|m| m.name == d.model_name) {
+                Some(listed) => listed.vision |= d.extra.vision,
+                None => models.push(ListedModel {
+                    mode: mode_of(d.upstream_format),
+                    vision: d.extra.vision,
+                    name: d.model_name,
+                }),
             }
         }
     }
-    names
+    models
+}
+
+fn mode_of(format: UpstreamFormat) -> &'static str {
+    match format {
+        UpstreamFormat::Chat(_) => "chat",
+        UpstreamFormat::Embed(_) => "embedding",
+        UpstreamFormat::Media(MediaFormat::OpenaiImages) => "image_generation",
+        UpstreamFormat::Media(MediaFormat::OpenaiSpeech) => "audio_speech",
+        UpstreamFormat::Media(MediaFormat::OpenaiTranscription) => "audio_transcription",
+    }
 }
 
 /// `GET /v1/models` and `/openai/v1/models` — OpenAI-shaped model list.
@@ -215,10 +258,17 @@ async fn models_openai(State(state): State<AppState>, headers: HeaderMap) -> Res
         Ok(a) => a,
         Err(e) => return error_response(&e),
     };
-    let data: Vec<_> = model_names(&state, &access)
+    // `mode` and `supports_vision` are additions to OpenAI's shape, which
+    // clients ignore; they let a caller choose a model by what it does.
+    let data: Vec<_> = listed_models(&state, &access)
         .await
         .into_iter()
-        .map(|id| json!({ "id": id, "object": "model", "created": 0, "owned_by": "gateway" }))
+        .map(|model| {
+            json!({
+                "id": model.name, "object": "model", "created": 0, "owned_by": "gateway",
+                "mode": model.mode, "supports_vision": model.vision,
+            })
+        })
         .collect();
     Json(json!({ "object": "list", "data": data })).into_response()
 }
@@ -335,12 +385,34 @@ async fn openai_embeddings(
     run_inference(state, EmbedFormat::OpenaiEmbed.into(), headers, body).await
 }
 
-/// `POST /v2/embed` — Cohere-dialect embeddings.
-async fn cohere_embed(
+/// `POST /v1/images/generations` — OpenAI image generation, forwarded.
+async fn openai_images(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    run_inference(state, MediaFormat::OpenaiImages.into(), headers, body).await
+}
+
+/// `POST /v1/audio/speech` — OpenAI text to speech, forwarded.
+async fn openai_speech(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    run_inference(state, MediaFormat::OpenaiSpeech.into(), headers, body).await
+}
+
+/// `POST /v1/audio/transcriptions` — OpenAI speech to text (a multipart
+/// form), forwarded.
+async fn openai_transcription(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    run_inference(
+        state,
+        MediaFormat::OpenaiTranscription.into(),
+        headers,
+        body,
+    )
+    .await
+}
+
+/// `POST /v2/embed` — Cohere-dialect embeddings.
+async fn cohere_embed(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     run_inference(state, EmbedFormat::CohereEmbed.into(), headers, body).await
 }
 
@@ -387,7 +459,10 @@ async fn gemini(
             EmbedFormat::GeminiEmbed.into()
         }
         _ => {
-            obj.insert("stream".to_string(), json!(action == "streamGenerateContent"));
+            obj.insert(
+                "stream".to_string(),
+                json!(action == "streamGenerateContent"),
+            );
             WireFormat::Gemini.into()
         }
     };
@@ -472,10 +547,20 @@ async fn run_inference(
 
     // 4. Build the request context and orchestrate.
     let request_id = header_str(&headers, "x-request-id").unwrap_or_else(new_id);
-    let trace_id = header_str(&headers, "x-trace-id")
-        .or_else(|| header_str(&headers, "traceparent"));
+    let trace_id =
+        header_str(&headers, "x-trace-id").or_else(|| header_str(&headers, "traceparent"));
 
     let access = effective_access(&state, &keyauth).await;
+
+    // Admission checked the tokens-per-minute budget; the turn's own tokens
+    // are charged against it once the upstream has reported them.
+    let token_meter = (state.ratelimit_enabled && limits.tpm > 0).then(|| {
+        let limiter = state.limiter.clone();
+        let scope = scope.clone();
+        TokenMeter::new(move |tokens| {
+            limiter.charge_tokens(&scope, limits, tokens, now());
+        })
+    });
 
     let ctx = RequestCtx {
         api_key: Some(keyauth.api_key.clone()),
@@ -486,6 +571,7 @@ async fn run_inference(
         excluded_model_ids: Default::default(),
         excluded_provider_ids: Default::default(),
         access,
+        token_meter,
     };
 
     // Best-effort last-used bookkeeping; never fails the request.
@@ -494,6 +580,14 @@ async fn run_inference(
     let result = match surface {
         UpstreamFormat::Chat(f) => state.gateway.handle(f, &body, ctx).await,
         UpstreamFormat::Embed(f) => state.gateway.handle_embed(f, &body, ctx).await,
+        UpstreamFormat::Media(f) => {
+            let content_type =
+                header_str(&headers, "content-type").unwrap_or_else(|| "application/json".into());
+            state
+                .gateway
+                .handle_media(f, &body, &content_type, ctx)
+                .await
+        }
     };
     match result {
         Ok(resp) => gateway_response_into_axum(resp),
@@ -601,7 +695,6 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
     }
     s
 }
-
 
 // ---- response mapping ----------------------------------------------------
 

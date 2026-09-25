@@ -8,6 +8,7 @@ It accepts four chat wire formats in front, normalizes through a provider-agnost
 
 - **Four inference dialects** — Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and Gemini `generateContent`, all served from one binary. The gateway translates between the client's wire format and the upstream's.
 - **Embeddings, including multimodal text+image** — OpenAI `/v1/embeddings` (plus Jina-style multimodal inputs), Gemini `:embedContent`/`:batchEmbedContents`, Cohere `/v2/embed`, and Voyage `/v1/multimodalembeddings` in front; OpenAI-compatible, Gemini, Cohere, Voyage, and Ollama upstreams behind.
+- **Images, speech and transcription** — OpenAI `/v1/images/generations`, `/v1/audio/speech` and `/v1/audio/transcriptions` (a multipart form) are routed by model to deployments whose `upstream_format` is `openai_images`, `openai_speech` or `openai_transcription`, and forwarded as sent with only the model replaced.
 - **Provider-agnostic IR** — a hand-rolled intermediate representation (`yb-wire`) covering requests, responses, and SSE streams.
 - **Deterministic routing** — model-to-deployment mapping with ordered fallbacks. No ML routing.
 - **Access control** — virtual keys, spend tracking and budgets, rate limits, users and teams with RBAC, and per-key model access.
@@ -25,7 +26,7 @@ cargo build --release
 
 ## Configure
 
-The gateway is configured by one TOML file and reads no environment variables (only `RUST_LOG`). There is no environment indirection for upstream keys either — each deployment carries its own `api_key` directly.
+The gateway is configured by one TOML file. Secrets can stay out of it and out of the database: `[database] dsn_env` and `[security] control_key_env` name environment variables, and a provider `api_key` of the form `env:NAME` is read from the environment when a request is sent.
 
 ```sh
 cp gateway.example.toml gateway.toml

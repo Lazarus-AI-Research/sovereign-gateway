@@ -57,14 +57,48 @@ impl EmbedFormat {
     }
 }
 
-/// What a deployment speaks upstream: a chat dialect or an embeddings dialect.
-/// Untagged serde over two disjoint snake_case string sets, so config/DB/admin
+/// The protocol a **media** surface or upstream speaks: OpenAI's image
+/// generation, speech and transcription endpoints. Nothing is translated: the
+/// gateway reads the model to route and forwards the request as it came.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaFormat {
+    /// `POST /v1/images/generations`, JSON in and out.
+    OpenaiImages,
+    /// `POST /v1/audio/speech`, JSON in, audio bytes out.
+    OpenaiSpeech,
+    /// `POST /v1/audio/transcriptions`, multipart form in, JSON out.
+    OpenaiTranscription,
+}
+
+impl MediaFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MediaFormat::OpenaiImages => "openai_images",
+            MediaFormat::OpenaiSpeech => "openai_speech",
+            MediaFormat::OpenaiTranscription => "openai_transcription",
+        }
+    }
+
+    /// The endpoint below an OpenAI-compatible `/v1` base.
+    pub fn path(self) -> &'static str {
+        match self {
+            MediaFormat::OpenaiImages => "images/generations",
+            MediaFormat::OpenaiSpeech => "audio/speech",
+            MediaFormat::OpenaiTranscription => "audio/transcriptions",
+        }
+    }
+}
+
+/// What a deployment speaks upstream: a chat, embeddings or media dialect.
+/// Untagged serde over disjoint snake_case string sets, so config/DB/admin
 /// carry flat strings (`"openai_chat"`, `"cohere_embed"`, …) with no migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum UpstreamFormat {
     Chat(WireFormat),
     Embed(EmbedFormat),
+    Media(MediaFormat),
 }
 
 impl UpstreamFormat {
@@ -72,7 +106,14 @@ impl UpstreamFormat {
         match self {
             UpstreamFormat::Chat(f) => f.as_str(),
             UpstreamFormat::Embed(f) => f.as_str(),
+            UpstreamFormat::Media(f) => f.as_str(),
         }
+    }
+}
+
+impl From<MediaFormat> for UpstreamFormat {
+    fn from(f: MediaFormat) -> Self {
+        UpstreamFormat::Media(f)
     }
 }
 
@@ -122,7 +163,7 @@ impl HealthCheck {
 /// Open-ended per-deployment extras: a `string → value` JSON object stored on
 /// the deployment row, so new knobs are additive and need no migration.
 ///
-/// Two keys are understood today:
+/// Three keys are understood today:
 ///
 /// - `cloudflare_access` (bool) — present the Cloudflare Access service token so
 ///   the request passes a Zero Trust edge policy. The flag only selects *which*
@@ -130,6 +171,9 @@ impl HealthCheck {
 ///   (`[upstream.cloudflare_access]`), is immutable at runtime, and is never
 ///   stored here, returned by the admin API, or editable in the UI.
 /// - `headers` (string map) — literal request headers to add.
+/// - `vision` (bool) — the models this provider serves take images as input;
+///   model discovery says so, so a caller can pick a vision model without
+///   trying one.
 ///
 /// Any other key is preserved verbatim, so a value written by a newer build
 /// survives a round-trip through an older one.
@@ -146,6 +190,9 @@ pub struct Extra {
     /// Literal headers to add to every upstream call for this deployment. These
     /// are applied *last* and never displace auth (see `append_headers`).
     pub headers: BTreeMap<String, String>,
+    /// The models this provider serves take images as input.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub vision: bool,
     /// Keys this build does not interpret, kept so they round-trip intact.
     #[serde(flatten)]
     pub rest: serde_json::Map<String, serde_json::Value>,

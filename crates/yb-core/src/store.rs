@@ -14,7 +14,7 @@ use crate::model::{
 };
 use crate::principal::KeyAuth;
 use crate::routing::{DeploymentRecord, HealthRecord, ModelRecord, NewDeployment, ProviderRecord};
-use crate::spend::{Budget, Period, RollupDelta, SpendRow, SubjectType};
+use crate::spend::{Budget, Period, RollupDelta, SpendRow, SubjectType, UsageRow};
 use async_trait::async_trait;
 
 /// Nullable per-subject rate limits, as stored on keys/users.
@@ -64,6 +64,7 @@ pub trait Store: Send + Sync {
     async fn delete_api_key(&self, id: &str) -> crate::Result<()>;
     async fn update_api_key_access(&self, id: &str, policy: &AccessPolicy) -> crate::Result<()>;
     async fn update_api_key_limits(&self, id: &str, limits: LimitColumns) -> crate::Result<()>;
+    async fn rename_api_key(&self, id: &str, name: Option<&str>) -> crate::Result<()>;
 
     // ---- external (BYOK) keys, per user -------------------------------
     async fn upsert_external_key(&self, key: &ExternalKey) -> crate::Result<()>;
@@ -77,8 +78,7 @@ pub trait Store: Send + Sync {
     async fn delete_team(&self, id: &str) -> crate::Result<()>;
     async fn update_team_access(&self, id: &str, policy: &AccessPolicy) -> crate::Result<()>;
     async fn upsert_membership(&self, m: &TeamMembership) -> crate::Result<()>;
-    async fn list_memberships_for_user(&self, user_id: &str)
-        -> crate::Result<Vec<TeamMembership>>;
+    async fn list_memberships_for_user(&self, user_id: &str) -> crate::Result<Vec<TeamMembership>>;
     async fn list_team_members(&self, team_id: &str) -> crate::Result<Vec<TeamMembership>>;
     async fn delete_membership(&self, team_id: &str, user_id: &str) -> crate::Result<()>;
 
@@ -104,6 +104,8 @@ pub trait Store: Send + Sync {
     async fn upsert_budget(&self, budget: &Budget) -> crate::Result<()>;
     async fn delete_budget(&self, id: &str) -> crate::Result<()>;
     async fn spend_rows(&self) -> crate::Result<Vec<SpendRow>>;
+    /// Per-day usage for turns recorded in `[from, to)`.
+    async fn usage(&self, from: Timestamp, to: Timestamp) -> crate::Result<Vec<UsageRow>>;
 
     // ---- rate-limit counters (db backend, multi-replica) --------------
     async fn incr_rate_counter(

@@ -56,6 +56,23 @@ pub struct ChatRequest {
     /// reads it; every other surface builds from [`Self::messages`] as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_input: Option<Vec<serde_json::Value>>,
+    /// The client's whole request object, kept verbatim when the surface was
+    /// OpenAI Chat Completions — replayed only on a Chat→Chat relay.
+    ///
+    /// The IR carries what every provider shares, so the fields only an
+    /// OpenAI-compatible server acts on (`response_format`, `seed`, `n`, the
+    /// penalties, `logprobs`, `logit_bias`, `user`, `parallel_tool_calls`) and
+    /// the engine extensions a local server takes (`top_k`,
+    /// `repetition_penalty`, `chat_template_kwargs`, guided decoding) have no
+    /// place in it. A structured-output client that loses `response_format`
+    /// gets prose back with nothing to notice, so a same-shape relay forwards
+    /// the request as it came, changing only the model and the streaming the
+    /// gateway needs.
+    ///
+    /// Only the Chat Completions parser sets this, and only its emitter reads
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_request: Option<Map<String, Value>>,
     /// The client asked for token usage on the stream
     /// (`stream_options.include_usage`, OpenAI Chat Completions only).
     ///
@@ -369,8 +386,16 @@ mod usage_tests {
         assert!(u.is_empty());
 
         // Anthropic's rhythm: input once, output growing.
-        u.merge(&Usage { input_tokens: 41, output_tokens: 0, ..Default::default() });
-        u.merge(&Usage { input_tokens: 41, output_tokens: 30, ..Default::default() });
+        u.merge(&Usage {
+            input_tokens: 41,
+            output_tokens: 0,
+            ..Default::default()
+        });
+        u.merge(&Usage {
+            input_tokens: 41,
+            output_tokens: 30,
+            ..Default::default()
+        });
         assert_eq!((u.input_tokens, u.output_tokens), (41, 30));
         assert!(!u.is_empty());
 
@@ -380,8 +405,15 @@ mod usage_tests {
         assert_eq!((u.input_tokens, u.output_tokens), (41, 30));
 
         // Cache fields fold the same way.
-        u.merge(&Usage { cache_read_tokens: 7, ..Default::default() });
-        u.merge(&Usage { cache_read_tokens: 0, cache_write_tokens: 3, ..Default::default() });
+        u.merge(&Usage {
+            cache_read_tokens: 7,
+            ..Default::default()
+        });
+        u.merge(&Usage {
+            cache_read_tokens: 0,
+            cache_write_tokens: 3,
+            ..Default::default()
+        });
         assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (7, 3));
     }
 }
@@ -411,15 +443,17 @@ impl ChatRequest {
     }
 }
 
-
 #[cfg(test)]
 mod passthrough_tests {
     use crate::{anthropic, openai_chat, openai_responses, EmitOptions};
     use serde_json::{json, Value};
 
+    type Emit =
+        fn(&crate::ChatRequest, &EmitOptions) -> crate::Result<(Vec<u8>, Vec<(String, String)>)>;
+
     fn relay(
         parse: fn(&[u8]) -> crate::Result<crate::ChatRequest>,
-        emit: fn(&crate::ChatRequest, &EmitOptions) -> crate::Result<(Vec<u8>, Vec<(String, String)>)>,
+        emit: Emit,
         body: Value,
     ) -> String {
         let req = parse(&serde_json::to_vec(&body).unwrap()).expect("parses");
@@ -436,14 +470,21 @@ mod passthrough_tests {
     /// the whole request with it.
     #[test]
     fn anthropic_to_anthropic_preserves_thinking() {
-        let s = relay(anthropic::parse_request, anthropic::emit_request, json!({
+        let s = relay(
+            anthropic::parse_request,
+            anthropic::emit_request,
+            json!({
             "model":"m","max_tokens":16,"messages":[
               {"role":"assistant","content":[
                  {"type":"thinking","thinking":"deep","signature":"SIG-BLOB"},
                  {"type":"redacted_thinking","data":"REDACTED-BLOB"}]},
-              {"role":"user","content":"hi"}]}));
+              {"role":"user","content":"hi"}]}),
+        );
         assert!(s.contains("SIG-BLOB"), "thinking signature dropped: {s}");
-        assert!(s.contains("REDACTED-BLOB"), "redacted_thinking dropped: {s}");
+        assert!(
+            s.contains("REDACTED-BLOB"),
+            "redacted_thinking dropped: {s}"
+        );
     }
 
     /// An unmodeled Anthropic block must parse, not 400.
@@ -452,17 +493,24 @@ mod passthrough_tests {
         let body = json!({"model":"m","max_tokens":16,"messages":[
             {"role":"user","content":[{"type":"some_future_block","payload":"X"}]}]});
         let req = anthropic::parse_request(&serde_json::to_vec(&body).unwrap());
-        assert!(req.is_ok(), "an unknown block must not fail the turn: {req:?}");
+        assert!(
+            req.is_ok(),
+            "an unknown block must not fail the turn: {req:?}"
+        );
     }
 
     /// Assistant reasoning must round-trip a chat history, as it already does
     /// on the stream.
     #[test]
     fn chat_to_chat_preserves_reasoning() {
-        let s = relay(openai_chat::parse_request, openai_chat::emit_request, json!({
+        let s = relay(
+            openai_chat::parse_request,
+            openai_chat::emit_request,
+            json!({
             "model":"m","messages":[
               {"role":"assistant","content":"hi","reasoning_content":"REASON-BLOB"},
-              {"role":"user","content":"yo"}]}));
+              {"role":"user","content":"yo"}]}),
+        );
         assert!(s.contains("REASON-BLOB"), "reasoning_content dropped: {s}");
     }
 
@@ -475,12 +523,99 @@ mod passthrough_tests {
                {"type":"redacted_thinking","data":"REDACTED-BLOB"}]}]});
         let req = anthropic::parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
         for (name, bytes) in [
-            ("openai_chat", openai_chat::emit_request(&req, &EmitOptions::new("t")).unwrap().0),
-            ("openai_responses",
-             openai_responses::emit_request(&req, &EmitOptions::new("t")).unwrap().0),
+            (
+                "openai_chat",
+                openai_chat::emit_request(&req, &EmitOptions::new("t"))
+                    .unwrap()
+                    .0,
+            ),
+            (
+                "openai_responses",
+                openai_responses::emit_request(&req, &EmitOptions::new("t"))
+                    .unwrap()
+                    .0,
+            ),
         ] {
             let s = String::from_utf8(bytes).unwrap();
-            assert!(!s.contains("REDACTED-BLOB"), "{name} received an Anthropic-only block");
+            assert!(
+                !s.contains("REDACTED-BLOB"),
+                "{name} received an Anthropic-only block"
+            );
         }
+    }
+
+    /// A Chat→Chat relay forwards what only an OpenAI-compatible server acts
+    /// on — structured output, sampling controls, engine extensions — changing
+    /// only the model and asking for the usage the gateway bills from.
+    #[test]
+    fn chat_to_chat_relay_keeps_every_field() {
+        let body = json!({
+            "model": "assistant", "stream": false,
+            "messages": [{"role": "user", "content": "hi", "name": "sam"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": {}}},
+            "seed": 7, "n": 1, "presence_penalty": 0.5, "frequency_penalty": 0.25,
+            "logprobs": true, "logit_bias": {"42": -100}, "user": "sam",
+            "parallel_tool_calls": false, "top_k": 20, "repetition_penalty": 1.1,
+            "chat_template_kwargs": {"enable_thinking": false}
+        });
+        let req = openai_chat::parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let opts = EmitOptions {
+            stream: true,
+            ..EmitOptions::new("upstream-model")
+        };
+        let sent: Value =
+            serde_json::from_slice(&openai_chat::emit_request(&req, &opts).unwrap().0).unwrap();
+        assert_eq!(sent["model"], "upstream-model");
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["stream_options"]["include_usage"], true);
+        for field in [
+            "response_format",
+            "seed",
+            "n",
+            "presence_penalty",
+            "frequency_penalty",
+            "logprobs",
+            "logit_bias",
+            "user",
+            "parallel_tool_calls",
+            "top_k",
+            "repetition_penalty",
+            "chat_template_kwargs",
+            "messages",
+        ] {
+            assert_eq!(
+                sent[field], body[field],
+                "{field} must reach the upstream unchanged"
+            );
+        }
+    }
+
+    /// A non-streaming answer carries the model's reasoning as the stream does.
+    #[test]
+    fn a_non_streaming_answer_keeps_its_reasoning() {
+        let response = crate::ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            content: vec![
+                crate::ContentBlock::Thinking {
+                    text: "weighing it".into(),
+                    signature: None,
+                },
+                crate::ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            stop_reason: crate::StopReason::EndTurn,
+            usage: crate::Usage::default(),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+        let body: Value =
+            serde_json::from_slice(&openai_chat::emit_response(&response).unwrap()).unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["reasoning_content"],
+            "weighing it"
+        );
+        assert_eq!(body["choices"][0]["message"]["content"], "answer");
     }
 }

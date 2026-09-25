@@ -94,10 +94,7 @@ impl Gateway {
                 }
             }
             Ok(Err(e)) => report.detail = Some(format!("transport: {e}")),
-            Err(_) => {
-                report.detail =
-                    Some(format!("timed out after {}s", CHECK_TIMEOUT.as_secs()))
-            }
+            Err(_) => report.detail = Some(format!("timed out after {}s", CHECK_TIMEOUT.as_secs())),
         }
         report.latency_ms = started.elapsed().as_millis() as u64;
         report
@@ -119,6 +116,7 @@ fn build_check_request(
     let mut auth = match dep.upstream_format {
         UpstreamFormat::Chat(f) => auth_headers(f, &api_key),
         UpstreamFormat::Embed(f) => embed_auth_headers(f, &api_key),
+        UpstreamFormat::Media(_) => yb_providers::media_auth_headers(&api_key),
     };
     // Edge headers (e.g. Cloudflare Access) apply to every check method — a
     // backend behind Zero Trust 403s the probe otherwise.
@@ -131,10 +129,9 @@ fn build_check_request(
             let url = match dep.health_path.as_deref() {
                 Some(p) if p.starts_with("http://") || p.starts_with("https://") => p.to_string(),
                 other => {
-                    let base = dep
-                        .api_base
-                        .as_deref()
-                        .ok_or_else(|| "http_ok needs api_base or an absolute health_path".to_string())?;
+                    let base = dep.api_base.as_deref().ok_or_else(|| {
+                        "http_ok needs api_base or an absolute health_path".to_string()
+                    })?;
                     format!("{}{}", origin_of(base), other.unwrap_or("/"))
                 }
             };
@@ -162,12 +159,9 @@ fn build_check_request(
             let (url, body, mut headers) = match dep.upstream_format {
                 UpstreamFormat::Chat(f) => {
                     let req = probe_chat_request(&dep.upstream_model);
-                    let (body, headers) = wire::emit_request(
-                        f,
-                        &req,
-                        &EmitOptions::new(dep.upstream_model.clone()),
-                    )
-                    .map_err(|e| format!("probe emit: {e}"))?;
+                    let (body, headers) =
+                        wire::emit_request(f, &req, &EmitOptions::new(dep.upstream_model.clone()))
+                            .map_err(|e| format!("probe emit: {e}"))?;
                     let url = build_url(f, dep.api_base.as_deref(), &dep.upstream_model, false);
                     (url, body, headers)
                 }
@@ -181,6 +175,14 @@ fn build_check_request(
                     .map_err(|e| format!("probe emit: {e}"))?;
                     let url = build_embed_url(f, dep.api_base.as_deref(), &dep.upstream_model);
                     (url, body, headers)
+                }
+                // A real image or speech request is too costly to spend on a
+                // health check; these deployments use http_ok or models_list.
+                UpstreamFormat::Media(f) => {
+                    return Err(format!(
+                    "a probe check is not available for {} deployments; use http_ok or models_list",
+                    f.as_str()
+                ))
                 }
             };
             headers.extend(auth);
@@ -233,29 +235,37 @@ pub fn models_list_url_for(
     api_base: Option<&str>,
 ) -> std::result::Result<String, String> {
     let (default_base, version, endpoint) = match fmt {
-        UpstreamFormat::Chat(WireFormat::Anthropic) => ("https://api.anthropic.com", "v1", "models"),
+        UpstreamFormat::Chat(WireFormat::Anthropic) => {
+            ("https://api.anthropic.com", "v1", "models")
+        }
         UpstreamFormat::Chat(WireFormat::OpenaiChat | WireFormat::OpenaiResponses)
-        | UpstreamFormat::Embed(EmbedFormat::OpenaiEmbed) => {
-            ("https://api.openai.com", "v1", "models")
+        | UpstreamFormat::Embed(EmbedFormat::OpenaiEmbed)
+        | UpstreamFormat::Media(_) => ("https://api.openai.com", "v1", "models"),
+        UpstreamFormat::Chat(WireFormat::Gemini)
+        | UpstreamFormat::Embed(EmbedFormat::GeminiEmbed) => (
+            "https://generativelanguage.googleapis.com",
+            "v1beta",
+            "models",
+        ),
+        UpstreamFormat::Embed(EmbedFormat::CohereEmbed) => {
+            ("https://api.cohere.com", "v1", "models")
         }
-        UpstreamFormat::Chat(WireFormat::Gemini) | UpstreamFormat::Embed(EmbedFormat::GeminiEmbed) => {
-            ("https://generativelanguage.googleapis.com", "v1beta", "models")
+        UpstreamFormat::Embed(EmbedFormat::OllamaEmbed) => {
+            ("http://localhost:11434", "api", "tags")
         }
-        UpstreamFormat::Embed(EmbedFormat::CohereEmbed) => ("https://api.cohere.com", "v1", "models"),
-        UpstreamFormat::Embed(EmbedFormat::OllamaEmbed) => ("http://localhost:11434", "api", "tags"),
         UpstreamFormat::Embed(EmbedFormat::VoyageEmbed) => {
-            return Err(
-                "voyage has no model-listing endpoint; use http_ok or probe".to_string()
-            )
+            return Err("voyage has no model-listing endpoint; use http_ok or probe".to_string())
         }
     };
     let base = api_base.unwrap_or(default_base);
     let base = base.strip_suffix('/').unwrap_or(base);
-    Ok(if base == version || base.ends_with(&format!("/{version}")) {
-        format!("{base}/{endpoint}")
-    } else {
-        format!("{base}/{version}/{endpoint}")
-    })
+    Ok(
+        if base == version || base.ends_with(&format!("/{version}")) {
+            format!("{base}/{endpoint}")
+        } else {
+            format!("{base}/{version}/{endpoint}")
+        },
+    )
 }
 
 /// Back-compat shim for the health path, which has a deployment in hand.
@@ -279,7 +289,12 @@ mod tests {
     use super::*;
     use yb_core::EmbedFormat;
 
-    fn dep(fmt: UpstreamFormat, base: Option<&str>, check: HealthCheck, path: Option<&str>) -> DeploymentRecord {
+    fn dep(
+        fmt: UpstreamFormat,
+        base: Option<&str>,
+        check: HealthCheck,
+        path: Option<&str>,
+    ) -> DeploymentRecord {
         DeploymentRecord {
             id: "d1".into(),
             model_id: "m1".into(),
@@ -316,11 +331,32 @@ mod tests {
 
     #[test]
     fn models_list_urls_per_family() {
-        let d = dep(WireFormat::OpenaiChat.into(), Some("http://host:8000/v1"), HealthCheck::ModelsList, None);
-        assert_eq!(build_check_request(&d, Vec::new()).unwrap().unwrap().url, "http://host:8000/v1/models");
-        let d = dep(EmbedFormat::OllamaEmbed.into(), Some("http://host:11434"), HealthCheck::ModelsList, None);
-        assert_eq!(build_check_request(&d, Vec::new()).unwrap().unwrap().url, "http://host:11434/api/tags");
-        let d = dep(EmbedFormat::VoyageEmbed.into(), None, HealthCheck::ModelsList, None);
+        let d = dep(
+            WireFormat::OpenaiChat.into(),
+            Some("http://host:8000/v1"),
+            HealthCheck::ModelsList,
+            None,
+        );
+        assert_eq!(
+            build_check_request(&d, Vec::new()).unwrap().unwrap().url,
+            "http://host:8000/v1/models"
+        );
+        let d = dep(
+            EmbedFormat::OllamaEmbed.into(),
+            Some("http://host:11434"),
+            HealthCheck::ModelsList,
+            None,
+        );
+        assert_eq!(
+            build_check_request(&d, Vec::new()).unwrap().unwrap().url,
+            "http://host:11434/api/tags"
+        );
+        let d = dep(
+            EmbedFormat::VoyageEmbed.into(),
+            None,
+            HealthCheck::ModelsList,
+            None,
+        );
         assert!(build_check_request(&d, Vec::new()).is_err());
     }
 
@@ -331,7 +367,12 @@ mod tests {
         assert_eq!(r.url, "https://api.anthropic.com/v1/messages");
         assert_eq!(r.method, HttpMethod::Post);
         assert!(!r.body.is_empty());
-        let d = dep(EmbedFormat::CohereEmbed.into(), None, HealthCheck::Probe, None);
+        let d = dep(
+            EmbedFormat::CohereEmbed.into(),
+            None,
+            HealthCheck::Probe,
+            None,
+        );
         let r = build_check_request(&d, Vec::new()).unwrap().unwrap();
         assert_eq!(r.url, "https://api.cohere.com/v2/embed");
     }
@@ -345,19 +386,43 @@ mod tests {
             ("cf-access-client-secret".to_string(), "sec".to_string()),
         ];
         let has_cf = |r: &UpstreamRequest| {
-            r.headers.iter().any(|(k, v)| k == "cf-access-client-id" && v == "cid")
-                && r.headers.iter().any(|(k, _)| k == "cf-access-client-secret")
+            r.headers
+                .iter()
+                .any(|(k, v)| k == "cf-access-client-id" && v == "cid")
+                && r.headers
+                    .iter()
+                    .any(|(k, _)| k == "cf-access-client-secret")
         };
 
-        let d = dep(WireFormat::OpenaiChat.into(), Some("http://h:8000/v1"), HealthCheck::HttpOk, Some("/health"));
+        let d = dep(
+            WireFormat::OpenaiChat.into(),
+            Some("http://h:8000/v1"),
+            HealthCheck::HttpOk,
+            Some("/health"),
+        );
         let r = build_check_request(&d, cf.clone()).unwrap().unwrap();
         assert!(has_cf(&r));
-        assert!(r.headers.iter().any(|(k, v)| k == "authorization" && v == "Bearer k"));
+        assert!(r
+            .headers
+            .iter()
+            .any(|(k, v)| k == "authorization" && v == "Bearer k"));
 
-        let d = dep(WireFormat::OpenaiChat.into(), Some("http://h:8000/v1"), HealthCheck::ModelsList, None);
-        assert!(has_cf(&build_check_request(&d, cf.clone()).unwrap().unwrap()));
+        let d = dep(
+            WireFormat::OpenaiChat.into(),
+            Some("http://h:8000/v1"),
+            HealthCheck::ModelsList,
+            None,
+        );
+        assert!(has_cf(
+            &build_check_request(&d, cf.clone()).unwrap().unwrap()
+        ));
 
-        let d = dep(WireFormat::OpenaiChat.into(), Some("http://h:8000/v1"), HealthCheck::Probe, None);
+        let d = dep(
+            WireFormat::OpenaiChat.into(),
+            Some("http://h:8000/v1"),
+            HealthCheck::Probe,
+            None,
+        );
         assert!(has_cf(&build_check_request(&d, cf).unwrap().unwrap()));
     }
 
@@ -375,14 +440,16 @@ mod tests {
 /// Cohere return `{"models":[{"name":…}]}`; Ollama returns `{"models":[{"name":…}]}`
 /// from `/api/tags`. Gemini prefixes ids with `models/`, which is stripped so the
 /// value matches what a request would send.
-pub fn parse_models_list(fmt: UpstreamFormat, body: &[u8]) -> std::result::Result<Vec<String>, String> {
+pub fn parse_models_list(
+    fmt: UpstreamFormat,
+    body: &[u8],
+) -> std::result::Result<Vec<String>, String> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("upstream returned invalid JSON: {e}"))?;
     let mut out = Vec::new();
     let (key, field) = match fmt {
-        UpstreamFormat::Chat(WireFormat::Gemini) | UpstreamFormat::Embed(EmbedFormat::GeminiEmbed) => {
-            ("models", "name")
-        }
+        UpstreamFormat::Chat(WireFormat::Gemini)
+        | UpstreamFormat::Embed(EmbedFormat::GeminiEmbed) => ("models", "name"),
         UpstreamFormat::Embed(EmbedFormat::CohereEmbed | EmbedFormat::OllamaEmbed) => {
             ("models", "name")
         }
@@ -467,7 +534,8 @@ mod discovery_tests {
     #[test]
     fn listing_url_joins_without_duplicating_the_version() {
         assert_eq!(
-            models_list_url_for(WireFormat::OpenaiChat.into(), Some("http://host:8000/v1")).unwrap(),
+            models_list_url_for(WireFormat::OpenaiChat.into(), Some("http://host:8000/v1"))
+                .unwrap(),
             "http://host:8000/v1/models"
         );
         assert_eq!(

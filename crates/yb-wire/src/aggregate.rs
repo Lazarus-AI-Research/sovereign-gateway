@@ -76,7 +76,10 @@ impl Aggregator {
     pub fn into_response(self, id: impl Into<String>) -> ChatResponse {
         let mut content = Vec::new();
         if !self.thinking.is_empty() {
-            content.push(ContentBlock::Thinking { text: self.thinking, signature: None });
+            content.push(ContentBlock::Thinking {
+                text: self.thinking,
+                signature: None,
+            });
         }
         if !self.text.is_empty() {
             content.push(ContentBlock::Text { text: self.text });
@@ -165,9 +168,15 @@ mod tests {
             StreamEvent::TextDelta { text: "Hel".into() },
             StreamEvent::TextDelta { text: "lo".into() },
             StreamEvent::UsageDelta {
-                usage: Usage { input_tokens: 5, output_tokens: 2, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 5,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
             },
-            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+            },
         ]);
         let resp = agg.into_response("id-1");
         assert_eq!(resp.model, "m");
@@ -180,9 +189,16 @@ mod tests {
     fn aggregates_tool_call_json() {
         let mut agg = Aggregator::new();
         agg.push_all(&[
-            StreamEvent::ToolUseStart { id: "t1".into(), name: "get_weather".into() },
-            StreamEvent::ToolUseDelta { partial_json: "{\"city\":".into() },
-            StreamEvent::ToolUseDelta { partial_json: "\"SF\"}".into() },
+            StreamEvent::ToolUseStart {
+                id: "t1".into(),
+                name: "get_weather".into(),
+            },
+            StreamEvent::ToolUseDelta {
+                partial_json: "{\"city\":".into(),
+            },
+            StreamEvent::ToolUseDelta {
+                partial_json: "\"SF\"}".into(),
+            },
         ]);
         let resp = agg.into_response("id-2");
         assert_eq!(resp.stop_reason, StopReason::ToolUse);
@@ -202,7 +218,11 @@ mod tests {
             model: "m".into(),
             content: vec![ContentBlock::text("hi")],
             stop_reason: StopReason::EndTurn,
-            usage: Usage { input_tokens: 3, output_tokens: 1, ..Default::default() },
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 1,
+                ..Default::default()
+            },
             prompt_cache_key: None,
             prompt_cache_retention: None,
         };

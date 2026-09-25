@@ -168,8 +168,12 @@ impl Limiter {
             .tpm
             .get_or_insert_with(|| Bucket::new(limits.tpm as f64, self.window, now));
         bucket.capacity = limits.tpm as f64;
-        let (ok, _) = bucket.take(tokens as f64, now);
-        !ok
+        // The tokens were spent whether or not the bucket held them, so they
+        // are always taken: a turn larger than what is left leaves a debt the
+        // refill pays off before the next request is admitted.
+        bucket.refill(now);
+        bucket.tokens -= tokens as f64;
+        bucket.tokens < 1.0
     }
 
     /// Preflight TPM: reject if the bucket is already empty from prior arrears.
@@ -185,7 +189,10 @@ impl Limiter {
         bucket.refill(now);
         if bucket.tokens < 1.0 {
             let secs = 1.0 / bucket.refill_per_sec.max(1e-9);
-            (true, Duration::from_secs_f64(secs).max(Duration::from_secs(1)))
+            (
+                true,
+                Duration::from_secs_f64(secs).max(Duration::from_secs(1)),
+            )
         } else {
             (false, Duration::ZERO)
         }
