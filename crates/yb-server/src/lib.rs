@@ -547,8 +547,13 @@ async fn run_inference(
 
     // 4. Build the request context and orchestrate.
     let request_id = header_str(&headers, "x-request-id").unwrap_or_else(new_id);
-    let trace_id =
-        header_str(&headers, "x-trace-id").or_else(|| header_str(&headers, "traceparent"));
+    let (trace_id, parent_span_id) = match header_str(&headers, "traceparent")
+        .as_deref()
+        .and_then(parse_traceparent)
+    {
+        Some((trace, parent)) => (Some(trace), Some(parent)),
+        None => (header_str(&headers, "x-trace-id"), None),
+    };
 
     let access = effective_access(&state, &keyauth).await;
 
@@ -568,6 +573,7 @@ async fn run_inference(
         team_id: keyauth.api_key.team_id.clone(),
         request_id,
         trace_id,
+        parent_span_id,
         excluded_model_ids: Default::default(),
         excluded_provider_ids: Default::default(),
         access,
@@ -671,6 +677,24 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         return Some(v.trim().to_string());
     }
     header_str(headers, "x-gateway-key").map(|s| s.trim().to_string())
+}
+
+/// The trace and the caller's span from a W3C `traceparent`
+/// (`00-<32 hex trace>-<16 hex span>-<2 hex flags>`), so the turn joins the
+/// caller's trace as its child. Anything else is not a trace context.
+pub fn parse_traceparent(value: &str) -> Option<(String, String)> {
+    let mut parts = value.trim().split('-');
+    let (version, trace, span, flags) =
+        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let hex = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let valid = hex(version, 2)
+        && version != "ff"
+        && hex(trace, 32)
+        && trace.bytes().any(|b| b != b'0')
+        && hex(span, 16)
+        && span.bytes().any(|b| b != b'0')
+        && hex(flags, 2);
+    valid.then(|| (trace.to_ascii_lowercase(), span.to_ascii_lowercase()))
 }
 
 /// Read a header as an owned `String`, if present and valid UTF-8.

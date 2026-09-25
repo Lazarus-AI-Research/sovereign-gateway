@@ -746,3 +746,50 @@ async fn media_goes_only_to_the_endpoint_a_model_serves() {
     assert_eq!(err.http_status(), 400, "{err}");
     assert_eq!(store.telemetry().len(), 1);
 }
+
+/// A client stops reading once its answer has ended; the turn is still
+/// complete, not abandoned, whether or not the upstream has closed yet.
+#[tokio::test]
+async fn a_client_that_stops_at_the_end_leaves_a_complete_turn() {
+    use futures::StreamExt;
+    let chunks = vec![
+        r#"data: {"id":"c","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"hi"}}]}"#.to_string() + "\n\n",
+        r#"data: {"id":"c","model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#.to_string() + "\n\n",
+        r#"data: {"id":"c","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}"#.to_string() + "\n\n",
+        "data: [DONE]".to_string() + "\n\n",
+    ];
+    let client: Arc<dyn UpstreamClient> = Arc::new(MockClient::sse(chunks));
+    let store = Arc::new(RecordingStore::default());
+    let gateway = Gateway::new(
+        client,
+        Arc::new(test_router()),
+        store.clone(),
+        Arc::new(NullLogger),
+    );
+    let body = serde_json::to_vec(&json!({
+        "model": "my-model", "stream": true, "stream_options": {"include_usage": true},
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+    let GatewayResponse::Stream { mut stream, .. } = gateway
+        .handle(WireFormat::OpenaiChat, &body, RequestCtx::new())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a stream")
+    };
+    let mut seen = String::new();
+    while let Some(chunk) = stream.next().await {
+        seen.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        if seen.contains("data: [DONE]") {
+            break;
+        }
+    }
+    drop(stream);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let telemetry = store.telemetry();
+    assert_eq!(telemetry.len(), 1, "{telemetry:?}");
+    assert_eq!(telemetry[0].status, 200);
+    assert!(!telemetry[0].is_error);
+    assert_eq!(telemetry[0].output_tokens, 1);
+}

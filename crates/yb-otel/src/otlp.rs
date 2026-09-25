@@ -180,8 +180,9 @@ pub fn logs_payload(service_name: &str, recs: &[TelemetryRecord]) -> Value {
 }
 
 /// Build the `/v1/traces` body: one span per turn. A client-supplied 32-hex
-/// trace id is honored so the turn joins the caller's trace; otherwise a fresh
-/// id is minted.
+/// trace id is honored so the turn joins the caller's trace, as a child of
+/// the caller's span when a `traceparent` named one; otherwise a fresh id is
+/// minted.
 pub fn traces_payload(service_name: &str, recs: &[TelemetryRecord]) -> Value {
     let spans: Vec<Value> = recs
         .iter()
@@ -195,7 +196,7 @@ pub fn traces_payload(service_name: &str, recs: &[TelemetryRecord]) -> Value {
             let span_id = &uuid::Uuid::new_v4().simple().to_string()[..16];
             let start = rec.created_at.timestamp_nanos_opt().unwrap_or(0);
             let end = start + rec.latency_ms.max(0) * 1_000_000;
-            json!({
+            let mut span = json!({
                 "traceId": trace_id,
                 "spanId": span_id,
                 "name": "gateway.turn",
@@ -204,7 +205,11 @@ pub fn traces_payload(service_name: &str, recs: &[TelemetryRecord]) -> Value {
                 "endTimeUnixNano": end.to_string(),
                 "attributes": turn_attrs(rec),
                 "status": {"code": if rec.is_error { 2 } else { 1 }},
-            })
+            });
+            if let Some(parent) = &rec.parent_span_id {
+                span["parentSpanId"] = json!(parent);
+            }
+            span
         })
         .collect();
     json!({"resourceSpans": [{
@@ -224,6 +229,7 @@ mod tests {
             id: new_id(),
             request_id: "req-1".into(),
             trace_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            parent_span_id: None,
             api_key_id: Some("key-1".into()),
             user_id: Some("user-1".into()),
             team_id: None,
@@ -275,6 +281,20 @@ mod tests {
         ));
         // no body-like fields, only structured metadata
         assert!(!attrs.iter().any(|a| a["key"] == "request_body"));
+    }
+
+    /// A turn that continues a caller's span is exported as its child.
+    #[test]
+    fn traces_payload_names_the_callers_span_as_parent() {
+        let mut r = rec();
+        r.parent_span_id = Some("00f067aa0ba902b7".into());
+        let v = traces_payload("gw", &[r]);
+        let span = &v["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["parentSpanId"], "00f067aa0ba902b7");
+        let v = traces_payload("gw", &[rec()]);
+        assert!(v["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+            .get("parentSpanId")
+            .is_none());
     }
 
     #[test]

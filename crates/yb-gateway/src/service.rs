@@ -54,6 +54,7 @@ pub(crate) struct TurnGuard {
     user_id: Option<String>,
     team_id: Option<String>,
     trace_id: Option<String>,
+    parent_span_id: Option<String>,
     request_id: String,
     surface: String,
     requested_model: String,
@@ -68,6 +69,7 @@ impl TurnGuard {
             id: new_id(),
             request_id: self.request_id.clone(),
             trace_id: self.trace_id.clone(),
+            parent_span_id: self.parent_span_id.clone(),
             api_key_id: self.api_key_id.clone(),
             user_id: self.user_id.clone(),
             team_id: self.team_id.clone(),
@@ -160,6 +162,9 @@ pub struct RequestCtx {
     pub request_id: String,
     /// Optional distributed-trace id.
     pub trace_id: Option<String>,
+    /// The caller's span this request continues, when it sent a W3C
+    /// `traceparent`.
+    pub parent_span_id: Option<String>,
     /// Public model names excluded for this caller (denylist).
     /// Model **ids** excluded by policy, so a rename cannot un-exclude one.
     pub excluded_model_ids: BTreeSet<String>,
@@ -597,6 +602,7 @@ impl Gateway {
             user_id: ctx.user_id.clone(),
             team_id: ctx.team_id.clone(),
             trace_id: ctx.trace_id.clone(),
+            parent_span_id: ctx.parent_span_id.clone(),
             request_id: ctx.request_id.clone(),
             surface: surface.to_string(),
             requested_model: requested_model.to_string(),
@@ -682,6 +688,7 @@ impl Gateway {
             user_id: ctx.user_id.clone(),
             team_id: ctx.team_id.clone(),
             trace_id: ctx.trace_id.clone(),
+            parent_span_id: ctx.parent_span_id.clone(),
             request_id: ctx.request_id.clone(),
             surface: surface.to_string(),
             requested_model: requested_model.to_string(),
@@ -751,6 +758,7 @@ pub(crate) struct RecordCtx {
     user_id: Option<String>,
     team_id: Option<String>,
     trace_id: Option<String>,
+    parent_span_id: Option<String>,
     request_id: String,
     surface: String,
     requested_model: String,
@@ -816,6 +824,7 @@ impl RecordCtx {
             id: new_id(),
             request_id: self.request_id.clone(),
             trace_id: self.trace_id.clone(),
+            parent_span_id: self.parent_span_id.clone(),
             api_key_id: self.api_key_id.clone(),
             user_id: self.user_id.clone(),
             team_id: self.team_id.clone(),
@@ -1058,6 +1067,8 @@ struct StreamState {
     done: bool,
     /// Set once telemetry has been recorded (exactly once).
     recorded: bool,
+    /// The client's dialect, which says what ends its answer.
+    surface: WireFormat,
 }
 
 impl StreamState {
@@ -1093,6 +1104,18 @@ impl Drop for StreamState {
     }
 }
 
+/// Whether these bytes carry the end of the answer in the client's dialect:
+/// what a client waits for before it stops reading.
+fn ends_stream(surface: WireFormat, bytes: &[u8], events: &[StreamEvent]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    match surface {
+        WireFormat::OpenaiChat => text.contains("data: [DONE]"),
+        WireFormat::Anthropic => text.contains("message_stop"),
+        WireFormat::OpenaiResponses => text.contains("response.completed"),
+        WireFormat::Gemini => events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
+    }
+}
+
 /// Build the client-facing translated SSE stream.
 ///
 /// Upstream bytes are buffered and split on `\n`; each line is decoded into IR
@@ -1125,6 +1148,7 @@ fn translate_stream(
         rctx,
         done: false,
         recorded: false,
+        surface,
     };
 
     let s = stream::unfold(init, |mut st| async move {
@@ -1170,6 +1194,18 @@ fn translate_stream(
                         continue;
                     }
                     st.response_bytes += bytes.len() as i64;
+                    // A client that has its answer's end may hang up before
+                    // the upstream closes, and the turn would then read as
+                    // abandoned; it is recorded as complete the moment the
+                    // end goes out.
+                    if !st.recorded && ends_stream(st.surface, &bytes, &events) {
+                        let ir = st.ir_json();
+                        st.rctx
+                            .finish(st.usage, st.status, false, ir, st.response_bytes)
+                            .await;
+                        st.recorded = true;
+                        st.done = true;
+                    }
                     return Some((Ok(Bytes::from(bytes)), st));
                 }
                 Some(Err(e)) => {

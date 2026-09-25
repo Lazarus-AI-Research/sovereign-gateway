@@ -1755,3 +1755,27 @@ async fn model_discovery_says_what_each_model_does() {
     assert_eq!(entry("speaking")["mode"], "audio_speech");
     assert_eq!(entry("speaking")["supports_vision"], false);
 }
+
+/// A W3C traceparent names the trace and the caller's span; anything
+/// malformed is not a trace context.
+#[test]
+fn a_traceparent_names_the_trace_and_the_callers_span() {
+    use yb_server::parse_traceparent;
+    assert_eq!(
+        parse_traceparent("00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01"),
+        Some((
+            "4bf92f3577b34da6a3ce929d0e0e4736".into(),
+            "00f067aa0ba902b7".into()
+        ))
+    );
+    for bad in [
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+        "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01",
+        "not a trace",
+    ] {
+        assert_eq!(parse_traceparent(bad), None, "{bad}");
+    }
+}

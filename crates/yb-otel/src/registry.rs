@@ -197,6 +197,7 @@ mod tests {
             id: new_id(),
             request_id: new_id(),
             trace_id: None,
+            parent_span_id: None,
             api_key_id: None,
             user_id: None,
             team_id: None,
