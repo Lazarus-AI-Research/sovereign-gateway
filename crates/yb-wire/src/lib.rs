@@ -24,6 +24,7 @@ pub mod embed;
 pub mod error;
 pub mod gemini;
 pub mod ir;
+pub mod media;
 pub mod openai_chat;
 pub mod openai_responses;
 
@@ -37,6 +38,7 @@ pub use ir::{
     ChatRequest, ChatResponse, ContentBlock, Message, Reasoning, Role, StopReason, StreamEvent,
     Tool, ToolChoice, Usage,
 };
+pub use media::{route_media_request, MediaRequest};
 
 /// An emitted upstream request: the serialized body plus the format-specific
 /// headers (`content-type`, `anthropic-version`, …) the caller should send.

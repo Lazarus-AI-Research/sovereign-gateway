@@ -14,7 +14,7 @@ use yb_wire::{
 };
 
 /// Map a `yb-wire` error into the domain error type.
-fn wire_err(e: yb_wire::WireError) -> Error {
+pub(crate) fn wire_err(e: yb_wire::WireError) -> Error {
     Error::Wire(e.to_string())
 }
 

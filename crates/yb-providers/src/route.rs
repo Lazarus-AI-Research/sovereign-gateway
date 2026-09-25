@@ -90,6 +90,17 @@ pub fn build_embed_url(fmt: EmbedFormat, api_base: Option<&str>, upstream_model:
     }
 }
 
+/// The URL of an OpenAI media endpoint below a deployment's base, with the same
+/// `/v1` handling as the other OpenAI-compatible URLs.
+pub fn build_media_url(fmt: yb_core::MediaFormat, api_base: Option<&str>) -> String {
+    let base = trim_base(api_base.unwrap_or(OPENAI_BASE));
+    if base == "v1" || base.ends_with("/v1") {
+        format!("{base}/{}", fmt.path())
+    } else {
+        format!("{base}/v1/{}", fmt.path())
+    }
+}
+
 /// The prefix that makes a stored upstream key a reference to an environment
 /// variable rather than the secret itself.
 pub const ENVIRONMENT_REFERENCE: &str = "env:";
@@ -153,6 +164,15 @@ pub fn embed_auth_headers(fmt: EmbedFormat, api_key: &str) -> Vec<(String, Strin
         EmbedFormat::OllamaEmbed if api_key.is_empty() => vec![],
         _ => vec![("authorization".to_string(), format!("Bearer {api_key}"))],
     }
+}
+
+/// The authentication header for OpenAI's image, speech and transcription
+/// endpoints: `Authorization: Bearer <key>`.
+pub fn media_auth_headers(api_key: &str) -> Vec<(String, String)> {
+    vec![(
+        "authorization".to_string(),
+        format!("Bearer {}", upstream_secret(api_key)),
+    )]
 }
 
 /// The Cloudflare Access service-token header pair.

@@ -25,6 +25,7 @@
 
 pub mod embed;
 pub mod health;
+pub mod media;
 pub mod router;
 pub mod service;
 pub mod wire;

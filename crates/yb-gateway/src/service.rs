@@ -279,6 +279,7 @@ impl Gateway {
         let mut headers = match fmt {
             yb_core::UpstreamFormat::Chat(f) => auth_headers(f, key),
             yb_core::UpstreamFormat::Embed(f) => yb_providers::embed_auth_headers(f, key),
+            yb_core::UpstreamFormat::Media(_) => yb_providers::media_auth_headers(key),
         };
         append_headers(&mut headers, self.extra_headers(extra, label));
 
@@ -406,7 +407,7 @@ impl Gateway {
             // deployments are a different universe (see Gateway::handle_embed).
             let upstream_fmt = match deployment.upstream_format {
                 yb_core::UpstreamFormat::Chat(f) => f,
-                yb_core::UpstreamFormat::Embed(_) => continue,
+                yb_core::UpstreamFormat::Embed(_) | yb_core::UpstreamFormat::Media(_) => continue,
             };
             saw_embed_only = false;
             let opts = EmitOptions {

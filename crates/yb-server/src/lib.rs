@@ -33,7 +33,9 @@ use yb_core::config::DeploymentMode;
 use yb_core::principal::KeyAuth;
 use yb_core::ratelimit::Limits;
 use yb_core::spend::{BudgetAction, SubjectType};
-use yb_core::{new_id, now, AccessPolicy, EmbedFormat, Error, UpstreamFormat, WireFormat};
+use yb_core::{
+    new_id, now, AccessPolicy, EmbedFormat, Error, MediaFormat, UpstreamFormat, WireFormat,
+};
 use yb_gateway::{GatewayResponse, RequestCtx};
 
 pub use state::AppState;
@@ -63,6 +65,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/embeddings", post(openai_embeddings))
         .route("/v1/multimodalembeddings", post(voyage_embeddings))
         .route("/v2/embed", post(cohere_embed))
+        .route("/v1/images/generations", post(openai_images))
+        .route("/v1/audio/speech", post(openai_speech))
+        .route("/v1/audio/transcriptions", post(openai_transcription))
         // Gemini: GET lists models, POST does inference (one wildcard, two
         // methods — avoids a static-vs-catch-all route conflict).
         .route("/v1beta/*path", get(gemini_models).post(gemini))
@@ -74,6 +79,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/openai/v1/chat/completions", post(openai_chat))
         .route("/openai/v1/responses", post(openai_responses))
         .route("/openai/v1/embeddings", post(openai_embeddings))
+        .route("/openai/v1/images/generations", post(openai_images))
+        .route("/openai/v1/audio/speech", post(openai_speech))
+        .route(
+            "/openai/v1/audio/transcriptions",
+            post(openai_transcription),
+        )
         .route("/voyage/v1/multimodalembeddings", post(voyage_embeddings))
         .route("/cohere/v2/embed", post(cohere_embed))
         .route("/openai/v1/models", get(models_openai))
@@ -335,6 +346,32 @@ async fn openai_embeddings(
     run_inference(state, EmbedFormat::OpenaiEmbed.into(), headers, body).await
 }
 
+/// `POST /v1/images/generations` — OpenAI image generation, forwarded.
+async fn openai_images(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    run_inference(state, MediaFormat::OpenaiImages.into(), headers, body).await
+}
+
+/// `POST /v1/audio/speech` — OpenAI text to speech, forwarded.
+async fn openai_speech(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    run_inference(state, MediaFormat::OpenaiSpeech.into(), headers, body).await
+}
+
+/// `POST /v1/audio/transcriptions` — OpenAI speech to text (a multipart
+/// form), forwarded.
+async fn openai_transcription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    run_inference(
+        state,
+        MediaFormat::OpenaiTranscription.into(),
+        headers,
+        body,
+    )
+    .await
+}
+
 /// `POST /v2/embed` — Cohere-dialect embeddings.
 async fn cohere_embed(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     run_inference(state, EmbedFormat::CohereEmbed.into(), headers, body).await
@@ -493,6 +530,14 @@ async fn run_inference(
     let result = match surface {
         UpstreamFormat::Chat(f) => state.gateway.handle(f, &body, ctx).await,
         UpstreamFormat::Embed(f) => state.gateway.handle_embed(f, &body, ctx).await,
+        UpstreamFormat::Media(f) => {
+            let content_type =
+                header_str(&headers, "content-type").unwrap_or_else(|| "application/json".into());
+            state
+                .gateway
+                .handle_media(f, &body, &content_type, ctx)
+                .await
+        }
     };
     match result {
         Ok(resp) => gateway_response_into_axum(resp),

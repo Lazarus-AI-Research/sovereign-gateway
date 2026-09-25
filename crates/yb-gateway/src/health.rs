@@ -116,6 +116,7 @@ fn build_check_request(
     let mut auth = match dep.upstream_format {
         UpstreamFormat::Chat(f) => auth_headers(f, &api_key),
         UpstreamFormat::Embed(f) => embed_auth_headers(f, &api_key),
+        UpstreamFormat::Media(_) => yb_providers::media_auth_headers(&api_key),
     };
     // Edge headers (e.g. Cloudflare Access) apply to every check method — a
     // backend behind Zero Trust 403s the probe otherwise.
@@ -175,6 +176,14 @@ fn build_check_request(
                     let url = build_embed_url(f, dep.api_base.as_deref(), &dep.upstream_model);
                     (url, body, headers)
                 }
+                // A real image or speech request is too costly to spend on a
+                // health check; these deployments use http_ok or models_list.
+                UpstreamFormat::Media(f) => {
+                    return Err(format!(
+                    "a probe check is not available for {} deployments; use http_ok or models_list",
+                    f.as_str()
+                ))
+                }
             };
             headers.extend(auth);
             Ok(Some(UpstreamRequest {
@@ -230,9 +239,8 @@ pub fn models_list_url_for(
             ("https://api.anthropic.com", "v1", "models")
         }
         UpstreamFormat::Chat(WireFormat::OpenaiChat | WireFormat::OpenaiResponses)
-        | UpstreamFormat::Embed(EmbedFormat::OpenaiEmbed) => {
-            ("https://api.openai.com", "v1", "models")
-        }
+        | UpstreamFormat::Embed(EmbedFormat::OpenaiEmbed)
+        | UpstreamFormat::Media(_) => ("https://api.openai.com", "v1", "models"),
         UpstreamFormat::Chat(WireFormat::Gemini)
         | UpstreamFormat::Embed(EmbedFormat::GeminiEmbed) => (
             "https://generativelanguage.googleapis.com",

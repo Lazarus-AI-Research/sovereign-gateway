@@ -67,7 +67,7 @@ impl Gateway {
             // Embedding requests only dispatch to embedding-format deployments.
             let upstream_fmt = match deployment.upstream_format {
                 UpstreamFormat::Embed(f) => f,
-                UpstreamFormat::Chat(_) => continue,
+                UpstreamFormat::Chat(_) | UpstreamFormat::Media(_) => continue,
             };
             saw_chat_only = false;
 
