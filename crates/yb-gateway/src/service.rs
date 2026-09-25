@@ -54,6 +54,7 @@ pub(crate) struct TurnGuard {
     user_id: Option<String>,
     team_id: Option<String>,
     trace_id: Option<String>,
+    parent_span_id: Option<String>,
     request_id: String,
     surface: String,
     requested_model: String,
@@ -68,6 +69,7 @@ impl TurnGuard {
             id: new_id(),
             request_id: self.request_id.clone(),
             trace_id: self.trace_id.clone(),
+            parent_span_id: self.parent_span_id.clone(),
             api_key_id: self.api_key_id.clone(),
             user_id: self.user_id.clone(),
             team_id: self.team_id.clone(),
@@ -160,6 +162,9 @@ pub struct RequestCtx {
     pub request_id: String,
     /// Optional distributed-trace id.
     pub trace_id: Option<String>,
+    /// The caller's span this request continues, when it sent a W3C
+    /// `traceparent`.
+    pub parent_span_id: Option<String>,
     /// Public model names excluded for this caller (denylist).
     /// Model **ids** excluded by policy, so a rename cannot un-exclude one.
     pub excluded_model_ids: BTreeSet<String>,
@@ -597,6 +602,7 @@ impl Gateway {
             user_id: ctx.user_id.clone(),
             team_id: ctx.team_id.clone(),
             trace_id: ctx.trace_id.clone(),
+            parent_span_id: ctx.parent_span_id.clone(),
             request_id: ctx.request_id.clone(),
             surface: surface.to_string(),
             requested_model: requested_model.to_string(),
@@ -682,6 +688,7 @@ impl Gateway {
             user_id: ctx.user_id.clone(),
             team_id: ctx.team_id.clone(),
             trace_id: ctx.trace_id.clone(),
+            parent_span_id: ctx.parent_span_id.clone(),
             request_id: ctx.request_id.clone(),
             surface: surface.to_string(),
             requested_model: requested_model.to_string(),
@@ -751,6 +758,7 @@ pub(crate) struct RecordCtx {
     user_id: Option<String>,
     team_id: Option<String>,
     trace_id: Option<String>,
+    parent_span_id: Option<String>,
     request_id: String,
     surface: String,
     requested_model: String,
@@ -816,6 +824,7 @@ impl RecordCtx {
             id: new_id(),
             request_id: self.request_id.clone(),
             trace_id: self.trace_id.clone(),
+            parent_span_id: self.parent_span_id.clone(),
             api_key_id: self.api_key_id.clone(),
             user_id: self.user_id.clone(),
             team_id: self.team_id.clone(),

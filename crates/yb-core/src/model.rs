@@ -341,6 +341,10 @@ pub struct TelemetryRecord {
     pub id: Id,
     pub request_id: String,
     pub trace_id: Option<String>,
+    /// The caller's span this turn continues, from a W3C `traceparent`; the
+    /// turn's span is exported as its child. Not stored.
+    #[serde(default, skip_serializing)]
+    pub parent_span_id: Option<String>,
     pub api_key_id: Option<Id>,
     pub user_id: Option<Id>,
     pub team_id: Option<Id>,
