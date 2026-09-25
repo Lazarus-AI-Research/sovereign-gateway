@@ -5,7 +5,7 @@ use base64::Engine as _;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use yb_core::{
-    new_id, now, AccessPolicy, ApiKey, IssuedKey, KeyScope, LimitColumns, Result, Store,
+    new_id, now, AccessPolicy, ApiKey, IssuedKey, KeyScope, LimitColumns, Result, Role, Store, User,
 };
 
 /// The gateway virtual-key prefix. Every issued token starts with `yb_`.
@@ -83,6 +83,76 @@ pub async fn issue_api_key(
     };
     store.create_api_key(&key).await?;
     Ok(IssuedKey { key, token })
+}
+
+/// The account the control key acts as.
+pub const CONTROL_USERNAME: &str = "control";
+
+/// Makes `token` the control key: a key scoped for inference and
+/// administration, owned by the `control` administrator, which has no usable
+/// password and so can only act through the key. A control key issued under
+/// an earlier token is revoked, so rotating the token is a restart.
+pub async fn ensure_control_key(store: &dyn Store, token: &str) -> Result<ApiKey> {
+    let owner = match store.get_user_by_username(CONTROL_USERNAME).await? {
+        Some(user) => {
+            if user.role != Role::Admin {
+                store.set_user_role(&user.id, Role::Admin).await?;
+            }
+            user
+        }
+        None => {
+            let user = User {
+                id: new_id(),
+                username: CONTROL_USERNAME.to_string(),
+                // Not a password hash, so no password ever matches it.
+                password_hash: "!".to_string(),
+                role: Role::Admin,
+                rpm_limit: None,
+                tpm_limit: None,
+                max_concurrent: None,
+                created_at: now(),
+                last_login_at: None,
+                deleted_at: None,
+            };
+            store.create_user(&user).await?;
+            user
+        }
+    };
+    let hash = hash_token(token);
+    let mut current = None;
+    for key in store.list_api_keys_for_user(&owner.id).await? {
+        if key.deleted_at.is_some() || key.name.as_deref() != Some(CONTROL_USERNAME) {
+            continue;
+        }
+        if key.hash == hash {
+            current = Some(key);
+        } else {
+            store.delete_api_key(&key.id).await?;
+        }
+    }
+    if let Some(key) = current {
+        return Ok(key);
+    }
+    let visible = |range: std::ops::Range<usize>| token.get(range).unwrap_or_default().to_string();
+    let key = ApiKey {
+        id: new_id(),
+        owner_user_id: owner.id,
+        team_id: None,
+        hash,
+        key_prefix: visible(0..token.len().min(8)),
+        key_suffix: visible(token.len().saturating_sub(4)..token.len()),
+        name: Some(CONTROL_USERNAME.to_string()),
+        scopes: vec![KeyScope::Inference, KeyScope::Admin],
+        access: AccessPolicy::default(),
+        rpm_limit: None,
+        tpm_limit: None,
+        max_concurrent: None,
+        created_at: now(),
+        last_used_at: None,
+        deleted_at: None,
+    };
+    store.create_api_key(&key).await?;
+    Ok(key)
 }
 
 #[cfg(test)]

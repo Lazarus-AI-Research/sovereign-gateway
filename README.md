@@ -25,7 +25,7 @@ cargo build --release
 
 ## Configure
 
-The gateway is configured by one TOML file and reads no environment variables (only `RUST_LOG`). There is no environment indirection for upstream keys either — each deployment carries its own `api_key` directly.
+The gateway is configured by one TOML file. Secrets can stay out of it and out of the database: `[database] dsn_env` and `[security] control_key_env` name environment variables, and a provider `api_key` of the form `env:NAME` is read from the environment when a request is sent.
 
 ```sh
 cp gateway.example.toml gateway.toml

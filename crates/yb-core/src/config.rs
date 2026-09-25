@@ -2,10 +2,12 @@
 //!
 //! The config file is the single source of truth for how the process boots:
 //! database backend, bind address, secrets, request-logging, feature flags, and
-//! routing policy. There are no `GATEWAY_*` environment variables, and no
-//! environment indirection for upstream keys — each deployment carries its own
-//! `api_key` directly. The model list is **not** here: it lives in the database,
-//! loaded with `gateway import <models-file>` (see [`ModelsFile`]).
+//! routing policy. Secrets may stay out of it: the file can name the
+//! environment variable holding the database DSN and the control key, and a
+//! provider's `api_key` of the form `env:NAME` is read from the environment.
+//! The model list is **not** here: it lives in the database, loaded with
+//! `gateway import <models-file>` or managed through the admin API (see
+//! [`ModelsFile`]).
 
 use crate::catalog::ModelPrice;
 use crate::routing::UpstreamFormat;
@@ -70,6 +72,9 @@ pub struct DatabaseConfig {
     pub backend: DbBackend,
     pub path: String,
     pub dsn: Option<String>,
+    /// The environment variable holding the DSN, for a DSN whose password
+    /// should not be written into the config file. `dsn` wins when both are set.
+    pub dsn_env: Option<String>,
 }
 
 impl Default for DatabaseConfig {
@@ -78,6 +83,7 @@ impl Default for DatabaseConfig {
             backend: DbBackend::Sqlite,
             path: "./gateway.db".to_string(),
             dsn: None,
+            dsn_env: None,
         }
     }
 }
@@ -89,6 +95,12 @@ impl Default for DatabaseConfig {
 pub struct SecurityConfig {
     /// 32-byte AES-256-GCM key (base64 or hex) for BYOK secret-at-rest.
     pub byok_key: Option<String>,
+    /// The environment variable holding the control key: the credential a
+    /// control plane that operates the gateway presents. `serve` makes sure a
+    /// key with that token exists, scoped for both inference and
+    /// administration and owned by the `control` administrator, and then
+    /// creates no default `admin`/`admin` account.
+    pub control_key_env: Option<String>,
 }
 
 /// Which admin-console login methods are available, and their settings.

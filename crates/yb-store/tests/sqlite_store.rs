@@ -13,7 +13,7 @@ use yb_core::model::{Role, Team, TeamMembership, TelemetryRecord, User};
 use yb_core::spend::{Budget, BudgetAction, Period, RollupDelta, SubjectType};
 use yb_core::{new_id, now, AccessPolicy, ExternalKey, LimitColumns, Store};
 use yb_store::crypto::{AesGcmEncryptor, Argon2Hasher};
-use yb_store::keys::{hash_token, issue_api_key};
+use yb_store::keys::{ensure_control_key, hash_token, issue_api_key};
 use yb_store::SqliteStore;
 
 /// A temp DB path that deletes its files (incl. WAL/SHM) on drop.
@@ -948,4 +948,44 @@ async fn api_key_scopes_roundtrip_and_legacy_single_value() {
         .unwrap()
         .unwrap();
     assert_eq!(auth.api_key.scopes, vec![KeyScope::Admin]);
+}
+
+/// The control key exists after `serve` starts, acts as an administrator with
+/// both scopes, survives a restart unchanged, and a new token revokes the old.
+#[tokio::test]
+async fn control_key_is_ensured_and_rotated() {
+    let (store, _db) = fresh_store().await;
+    let first = ensure_control_key(&store, "control-token-one")
+        .await
+        .unwrap();
+    let auth = store
+        .verify_api_key(&hash_token("control-token-one"))
+        .await
+        .unwrap()
+        .expect("the control token authenticates");
+    assert_eq!(auth.user.username, "control");
+    assert_eq!(auth.user.role, Role::Admin);
+    assert!(auth.api_key.has_scope(yb_core::KeyScope::Admin));
+    assert!(auth.api_key.has_scope(yb_core::KeyScope::Inference));
+    assert!(!Argon2Hasher.verify("", &auth.user.password_hash));
+
+    let again = ensure_control_key(&store, "control-token-one")
+        .await
+        .unwrap();
+    assert_eq!(again.id, first.id, "a restart keeps the same key");
+
+    ensure_control_key(&store, "control-token-two")
+        .await
+        .unwrap();
+    assert!(store
+        .verify_api_key(&hash_token("control-token-one"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .verify_api_key(&hash_token("control-token-two"))
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(store.count_users().await.unwrap(), 1);
 }

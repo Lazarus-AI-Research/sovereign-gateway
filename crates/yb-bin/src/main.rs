@@ -294,7 +294,15 @@ async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> 
     store.migrate().await?;
     tracing::info!("store migrated");
 
-    if store.count_users().await.unwrap_or(0) == 0 {
+    if let Some(variable) = &cfg.security.control_key_env {
+        let token = std::env::var(variable)
+            .map_err(|_| format!("security.control_key_env names {variable}, which is not set"))?;
+        if token.trim().is_empty() {
+            return Err(format!("{variable} is empty; the control key needs a value").into());
+        }
+        yb_store::ensure_control_key(store.as_ref(), token.trim()).await?;
+        tracing::info!(variable = %variable, "control key ensured");
+    } else if store.count_users().await.unwrap_or(0) == 0 {
         // First run: implicitly create a default admin user so the console is
         // usable immediately. Customize with `gateway setup --user … --password …`.
         match upsert_admin(store.as_ref(), "admin", "admin").await {
@@ -444,12 +452,19 @@ async fn build_store(db: &DatabaseConfig) -> Result<Arc<dyn Store>, Box<dyn std:
             Ok(Arc::new(SqliteStore::connect(&db.path).await?))
         }
         DbBackend::Postgres => {
-            let dsn = db
-                .dsn
-                .as_deref()
-                .ok_or("database.backend = \"postgres\" requires database.dsn")?;
+            let dsn = match (&db.dsn, &db.dsn_env) {
+                (Some(dsn), _) => dsn.clone(),
+                (None, Some(variable)) => std::env::var(variable)
+                    .map_err(|_| format!("database.dsn_env names {variable}, which is not set"))?,
+                (None, None) => {
+                    return Err(
+                        "database.backend = \"postgres\" requires database.dsn or database.dsn_env"
+                            .into(),
+                    )
+                }
+            };
             tracing::info!(backend = "postgres", "opening store");
-            Ok(Arc::new(PostgresStore::connect(dsn).await?))
+            Ok(Arc::new(PostgresStore::connect(&dsn).await?))
         }
     }
 }

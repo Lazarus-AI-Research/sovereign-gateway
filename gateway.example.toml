@@ -14,6 +14,7 @@ deployment_mode = "selfhosted"   # selfhosted (admin API on) | managed
 backend = "sqlite"               # sqlite | postgres
 path = "./gateway.db"           # sqlite file (when backend = "sqlite")
 # dsn = "postgres://user:pass@localhost:5432/gateway"   # when backend = "postgres"
+# dsn_env = "GATEWAY_DATABASE_URL"   # or read the DSN from this environment variable
 
 [security]
 # No passwords here. Users (the login accounts — username + password + role) live
@@ -22,6 +23,11 @@ path = "./gateway.db"           # sqlite file (when backend = "sqlite")
 # the admin UI or /admin/v1/users.
 # Web sessions are server-side: login creates a row in the `sessions` table keyed
 # by an opaque cookie token, so logout revokes immediately (nothing to set here).
+#
+# A control plane that operates the gateway presents the control key: an
+# administrator key with both scopes whose token is read from this variable at
+# start. With it set, no default admin/admin account is created.
+# control_key_env = "GATEWAY_CONTROL_KEY"
 # 32-byte AES-256-GCM key (base64 or hex) for BYOK secret-at-rest; plaintext if unset.
 # byok_key = "0000000000000000000000000000000000000000000000000000000000000000"
 

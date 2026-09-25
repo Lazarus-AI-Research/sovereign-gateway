@@ -5,8 +5,8 @@ use futures::StreamExt;
 use yb_core::WireFormat;
 
 use yb_providers::{
-    append_headers, auth_headers, build_url, cloudflare_access_headers, is_model_not_found,
-    is_retryable, MockClient, ResponseBody, UpstreamClient, UpstreamRequest,
+    append_headers, auth_headers, build_url, cloudflare_access_headers, embed_auth_headers,
+    is_model_not_found, is_retryable, MockClient, ResponseBody, UpstreamClient, UpstreamRequest,
 };
 
 fn req(url: &str, stream: bool) -> UpstreamRequest {
@@ -117,6 +117,34 @@ fn cloudflare_access_composes_with_upstream_auth() {
         ]
     );
     assert_eq!(headers[0].1, "Bearer sk-vllm");
+}
+
+/// A stored key of the form `env:NAME` is read from the environment, so the
+/// secret never has to be written into the database.
+#[test]
+fn an_environment_reference_is_read_from_the_environment() {
+    std::env::set_var("YB_TEST_UPSTREAM_KEY", "sk-from-env");
+    assert_eq!(
+        auth_headers(WireFormat::OpenaiChat, "env:YB_TEST_UPSTREAM_KEY"),
+        vec![(
+            "authorization".to_string(),
+            "Bearer sk-from-env".to_string()
+        )]
+    );
+    assert_eq!(
+        embed_auth_headers(
+            yb_core::EmbedFormat::OpenaiEmbed,
+            "env:YB_TEST_UPSTREAM_KEY"
+        ),
+        vec![(
+            "authorization".to_string(),
+            "Bearer sk-from-env".to_string()
+        )]
+    );
+    assert_eq!(
+        auth_headers(WireFormat::OpenaiChat, "env:YB_TEST_UNSET_VARIABLE"),
+        vec![("authorization".to_string(), "Bearer ".to_string())]
+    );
 }
 
 #[test]

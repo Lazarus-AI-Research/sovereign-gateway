@@ -32,7 +32,7 @@ pub use http::HttpClient;
 pub use mock::{MockBody, MockClient};
 pub use route::{
     append_headers, auth_headers, build_embed_url, build_url, cloudflare_access_headers,
-    embed_auth_headers, is_model_not_found, is_retryable,
+    embed_auth_headers, is_model_not_found, is_retryable, upstream_secret, ENVIRONMENT_REFERENCE,
 };
 
 /// A boxed, owned byte stream as returned by a streaming upstream response.
