@@ -121,6 +121,7 @@ async fn setup() -> (AppState, String) {
         budgets_enabled: false,
         ratelimit_enabled: false,
         request_log: Arc::new(NullLogger),
+        logging: Arc::new(yb_core::FixedLogging),
     };
 
     (state, issued.token)
@@ -403,6 +404,7 @@ async fn setup_auth_ts(
         budgets_enabled: false,
         ratelimit_enabled: false,
         request_log: Arc::new(NullLogger),
+        logging: Arc::new(yb_core::FixedLogging),
     }
 }
 
@@ -1826,4 +1828,61 @@ fn a_captured_chat_becomes_a_training_example() {
     let mut speech = turn;
     speech.surface = "openai_speech".into();
     assert!(yb_server::capture::training_example(&speech).is_none());
+}
+
+/// Records the levels applied to it.
+#[derive(Default)]
+struct RecordingLogging(std::sync::Mutex<Vec<yb_core::LogLevel>>);
+
+impl yb_core::LogControl for RecordingLogging {
+    fn apply(&self, level: yb_core::LogLevel) -> yb_core::Result<()> {
+        self.0.lock().unwrap().push(level);
+        Ok(())
+    }
+}
+
+/// A level an administrator sets is applied to the running process at once
+/// and kept; an unknown one is refused.
+#[tokio::test]
+async fn the_log_level_is_applied_at_once_and_kept() {
+    let (mut state, _) = setup().await;
+    let logging = Arc::new(RecordingLogging::default());
+    state.logging = logging.clone();
+    let store = state.store.clone();
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state);
+    let (status, got) = get_json(&app, "/admin/v1/log-level", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got["level"], "info", "info until one is set");
+
+    let put = |body: Value| {
+        Request::builder()
+            .method("PUT")
+            .uri("/admin/v1/log-level")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let resp = app
+        .clone()
+        .oneshot(put(json!({"level": "debug"})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(*logging.0.lock().unwrap(), vec![yb_core::LogLevel::Debug]);
+    assert_eq!(
+        store.log_level().await.unwrap(),
+        Some(yb_core::LogLevel::Debug)
+    );
+    let (_, got) = get_json(&app, "/admin/v1/log-level", &cookie).await;
+    assert_eq!(got["level"], "debug");
+
+    let resp = app.oneshot(put(json!({"level": "chatty"}))).await.unwrap();
+    assert!(resp.status().is_client_error());
+    assert_eq!(
+        logging.0.lock().unwrap().len(),
+        1,
+        "a refused level is not applied"
+    );
 }

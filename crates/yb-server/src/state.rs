@@ -12,7 +12,7 @@ use std::sync::Arc;
 use yb_core::config::{AuthConfig, DeploymentMode};
 use yb_core::crypto::{Encryptor, PasswordHasher};
 use yb_core::ratelimit::Limiter;
-use yb_core::{Observer, RequestLogger, Store};
+use yb_core::{LogControl, Observer, RequestLogger, Store};
 use yb_gateway::{DeploymentRouter, Gateway};
 
 use crate::sso::SsoClient;
@@ -49,6 +49,8 @@ pub struct AppState {
     pub ratelimit_enabled: bool,
     /// Where captured turns go, and are read back from for export.
     pub request_log: Arc<dyn RequestLogger>,
+    /// Changes how much the running process logs.
+    pub logging: Arc<dyn LogControl>,
 }
 
 impl AppState {

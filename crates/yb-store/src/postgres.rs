@@ -955,6 +955,31 @@ impl Store for PostgresStore {
         })
     }
 
+    async fn log_level(&self) -> Result<Option<yb_core::LogLevel>> {
+        let row = sqlx::query("SELECT level FROM log_level WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let level: String = row.try_get("level").map_err(storage_err)?;
+        Ok(yb_core::LogLevel::parse(&level))
+    }
+
+    async fn set_log_level(&self, level: yb_core::LogLevel) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO log_level (id, level, updated_at) VALUES (1, $1, $2) \
+             ON CONFLICT(id) DO UPDATE SET level = excluded.level, updated_at = excluded.updated_at",
+        )
+        .bind(level.as_str())
+        .bind(now().to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        Ok(())
+    }
+
     async fn set_capture_policy(&self, policy: &yb_core::CapturePolicy) -> Result<()> {
         sqlx::query(
             "INSERT INTO capture_policy (id, enabled, redaction, retention_days, updated_at) VALUES (1, $1, $2, $3, $4) \

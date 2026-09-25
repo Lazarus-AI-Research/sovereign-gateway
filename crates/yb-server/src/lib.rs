@@ -17,6 +17,7 @@
 
 pub mod admin;
 pub mod capture;
+pub mod logging;
 pub mod sso;
 pub mod state;
 pub mod ui;

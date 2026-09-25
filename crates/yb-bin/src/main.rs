@@ -48,7 +48,9 @@ use yb_core::config::{
 };
 use yb_core::crypto::{Encryptor, NoopEncryptor, PasswordHasher};
 use yb_core::ratelimit::Limiter;
-use yb_core::{NewDeployment, NullLogger, NullObserver, Observer, RequestLogger, Store};
+use yb_core::{
+    LogControl, LogLevel, NewDeployment, NullLogger, NullObserver, Observer, RequestLogger, Store,
+};
 use yb_gateway::{DeploymentRouter, Gateway};
 use yb_otel::OtelSink;
 use yb_providers::{HttpClient, MockClient, UpstreamClient};
@@ -61,7 +63,7 @@ const DEFAULT_CONFIG: &str = "gateway.toml";
 
 #[tokio::main]
 async fn main() {
-    init_tracing();
+    let logging = init_tracing();
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
         // `gateway setup [config] [--user U] [--password P]` — initialize the DB
@@ -76,10 +78,10 @@ async fn main() {
         // models file into the database, then exit. Models live ONLY in the DB;
         // the serve config never carries them and `serve` never seeds.
         Some("import") => run_import(&args).await,
-        Some("serve") => run_serve(&arg_or_default(&args, 2)).await,
+        Some("serve") => run_serve(&arg_or_default(&args, 2), logging).await,
         // Backward-compatible: `gateway [config]` serves.
-        Some(other) if !other.starts_with('-') => run_serve(other).await,
-        _ => run_serve(DEFAULT_CONFIG).await,
+        Some(other) if !other.starts_with('-') => run_serve(other, logging).await,
+        _ => run_serve(DEFAULT_CONFIG, logging).await,
     };
     if let Err(e) = result {
         tracing::error!(error = %e, "gateway failed");
@@ -96,10 +98,37 @@ fn arg_or_default(args: &[String], idx: usize) -> String {
 
 /// Initialise the global tracing subscriber. Honours `RUST_LOG`; defaults to
 /// `info`. (`RUST_LOG` is the standard tracing knob, not a gateway config var.)
-fn init_tracing() {
+/// A level an operator sets at runtime replaces it.
+fn init_tracing() -> Arc<dyn LogControl> {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).init();
+    let builder = fmt().with_env_filter(filter).with_filter_reloading();
+    let handle = builder.reload_handle();
+    builder.init();
+    Arc::new(ReloadableLogging(Box::new(move |filter| {
+        handle.reload(filter).map_err(|e| e.to_string())
+    })))
+}
+
+type Reload = Box<dyn Fn(tracing_subscriber::EnvFilter) -> Result<(), String> + Send + Sync>;
+
+struct ReloadableLogging(Reload);
+
+impl LogControl for ReloadableLogging {
+    /// Debug is for the gateway's own crates; the libraries under them stay at
+    /// info, where their output still means something to an operator.
+    fn apply(&self, level: LogLevel) -> yb_core::Result<()> {
+        let directives = match level {
+            LogLevel::Debug => "info,gateway=debug,yb_core=debug,yb_gateway=debug,yb_otel=debug,\
+                                yb_providers=debug,yb_redact=debug,yb_reqlog=debug,yb_server=debug,\
+                                yb_store=debug,yb_wire=debug"
+                .to_string(),
+            other => other.as_str().to_string(),
+        };
+        let filter = tracing_subscriber::EnvFilter::try_new(directives)
+            .map_err(|e| yb_core::Error::Internal(e.to_string()))?;
+        (self.0)(filter).map_err(yb_core::Error::Internal)
+    }
 }
 
 /// `gateway setup [config] [--user U] [--password P]` — initialize the database
@@ -284,7 +313,10 @@ async fn run_import(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// `gateway serve [config]` — run the gateway. The router is built entirely from
 /// the **database**; the serve config carries no model list. Use
 /// `gateway import` to load models from a file.
-async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_serve(
+    config_path: &str,
+    logging: Arc<dyn LogControl>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // --- 1. configuration ---------------------------------------------------
     let cfg = load_config(config_path)?;
     tracing::info!(config = %config_path, "configuration loaded");
@@ -344,6 +376,11 @@ async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> 
     let logger: Arc<dyn RequestLogger> = build_reqlog(&cfg.reqlog)?;
     // Capture follows the policy an operator last set, off until one does.
     logger.apply_policy(&store.capture_policy().await?);
+    // As does the log level; the environment's until one is set.
+    if let Some(level) = store.log_level().await? {
+        logging.apply(level)?;
+        tracing::info!(level = level.as_str(), "log level applied");
+    }
     let observer: Arc<dyn Observer> = if cfg.telemetry.enabled {
         tracing::info!(
             otlp = cfg
@@ -420,6 +457,7 @@ async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> 
         budgets_enabled: cfg.features.budgets_enabled,
         ratelimit_enabled: cfg.features.ratelimit_enabled,
         request_log: logger.clone(),
+        logging,
     };
 
     let app = build_router(state);
