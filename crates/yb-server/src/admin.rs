@@ -106,6 +106,11 @@ pub fn router() -> Router<AppState> {
         // spend
         .route("/spend", get(spend))
         .route("/usage", get(usage))
+        .route(
+            "/capture",
+            get(crate::capture::get_policy).put(crate::capture::put_policy),
+        )
+        .route("/capture/export", get(crate::capture::export))
 }
 
 // ---- principal extraction ------------------------------------------------
@@ -120,7 +125,7 @@ impl Principal {
     fn role(&self) -> Role {
         self.0.role
     }
-    fn is_admin(&self) -> bool {
+    pub(crate) fn is_admin(&self) -> bool {
         self.0.is_admin()
     }
     fn user_id(&self) -> &str {

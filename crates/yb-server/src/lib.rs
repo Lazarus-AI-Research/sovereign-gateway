@@ -16,6 +16,7 @@
 //! Build the router from an [`AppState`] with [`build_router`].
 
 pub mod admin;
+pub mod capture;
 pub mod sso;
 pub mod state;
 pub mod ui;
@@ -574,6 +575,7 @@ async fn run_inference(
         request_id,
         trace_id,
         parent_span_id,
+        tags: header_str(&headers, "x-gateway-tags").and_then(|value| parse_tags(&value)),
         excluded_model_ids: Default::default(),
         excluded_provider_ids: Default::default(),
         access,
@@ -695,6 +697,31 @@ pub fn parse_traceparent(value: &str) -> Option<(String, String)> {
         && span.bytes().any(|b| b != b'0')
         && hex(flags, 2);
     valid.then(|| (trace.to_ascii_lowercase(), span.to_ascii_lowercase()))
+}
+
+/// `key=value` pairs, comma-separated, as a JSON object: what a caller says
+/// a request belongs to (`space=…,conversation=…`), kept with its capture.
+/// Keys and values are short plain words; anything else is not a tag.
+pub fn parse_tags(value: &str) -> Option<String> {
+    let mut tags = serde_json::Map::new();
+    for pair in value.split(',') {
+        let (key, value) = pair.split_once('=')?;
+        let (key, value) = (key.trim(), value.trim());
+        let plain = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.:".contains(c))
+        };
+        if !plain(key) || !plain(value) {
+            return None;
+        }
+        tags.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    (!tags.is_empty()).then(|| serde_json::Value::Object(tags).to_string())
 }
 
 /// Read a header as an owned `String`, if present and valid UTF-8.

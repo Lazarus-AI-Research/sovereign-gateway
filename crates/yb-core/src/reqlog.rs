@@ -28,12 +28,58 @@ pub struct RequestLogRecord {
     /// uniform schema across all surfaces, streaming or buffered. Empty when
     /// truncated/dropped.
     pub response_body: Vec<u8>,
+    /// The key the turn came with and its owner, so a capture can be sorted
+    /// by who asked.
+    pub api_key_id: Option<String>,
+    pub user_id: Option<String>,
+    /// What the caller said the turn belongs to, as a JSON object from its
+    /// `x-gateway-tags` header (a space, a conversation).
+    pub tags: Option<String>,
+    /// How the bodies were redacted before storage (see
+    /// [`crate::Redaction`]).
+    pub redaction: String,
+}
+
+/// Which captured turns an export takes: those in `[from, to)`, narrowed by
+/// any of the rest that are not empty.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureFilter {
+    pub from: Option<Timestamp>,
+    pub to: Option<Timestamp>,
+    pub models: Vec<String>,
+    pub api_key_ids: Vec<String>,
+    /// `(key, value)` pairs a turn's tags must all carry.
+    pub tags: Vec<(String, String)>,
+    pub redaction: Option<String>,
+}
+
+/// One captured turn as an export reads it back.
+#[derive(Debug, Clone)]
+pub struct CapturedTurn {
+    pub ts: Timestamp,
+    pub request_id: String,
+    pub surface: String,
+    pub requested_model: String,
+    pub api_key_id: Option<String>,
+    pub user_id: Option<String>,
+    pub tags: Option<String>,
+    pub redaction: String,
+    pub request_body: Vec<u8>,
+    pub response_body: Vec<u8>,
 }
 
 /// A non-blocking sink. `log` must enqueue and return immediately; it must never
 /// block the request path. Dropping on a full queue is acceptable (and counted).
 pub trait RequestLogger: Send + Sync {
     fn log(&self, record: RequestLogRecord);
+
+    /// Whether and how turns are captured from now on.
+    fn apply_policy(&self, _policy: &crate::CapturePolicy) {}
+
+    /// The successful captured turns the filter takes, oldest first.
+    fn export(&self, _filter: &CaptureFilter) -> crate::Result<Vec<CapturedTurn>> {
+        Ok(Vec::new())
+    }
 }
 
 /// A logger that discards everything (the default when capture is disabled).

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 yb-core.workspace = true
+yb-redact.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

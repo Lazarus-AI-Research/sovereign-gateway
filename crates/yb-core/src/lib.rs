@@ -4,6 +4,7 @@
 //! (`Store`, `Router`, `RequestLogger`, `Encryptor`, `PasswordHasher`) that the
 //! adapter crates implement. Pure and I/O-free — no HTTP, DB, or filesystem here.
 
+pub mod capture;
 pub mod catalog;
 pub mod config;
 pub mod crypto;
@@ -19,6 +20,7 @@ pub mod routing;
 pub mod spend;
 pub mod store;
 
+pub use capture::{CapturePolicy, Redaction};
 pub use error::{Error, Result};
 pub use ids::{micros_to_usd, new_id, now, usd_to_micros, Id, Micros, Timestamp};
 pub use model::{
@@ -27,7 +29,7 @@ pub use model::{
 };
 pub use observe::{NullObserver, Observer};
 pub use principal::{KeyAuth, Principal};
-pub use reqlog::{NullLogger, RequestLogRecord, RequestLogger};
+pub use reqlog::{CaptureFilter, CapturedTurn, NullLogger, RequestLogRecord, RequestLogger};
 pub use routing::{
     Decision, Deployment, DeploymentRecord, EmbedFormat, Extra, HealthCheck, HealthRecord,
     MediaFormat, ModelRecord, NewDeployment, ProviderRecord, RouteRequest, Router, UpstreamFormat,

@@ -165,6 +165,8 @@ pub struct RequestCtx {
     /// The caller's span this request continues, when it sent a W3C
     /// `traceparent`.
     pub parent_span_id: Option<String>,
+    /// What the caller said the request belongs to, as a JSON object.
+    pub tags: Option<String>,
     /// Public model names excluded for this caller (denylist).
     /// Model **ids** excluded by policy, so a rename cannot un-exclude one.
     pub excluded_model_ids: BTreeSet<String>,
@@ -697,6 +699,7 @@ impl Gateway {
             start: started,
             created_at,
             token_meter: ctx.token_meter.clone(),
+            tags: ctx.tags.clone(),
             reports_usage: true,
         }
     }
@@ -767,6 +770,7 @@ pub(crate) struct RecordCtx {
     start: Instant,
     created_at: Timestamp,
     token_meter: Option<TokenMeter>,
+    tags: Option<String>,
     /// False for a turn that never reports tokens (an image or speech), so a
     /// zero count is not taken for an upstream fault.
     pub(crate) reports_usage: bool,
@@ -897,6 +901,10 @@ impl RecordCtx {
             response_truncated: false,
             request_body: self.request_body.clone(),
             response_body,
+            api_key_id: self.api_key_id.clone(),
+            user_id: self.user_id.clone(),
+            tags: self.tags.clone(),
+            redaction: String::new(),
         });
     }
 }

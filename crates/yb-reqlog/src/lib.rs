@@ -8,9 +8,11 @@
 //! [`std::thread`] that is the *sole* holder of the DuckDB [`Connection`].
 //!
 //! ## Data path
-//! [`DuckLogger::log`] redacts nothing itself; it boxes the record and pushes it
-//! onto a bounded [`std::sync::mpsc::sync_channel`] with a non-blocking
-//! `try_send`. When the queue is full the record is dropped and a counter is
+//! [`DuckLogger::log`] applies the capture policy first: nothing is kept while
+//! capture is off, and bodies are redacted (or dropped, keeping metadata only)
+//! before they leave the request's thread, so unredacted text never reaches
+//! the queue or the disk. It then boxes the record and pushes it onto a
+//! bounded [`std::sync::mpsc::sync_channel`] with a non-blocking `try_send`. When the queue is full the record is dropped and a counter is
 //! incremented ([`DuckLogger::dropped`]) — the request path is never blocked.
 //!
 //! ## Storage path
@@ -27,7 +29,7 @@
 //! shards older than [`ReqlogConfig::retention_days`].
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -36,7 +38,11 @@ use std::time::{Duration, Instant};
 use chrono::{NaiveDate, SecondsFormat, Utc};
 use duckdb::{params, Connection};
 
-use yb_core::{Error, RequestLogRecord, RequestLogger, Result};
+use yb_core::{
+    CaptureFilter, CapturePolicy, CapturedTurn, Error, Redaction, RequestLogRecord, RequestLogger,
+    Result,
+};
+use yb_redact::{PatternRedactor, Redactor};
 
 /// Tunables for the DuckDB logging sink.
 #[derive(Debug, Clone)]
@@ -96,16 +102,32 @@ CREATE TABLE IF NOT EXISTS turns (
     response_bytes     INTEGER,
     response_truncated BOOLEAN,
     request_body       BLOB,
-    response_body      BLOB
+    response_body      BLOB,
+    api_key_id         VARCHAR,
+    user_id            VARCHAR,
+    tags               VARCHAR,
+    redaction          VARCHAR
 )";
+
+/// A log written before a column existed gains it, so an upgraded gateway
+/// keeps its buffered turns.
+const ADD_LATER_COLUMNS: &str = "\
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS api_key_id VARCHAR;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS user_id VARCHAR;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS tags VARCHAR;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS redaction VARCHAR;";
 
 /// Parameterised insert. Strings are CAST into the temporal / unsigned columns so
 /// we do not need DuckDB's optional `chrono` feature enabled.
 const INSERT_TURN: &str = "\
-INSERT INTO turns VALUES (
+INSERT INTO turns (id, ts, log_date, request_id, trace_id, installation_id, surface,
+    requested_model, decision_model, decision_provider, upstream_status, is_error,
+    request_bytes, response_bytes, response_truncated, request_body, response_body,
+    api_key_id, user_id, tags, redaction) VALUES (
     CAST(? AS UBIGINT), CAST(? AS TIMESTAMP), CAST(? AS DATE),
     ?, ?, ?, ?, ?, ?, ?, ?, ?,
-    CAST(? AS INTEGER), CAST(? AS INTEGER), ?, ?, ?
+    CAST(? AS INTEGER), CAST(? AS INTEGER), ?, ?, ?,
+    ?, ?, ?, ?
 )";
 
 /// Acknowledgement channel for a control message: `Ok(())`/`Err(detail)`.
@@ -118,6 +140,10 @@ enum Msg {
     Flush(Ack),
     Rotate(Ack),
     Count(mpsc::Sender<std::result::Result<u64, String>>),
+    Export(
+        Box<CaptureFilter>,
+        mpsc::Sender<std::result::Result<Vec<CapturedTurn>, String>>,
+    ),
     Shutdown(Ack),
 }
 
@@ -128,6 +154,10 @@ pub struct DuckLogger {
     tx: SyncSender<Msg>,
     dropped: Arc<AtomicU64>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// Off until an operator's policy says otherwise.
+    policy: std::sync::RwLock<CapturePolicy>,
+    /// Shared with the worker, which prunes by it.
+    retention_days: Arc<AtomicU32>,
 }
 
 impl DuckLogger {
@@ -140,10 +170,12 @@ impl DuckLogger {
         let (tx, rx) = mpsc::sync_channel::<Msg>(cfg.queue_size.max(1));
         let (start_tx, start_rx) = mpsc::channel::<std::result::Result<(), String>>();
         let dropped = Arc::new(AtomicU64::new(0));
+        let retention_days = Arc::new(AtomicU32::new(cfg.retention_days));
+        let worker_retention = retention_days.clone();
 
         let handle = std::thread::Builder::new()
             .name("yb-reqlog".to_string())
-            .spawn(move || match Worker::open(cfg) {
+            .spawn(move || match Worker::open(cfg, worker_retention) {
                 Ok(mut worker) => {
                     // Setup succeeded; unblock `new` then serve until shutdown.
                     let _ = start_tx.send(Ok(()));
@@ -160,6 +192,8 @@ impl DuckLogger {
                 tx,
                 dropped,
                 worker: Mutex::new(Some(handle)),
+                policy: std::sync::RwLock::new(CapturePolicy::default()),
+                retention_days,
             }),
             Ok(Err(detail)) => {
                 let _ = handle.join();
@@ -228,13 +262,56 @@ impl DuckLogger {
 }
 
 impl RequestLogger for DuckLogger {
-    fn log(&self, record: RequestLogRecord) {
+    fn log(&self, mut record: RequestLogRecord) {
+        let policy = *self.policy.read().unwrap_or_else(|e| e.into_inner());
+        if !policy.enabled {
+            return;
+        }
+        redact(&mut record, policy.redaction);
         match self.tx.try_send(Msg::Record(Box::new(record))) {
             Ok(()) => {}
             // Full queue, or worker already gone (post-shutdown). Either way we
             // drop and count — never block or panic on the request path.
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn apply_policy(&self, policy: &CapturePolicy) {
+        *self.policy.write().unwrap_or_else(|e| e.into_inner()) = *policy;
+        self.retention_days
+            .store(policy.retention_days, Ordering::Relaxed);
+    }
+
+    fn export(&self, filter: &CaptureFilter) -> Result<Vec<CapturedTurn>> {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.tx
+            .send(Msg::Export(Box::new(filter.clone()), ack_tx))
+            .map_err(|_| Error::Internal("reqlog: worker is gone".into()))?;
+        ack_rx
+            .recv()
+            .map_err(|_| Error::Internal("reqlog: worker is gone".into()))?
+            .map_err(Error::Storage)
+    }
+}
+
+/// The policy's redaction, applied to both bodies before a record is queued.
+fn redact(record: &mut RequestLogRecord, redaction: Redaction) {
+    record.redaction = redaction.as_str().to_string();
+    match redaction {
+        Redaction::None => {}
+        Redaction::MetadataOnly => {
+            record.request_body.clear();
+            record.response_body.clear();
+        }
+        Redaction::Patterns => {
+            for body in [&mut record.request_body, &mut record.response_body] {
+                let text = String::from_utf8_lossy(body);
+                let redacted = PatternRedactor.redact(&text);
+                if redacted != text {
+                    *body = redacted.into_owned().into_bytes();
+                }
             }
         }
     }
@@ -255,6 +332,7 @@ const BATCH_FLUSH: usize = 256;
 struct Worker {
     conn: Connection,
     cfg: ReqlogConfig,
+    retention_days: Arc<AtomicU32>,
     db_path: PathBuf,
     shards_dir: PathBuf,
     buf: Vec<RequestLogRecord>,
@@ -265,7 +343,7 @@ struct Worker {
 
 impl Worker {
     /// Open the WAL database and prepare the directory layout.
-    fn open(cfg: ReqlogConfig) -> Result<Self> {
+    fn open(cfg: ReqlogConfig, retention_days: Arc<AtomicU32>) -> Result<Self> {
         let shards_dir = cfg.dir.join("shards");
         std::fs::create_dir_all(&shards_dir)
             .map_err(|e| Error::Storage(format!("reqlog: create dir: {e}")))?;
@@ -273,6 +351,7 @@ impl Worker {
         let db_path = cfg.dir.join("wal.duckdb");
         let conn = Connection::open(&db_path).map_err(map_db)?;
         conn.execute_batch(CREATE_TURNS).map_err(map_db)?;
+        conn.execute_batch(ADD_LATER_COLUMNS).map_err(map_db)?;
 
         // Resume the surrogate id sequence past any rows left from a prior run.
         let max_id: i64 = conn
@@ -282,6 +361,7 @@ impl Worker {
         Ok(Self {
             conn,
             cfg,
+            retention_days,
             db_path,
             shards_dir,
             buf: Vec::new(),
@@ -321,6 +401,10 @@ impl Worker {
                     let r = self.flush().and_then(|()| self.count());
                     let _ = ack.send(r.map_err(|e| e.to_string()));
                 }
+                Ok(Msg::Export(filter, ack)) => {
+                    let r = self.flush().and_then(|()| self.export(&filter));
+                    let _ = ack.send(r.map_err(|e| e.to_string()));
+                }
                 Ok(Msg::Shutdown(ack)) => {
                     let _ = ack.send(self.flush().map_err(|e| e.to_string()));
                     break;
@@ -335,6 +419,91 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// The captured turns the filter takes, from the buffer and every shard,
+    /// oldest first. Tags are matched here rather than in SQL: they are a
+    /// small JSON object per turn.
+    fn export(&self, filter: &CaptureFilter) -> Result<Vec<CapturedTurn>> {
+        let columns = "ts, request_id, surface, requested_model, api_key_id, user_id, tags, redaction, request_body, response_body, is_error";
+        let has_shards = std::fs::read_dir(&self.shards_dir)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    entry.path().extension().and_then(|e| e.to_str()) == Some("parquet")
+                })
+            })
+            .unwrap_or(false);
+        let mut source = format!("SELECT {columns} FROM turns");
+        if has_shards {
+            let pattern = self.shards_dir.join("*.parquet");
+            let pattern = pattern.to_string_lossy().replace('\'', "''");
+            source.push_str(&format!(
+                " UNION ALL BY NAME SELECT {columns} FROM read_parquet('{pattern}', union_by_name = true)"
+            ));
+        }
+        let mut conditions = vec!["NOT is_error".to_string()];
+        let mut values: Vec<String> = Vec::new();
+        let format = |t: &yb_core::Timestamp| t.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        if let Some(from) = &filter.from {
+            conditions.push("ts >= CAST(? AS TIMESTAMP)".into());
+            values.push(format(from));
+        }
+        if let Some(to) = &filter.to {
+            conditions.push("ts < CAST(? AS TIMESTAMP)".into());
+            values.push(format(to));
+        }
+        for (column, wanted) in [
+            ("requested_model", &filter.models),
+            ("api_key_id", &filter.api_key_ids),
+        ] {
+            if !wanted.is_empty() {
+                conditions.push(format!(
+                    "{column} IN ({})",
+                    vec!["?"; wanted.len()].join(", ")
+                ));
+                values.extend(wanted.iter().cloned());
+            }
+        }
+        if let Some(redaction) = &filter.redaction {
+            conditions.push("redaction = ?".into());
+            values.push(redaction.clone());
+        }
+        let query = format!(
+            "SELECT CAST(ts AS VARCHAR), request_id, surface, requested_model, api_key_id, user_id, tags, \
+             COALESCE(redaction, 'none'), request_body, response_body FROM ({source}) WHERE {} ORDER BY ts",
+            conditions.join(" AND ")
+        );
+        let mut statement = self.conn.prepare(&query).map_err(map_db)?;
+        let rows = statement
+            .query_map(duckdb::params_from_iter(values.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    CapturedTurn {
+                        ts: yb_core::now(),
+                        request_id: row.get(1)?,
+                        surface: row.get(2)?,
+                        requested_model: row.get(3)?,
+                        api_key_id: row.get(4)?,
+                        user_id: row.get(5)?,
+                        tags: row.get(6)?,
+                        redaction: row.get(7)?,
+                        request_body: row.get::<_, Option<Vec<u8>>>(8)?.unwrap_or_default(),
+                        response_body: row.get::<_, Option<Vec<u8>>>(9)?.unwrap_or_default(),
+                    },
+                ))
+            })
+            .map_err(map_db)?;
+        let mut turns = Vec::new();
+        for row in rows {
+            let (ts, mut turn) = row.map_err(map_db)?;
+            if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S%.f") {
+                turn.ts = parsed.and_utc();
+            }
+            if tags_match(turn.tags.as_deref(), &filter.tags) {
+                turns.push(turn);
+            }
+        }
+        Ok(turns)
     }
 
     /// Flush, logging (but not propagating) any error — used on the timer and
@@ -389,6 +558,10 @@ impl Worker {
                     truncated,
                     req_body,
                     resp_body,
+                    rec.api_key_id,
+                    rec.user_id,
+                    rec.tags,
+                    rec.redaction,
                 ])
                 .map_err(map_db)?;
             }
@@ -507,11 +680,12 @@ impl Worker {
     /// Remove `*.parquet` shards whose mtime is older than the retention window.
     /// Best-effort: filesystem errors are ignored (logged at debug).
     fn prune(&self) {
-        if self.cfg.retention_days == 0 {
+        let retention_days = self.retention_days.load(Ordering::Relaxed);
+        if retention_days == 0 {
             return;
         }
         let Some(cutoff) = std::time::SystemTime::now()
-            .checked_sub(Duration::from_secs(self.cfg.retention_days as u64 * 86_400))
+            .checked_sub(Duration::from_secs(retention_days as u64 * 86_400))
         else {
             return;
         };
@@ -556,6 +730,19 @@ fn map_db(e: duckdb::Error) -> Error {
     Error::Storage(format!("reqlog/duckdb: {e}"))
 }
 
+/// Whether a turn's tags carry every wanted `(key, value)`.
+fn tags_match(tags: Option<&str>, wanted: &[(String, String)]) -> bool {
+    if wanted.is_empty() {
+        return true;
+    }
+    let Some(tags) = tags.and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()) else {
+        return false;
+    };
+    wanted
+        .iter()
+        .all(|(key, value)| tags.get(key).and_then(|v| v.as_str()) == Some(value.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,6 +753,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yb-reqlog-{}", yb_core::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A logger with capture on and bodies kept as they came, as these tests
+    /// exercise storage rather than policy.
+    fn capturing(logger: DuckLogger) -> DuckLogger {
+        logger.apply_policy(&CapturePolicy {
+            enabled: true,
+            redaction: Redaction::None,
+            retention_days: 30,
+        });
+        logger
     }
 
     fn record(i: usize) -> RequestLogRecord {
@@ -585,6 +783,10 @@ mod tests {
             response_truncated: false,
             request_body: format!("request-body-{i}").into_bytes(),
             response_body: format!("response-body-{i}").into_bytes(),
+            api_key_id: Some("key-1".to_string()),
+            user_id: Some("user-1".to_string()),
+            tags: Some(r#"{"space":"s1"}"#.to_string()),
+            redaction: "none".to_string(),
         }
     }
 
@@ -601,7 +803,7 @@ mod tests {
             on_roll: None,
         };
 
-        let logger = DuckLogger::new(cfg).unwrap();
+        let logger = capturing(DuckLogger::new(cfg).unwrap());
 
         for i in 0..50 {
             logger.log(record(i));
@@ -648,7 +850,7 @@ mod tests {
             on_roll: Some(format!("printf '%s' '{{shard}}' > {}", marker.display())),
             ..ReqlogConfig::default()
         };
-        let logger = DuckLogger::new(cfg).unwrap();
+        let logger = capturing(DuckLogger::new(cfg).unwrap());
 
         // A non-empty buffer so a shard is actually sealed.
         for i in 0..3 {
@@ -680,7 +882,7 @@ mod tests {
             shard_max_bytes: u64::MAX,
             ..ReqlogConfig::default()
         };
-        let logger = DuckLogger::new(cfg).unwrap();
+        let logger = capturing(DuckLogger::new(cfg).unwrap());
 
         logger.force_rotate().unwrap();
         assert_eq!(logger.turns_count().unwrap(), 0);
@@ -703,7 +905,7 @@ mod tests {
             rotate_interval: Duration::from_secs(3600),
             ..ReqlogConfig::default()
         };
-        let logger = DuckLogger::new(cfg).unwrap();
+        let logger = capturing(DuckLogger::new(cfg).unwrap());
 
         for i in 0..5000 {
             logger.log(record(i));
@@ -712,5 +914,91 @@ mod tests {
 
         logger.shutdown().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing is kept while capture is off, which it is until a policy
+    /// turns it on.
+    #[test]
+    fn nothing_is_captured_until_a_policy_turns_it_on() {
+        let dir = scratch_dir();
+        let logger = DuckLogger::new(ReqlogConfig {
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        logger.log(record(1));
+        assert!(logger.export(&CaptureFilter::default()).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Personal data is redacted before a turn is stored, and metadata-only
+    /// keeps no text at all; the export says how each turn was redacted and
+    /// filters by it, by model, by key and by tag, across the buffer and
+    /// sealed shards.
+    #[test]
+    fn captured_turns_are_redacted_and_exported_by_filter() {
+        let dir = scratch_dir();
+        let logger = DuckLogger::new(ReqlogConfig {
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        let personal = |i: usize, model: &str, key: &str, space: &str| {
+            let mut r = record(i);
+            r.requested_model = model.to_string();
+            r.api_key_id = Some(key.to_string());
+            r.tags = Some(format!(r#"{{"space":"{space}"}}"#));
+            r.request_body =
+                br#"{"messages":[{"role":"user","content":"mail ada@example.com"}]}"#.to_vec();
+            r
+        };
+        logger.apply_policy(&CapturePolicy {
+            enabled: true,
+            redaction: Redaction::Patterns,
+            retention_days: 30,
+        });
+        logger.log(personal(1, "assistant", "key-a", "s1"));
+        logger.log(personal(2, "coder", "key-b", "s2"));
+        logger.force_rotate().unwrap();
+        logger.apply_policy(&CapturePolicy {
+            enabled: true,
+            redaction: Redaction::MetadataOnly,
+            retention_days: 30,
+        });
+        logger.log(personal(3, "assistant", "key-a", "s1"));
+
+        let all = logger.export(&CaptureFilter::default()).unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all
+            .iter()
+            .all(|t| !String::from_utf8_lossy(&t.request_body).contains("ada@example.com")));
+        assert!(String::from_utf8_lossy(&all[0].request_body).contains("[EMAIL]"));
+        assert_eq!(all[0].redaction, "patterns");
+        assert!(all[2].request_body.is_empty() && all[2].redaction == "metadata_only");
+
+        let assistant = logger
+            .export(&CaptureFilter {
+                models: vec!["assistant".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(assistant.len(), 2);
+        let by_key = logger
+            .export(&CaptureFilter {
+                api_key_ids: vec!["key-b".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_key.len(), 1);
+        let in_space = logger
+            .export(&CaptureFilter {
+                tags: vec![("space".into(), "s1".into())],
+                redaction: Some("patterns".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(in_space.len(), 1);
+        assert_eq!(in_space[0].api_key_id.as_deref(), Some("key-a"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
