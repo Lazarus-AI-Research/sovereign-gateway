@@ -113,6 +113,8 @@ impl Gateway {
                     started,
                     created_at,
                 );
+                let mut record = record;
+                record.reports_usage = false;
                 record
                     .finish(Usage::default(), status, true, Vec::new(), 0)
                     .await;
@@ -128,7 +130,7 @@ impl Gateway {
                 ResponseBody::Stream(_) => read_body_message(response.body).await.into_bytes(),
             };
             guard.disarm();
-            let record = self.record_ctx(
+            let mut record = self.record_ctx(
                 &ctx,
                 surface.as_str(),
                 &request.model,
@@ -137,6 +139,7 @@ impl Gateway {
                 started,
                 created_at,
             );
+            record.reports_usage = false;
             // Audio is not worth keeping in the request log; JSON answers are.
             let logged = if response_type.starts_with("application/json") {
                 bytes.clone()

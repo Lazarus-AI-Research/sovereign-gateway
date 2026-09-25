@@ -1577,3 +1577,159 @@ async fn model_discovery_needs_a_credential() {
     let (status, _) = get_as(&app, "/v1/models", "not-a-real-key").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// A turn's tokens count against the key's tokens-per-minute limit: the turn
+/// that crosses the limit is served, the next is refused until it refills.
+#[tokio::test]
+async fn tokens_per_minute_are_charged_after_each_turn() {
+    let (mut state, token) = setup().await;
+    state.ratelimit_enabled = true;
+    let key = state
+        .store
+        .verify_api_key(&yb_store::hash_token(&token))
+        .await
+        .unwrap()
+        .unwrap()
+        .api_key;
+    state
+        .store
+        .update_api_key_limits(
+            &key.id,
+            LimitColumns {
+                rpm: None,
+                tpm: Some(10),
+                max_concurrent: None,
+            },
+        )
+        .await
+        .unwrap();
+    let app = build_router(state);
+    let turn = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "my-model",
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+    let first = app.clone().oneshot(turn()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK, "the first turn is served");
+    to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    let second = app.oneshot(turn()).await.unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "15 tokens against a limit of 10 leave nothing for the next turn"
+    );
+}
+
+/// A key's name and limits change after issue; a field left out keeps its
+/// value and `null` clears it.
+#[tokio::test]
+async fn a_key_is_renamed_and_its_limits_changed_after_issue() {
+    let (state, token) = setup().await;
+    let store = state.store.clone();
+    let key = store
+        .verify_api_key(&yb_store::hash_token(&token))
+        .await
+        .unwrap()
+        .unwrap()
+        .api_key;
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state);
+    let patch = |body: Value| {
+        Request::builder()
+            .method("PATCH")
+            .uri(format!("/admin/v1/keys/{}", key.id))
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+
+    let resp = app
+        .clone()
+        .oneshot(patch(
+            json!({"name": "billing", "rpm_limit": 60, "tpm_limit": 1000}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (status, got) = get_json(&app, &format!("/admin/v1/keys/{}", key.id), &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got["name"], "billing");
+    assert_eq!(got["rpm_limit"], 60);
+    assert_eq!(got["tpm_limit"], 1000);
+
+    let resp = app
+        .clone()
+        .oneshot(patch(json!({"rpm_limit": null})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (_, got) = get_json(&app, &format!("/admin/v1/keys/{}", key.id), &cookie).await;
+    assert!(got["rpm_limit"].is_null(), "null clears a limit");
+    assert_eq!(got["tpm_limit"], 1000, "a field left out keeps its value");
+    assert_eq!(got["name"], "billing");
+
+    let resp = app.oneshot(patch(json!({"tpm_limit": -1}))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Discovery says what each model does and whether it takes images, so a
+/// caller picks a vision, image or speech model without trying one.
+#[tokio::test]
+async fn model_discovery_says_what_each_model_does() {
+    let (state, token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "seeing", "vision-server").await;
+    let provider = store
+        .get_provider_by_name("vision-server")
+        .await
+        .unwrap()
+        .unwrap();
+    let extra = yb_core::Extra {
+        vision: true,
+        ..Default::default()
+    };
+    store
+        .update_provider(&provider.id, &provider.name, None, None, &extra)
+        .await
+        .unwrap();
+    store
+        .create_deployment(&yb_core::NewDeployment {
+            model_name: "speaking".into(),
+            provider_name: "speech-server".into(),
+            upstream_model: "piper".into(),
+            upstream_format: yb_core::MediaFormat::OpenaiSpeech.into(),
+            weight: 1,
+            pricing: None,
+            health_check: Default::default(),
+            health_path: None,
+        })
+        .await
+        .unwrap();
+    let app = build_router(state);
+    let (status, v) = get_as(&app, "/v1/models", &token).await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = |id: &str| {
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} is listed: {v}"))
+    };
+    assert_eq!(entry("seeing")["mode"], "chat");
+    assert_eq!(entry("seeing")["supports_vision"], true);
+    assert_eq!(entry("speaking")["mode"], "audio_speech");
+    assert_eq!(entry("speaking")["supports_vision"], false);
+}

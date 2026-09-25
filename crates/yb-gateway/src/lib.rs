@@ -32,4 +32,4 @@ pub mod wire;
 
 pub use health::HealthReport;
 pub use router::DeploymentRouter;
-pub use service::{Gateway, GatewayResponse, RequestCtx};
+pub use service::{Gateway, GatewayResponse, RequestCtx, TokenMeter};

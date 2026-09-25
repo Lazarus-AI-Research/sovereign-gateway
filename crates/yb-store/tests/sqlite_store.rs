@@ -376,6 +376,57 @@ async fn telemetry_insert_by_key_user_team() {
     store.insert_telemetry(&rec).await.unwrap();
 }
 
+/// Usage sums the day's turns per key and model, counts errors, and leaves
+/// out turns outside the range.
+#[tokio::test]
+async fn usage_sums_turns_per_day_key_and_model() {
+    let (store, _db) = fresh_store().await;
+    let today = Period::Day.bucket_start(now());
+    let turn = |model: &str, tokens: i64, is_error: bool, at: yb_core::Timestamp| TelemetryRecord {
+        id: new_id(),
+        request_id: new_id(),
+        trace_id: None,
+        api_key_id: Some("key-1".into()),
+        user_id: Some("user-1".into()),
+        team_id: None,
+        surface: "openai_chat".into(),
+        requested_model: model.into(),
+        decision_model: model.into(),
+        decision_provider: "local".into(),
+        input_tokens: tokens,
+        output_tokens: 1,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cost_micros: 0,
+        status: if is_error { 500 } else { 200 },
+        is_error,
+        latency_ms: 5,
+        created_at: at,
+    };
+    let noon = today + chrono::Duration::hours(12);
+    for record in [
+        turn("assistant", 10, false, noon),
+        turn("assistant", 20, true, noon),
+        turn("coder", 5, false, noon),
+        turn("assistant", 99, false, today - chrono::Duration::days(3)),
+    ] {
+        store.insert_telemetry(&record).await.unwrap();
+    }
+    let rows = store
+        .usage(today, today + chrono::Duration::days(1))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let assistant = rows.iter().find(|r| r.model == "assistant").unwrap();
+    assert_eq!(assistant.day, today.format("%Y-%m-%d").to_string());
+    assert_eq!(assistant.requests, 2);
+    assert_eq!(assistant.errors, 1);
+    assert_eq!(assistant.input_tokens, 30);
+    assert_eq!(assistant.output_tokens, 2);
+    assert_eq!(assistant.api_key_id.as_deref(), Some("key-1"));
+    assert_eq!(assistant.user_id.as_deref(), Some("user-1"));
+}
+
 #[tokio::test]
 async fn spend_rollup_and_period_spend_by_key_and_user() {
     let (store, _db) = fresh_store().await;
@@ -416,6 +467,48 @@ async fn spend_rollup_and_period_spend_by_key_and_user() {
     assert!(rows
         .iter()
         .all(|r| r.request_count == 2 && r.input_tokens == 200));
+}
+
+/// Spend is rolled up by day, so a week, month or total budget reads the sum
+/// of the days since its period began; before, those periods always read 0.
+#[tokio::test]
+async fn longer_periods_sum_the_days_since_they_began() {
+    let (store, _db) = fresh_store().await;
+    let today = Period::Day.bucket_start(now());
+    let long_ago = today - chrono::Duration::days(400);
+    for (day, spend) in [(today, 300), (long_ago, 1_000)] {
+        store
+            .upsert_rollup(&RollupDelta {
+                subject_type: SubjectType::Key,
+                subject_id: "key-1".into(),
+                period: Period::Day,
+                period_start: day,
+                spend_micros: spend,
+                request_count: 1,
+                input_tokens: 0,
+                output_tokens: 0,
+            })
+            .await
+            .unwrap();
+    }
+    let spend = |period: Period| {
+        let store = &store;
+        async move {
+            store
+                .period_spend(
+                    SubjectType::Key,
+                    "key-1",
+                    period,
+                    period.bucket_start(now()),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(spend(Period::Day).await, 300);
+    assert_eq!(spend(Period::Week).await, 300);
+    assert_eq!(spend(Period::Month).await, 300);
+    assert_eq!(spend(Period::Total).await, 1_300);
 }
 
 #[tokio::test]

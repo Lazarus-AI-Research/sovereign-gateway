@@ -163,7 +163,7 @@ impl HealthCheck {
 /// Open-ended per-deployment extras: a `string → value` JSON object stored on
 /// the deployment row, so new knobs are additive and need no migration.
 ///
-/// Two keys are understood today:
+/// Three keys are understood today:
 ///
 /// - `cloudflare_access` (bool) — present the Cloudflare Access service token so
 ///   the request passes a Zero Trust edge policy. The flag only selects *which*
@@ -171,6 +171,9 @@ impl HealthCheck {
 ///   (`[upstream.cloudflare_access]`), is immutable at runtime, and is never
 ///   stored here, returned by the admin API, or editable in the UI.
 /// - `headers` (string map) — literal request headers to add.
+/// - `vision` (bool) — the models this provider serves take images as input;
+///   model discovery says so, so a caller can pick a vision model without
+///   trying one.
 ///
 /// Any other key is preserved verbatim, so a value written by a newer build
 /// survives a round-trip through an older one.
@@ -187,6 +190,9 @@ pub struct Extra {
     /// Literal headers to add to every upstream call for this deployment. These
     /// are applied *last* and never displace auth (see `append_headers`).
     pub headers: BTreeMap<String, String>,
+    /// The models this provider serves take images as input.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub vision: bool,
     /// Keys this build does not interpret, kept so they round-trip intact.
     #[serde(flatten)]
     pub rest: serde_json::Map<String, serde_json::Value>,

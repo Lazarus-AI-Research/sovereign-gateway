@@ -126,6 +126,28 @@ impl Drop for TurnGuard {
 /// the gateway runs. Carries the authenticated identity (the key and its owner
 /// user/team) and the access exclusions already distilled from the key/team
 /// policy.
+/// Counts a finished turn's tokens against the caller's tokens-per-minute
+/// limit. Tokens are known only once the upstream answers, so admission can
+/// check the limit but only the end of the turn can charge it.
+#[derive(Clone)]
+pub struct TokenMeter(Arc<dyn Fn(i64) + Send + Sync>);
+
+impl TokenMeter {
+    pub fn new(charge: impl Fn(i64) + Send + Sync + 'static) -> Self {
+        TokenMeter(Arc::new(charge))
+    }
+
+    fn charge(&self, tokens: i64) {
+        (self.0)(tokens)
+    }
+}
+
+impl std::fmt::Debug for TokenMeter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenMeter")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RequestCtx {
     /// The virtual key the request authenticated with, if any.
@@ -147,6 +169,8 @@ pub struct RequestCtx {
     /// The effective model/provider access grant for this caller — the key's
     /// policy merged with its team's. Deny wins, allow-lists are ceilings.
     pub access: AccessPolicy,
+    /// Charges the turn's tokens to the caller's tokens-per-minute limit.
+    pub token_meter: Option<TokenMeter>,
 }
 
 impl RequestCtx {
@@ -665,6 +689,8 @@ impl Gateway {
             request_body,
             start: started,
             created_at,
+            token_meter: ctx.token_meter.clone(),
+            reports_usage: true,
         }
     }
 }
@@ -732,6 +758,10 @@ pub(crate) struct RecordCtx {
     request_body: Vec<u8>,
     start: Instant,
     created_at: Timestamp,
+    token_meter: Option<TokenMeter>,
+    /// False for a turn that never reports tokens (an image or speech), so a
+    /// zero count is not taken for an upstream fault.
+    pub(crate) reports_usage: bool,
 }
 
 impl RecordCtx {
@@ -760,7 +790,7 @@ impl RecordCtx {
         // writing a zero row — this is how a whole provider silently stops
         // billing (an OpenAI-compatible stream omits usage entirely unless
         // `stream_options.include_usage` is set, for instance).
-        if !is_error && (200..300).contains(&status) && usage.is_empty() {
+        if self.reports_usage && !is_error && (200..300).contains(&status) && usage.is_empty() {
             tracing::warn!(
                 provider = %self.deployment.provider,
                 model = %self.deployment.model_name,
@@ -776,6 +806,11 @@ impl RecordCtx {
         let cache_write = usage.cache_write_tokens as i64;
         let cost = price.cost_micros(input, output, cache_read, cache_write);
         let latency_ms = self.start.elapsed().as_millis() as i64;
+        if let Some(meter) = &self.token_meter {
+            if input + output > 0 {
+                meter.charge(input + output);
+            }
+        }
 
         let telemetry = TelemetryRecord {
             id: new_id(),

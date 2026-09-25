@@ -21,7 +21,7 @@ use yb_core::principal::KeyAuth;
 use yb_core::routing::{
     DeploymentRecord, HealthRecord, ModelRecord, NewDeployment, ProviderRecord,
 };
-use yb_core::spend::{Budget, BudgetAction, Period, RollupDelta, SpendRow, SubjectType};
+use yb_core::spend::{Budget, BudgetAction, Period, RollupDelta, SpendRow, SubjectType, UsageRow};
 use yb_core::{new_id, now, Error, LimitColumns, Micros, Result, Store, Timestamp};
 
 use crate::common::{dec_access, enc_access, parse_ts, parse_ts_opt, storage_err};
@@ -602,6 +602,16 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn rename_api_key(&self, id: &str, name: Option<&str>) -> Result<()> {
+        sqlx::query("UPDATE api_keys SET name = ? WHERE id = ?")
+            .bind(name)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        Ok(())
+    }
+
     // ---- external (BYOK) keys, per user -------------------------------
     async fn upsert_external_key(&self, key: &ExternalKey) -> Result<()> {
         sqlx::query(
@@ -812,6 +822,8 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    // Spend is rolled up by day only; a week, month or total is the sum of
+    // the days since the period began.
     async fn period_spend(
         &self,
         subject_type: SubjectType,
@@ -820,20 +832,16 @@ impl Store for SqliteStore {
         period_start: Timestamp,
     ) -> Result<Micros> {
         let row = sqlx::query(
-            "SELECT spend_micros FROM spend_rollup \
-             WHERE subject_type = ? AND subject_id = ? AND period = ? AND period_start = ?",
+            "SELECT COALESCE(SUM(spend_micros), 0) AS spend_micros FROM spend_rollup \
+             WHERE subject_type = ? AND subject_id = ? AND period = 'day' AND period_start >= ?",
         )
         .bind(subject_type.as_str())
         .bind(subject_id)
-        .bind(period.as_str())
-        .bind(ts(&period_start))
-        .fetch_optional(&self.pool)
+        .bind(ts(&period.bucket_start(period_start)))
+        .fetch_one(&self.pool)
         .await
         .map_err(storage_err)?;
-        match row {
-            Some(r) => r.try_get("spend_micros").map_err(storage_err),
-            None => Ok(0),
-        }
+        row.try_get("spend_micros").map_err(storage_err)
     }
 
     async fn list_budgets(
@@ -916,6 +924,39 @@ impl Store for SqliteStore {
         .await
         .map_err(storage_err)?;
         rows.iter().map(map_spend_row).collect()
+    }
+
+    async fn usage(&self, from: Timestamp, to: Timestamp) -> Result<Vec<UsageRow>> {
+        let rows = sqlx::query(
+            "SELECT substr(created_at, 1, 10) AS day, api_key_id, user_id, requested_model, surface, \
+                    COUNT(*) AS requests, SUM(is_error) AS errors, \
+                    SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, \
+                    SUM(cost_micros) AS cost_micros \
+             FROM request_telemetry WHERE created_at >= ? AND created_at < ? \
+             GROUP BY 1, api_key_id, user_id, requested_model, surface \
+             ORDER BY 1, api_key_id, requested_model",
+        )
+        .bind(ts(&from))
+        .bind(ts(&to))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        rows.iter()
+            .map(|row| {
+                Ok(UsageRow {
+                    day: row.try_get("day").map_err(storage_err)?,
+                    api_key_id: row.try_get("api_key_id").map_err(storage_err)?,
+                    user_id: row.try_get("user_id").map_err(storage_err)?,
+                    model: row.try_get("requested_model").map_err(storage_err)?,
+                    surface: row.try_get("surface").map_err(storage_err)?,
+                    requests: row.try_get("requests").map_err(storage_err)?,
+                    errors: row.try_get("errors").map_err(storage_err)?,
+                    input_tokens: row.try_get("input_tokens").map_err(storage_err)?,
+                    output_tokens: row.try_get("output_tokens").map_err(storage_err)?,
+                    cost_micros: row.try_get("cost_micros").map_err(storage_err)?,
+                })
+            })
+            .collect()
     }
 
     // ---- rate-limit counters ------------------------------------------

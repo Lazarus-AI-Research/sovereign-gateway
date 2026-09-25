@@ -121,6 +121,9 @@ impl Store for RecordingStore {
     async fn update_api_key_limits(&self, _id: &str, _limits: LimitColumns) -> Result<()> {
         Ok(())
     }
+    async fn rename_api_key(&self, _id: &str, _name: Option<&str>) -> Result<()> {
+        Ok(())
+    }
 
     // ---- external keys ---------------------------------------------------
     async fn upsert_external_key(&self, _key: &ExternalKey) -> Result<()> {
@@ -205,6 +208,13 @@ impl Store for RecordingStore {
         Ok(())
     }
     async fn spend_rows(&self) -> Result<Vec<SpendRow>> {
+        Ok(vec![])
+    }
+    async fn usage(
+        &self,
+        _from: Timestamp,
+        _to: Timestamp,
+    ) -> Result<Vec<yb_core::spend::UsageRow>> {
         Ok(vec![])
     }
 

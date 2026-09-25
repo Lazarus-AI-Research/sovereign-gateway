@@ -32,7 +32,7 @@ use yb_core::model::{AccessPolicy, ApiKey, KeyScope, Role, Session, Team, TeamMe
 use yb_core::principal::Principal as CorePrincipal;
 use yb_core::rbac::{authorize, Action};
 use yb_core::spend::{Budget, SubjectType};
-use yb_core::{new_id, now, Error};
+use yb_core::{new_id, now, Error, LimitColumns};
 
 use crate::error_response;
 use crate::sso::SsoUser;
@@ -87,7 +87,10 @@ pub fn router() -> Router<AppState> {
         .route("/aliases/:alias", delete(delete_alias))
         // keys (owned by users; admin sees all)
         .route("/keys", get(list_keys).post(create_key))
-        .route("/keys/:id", delete(delete_key))
+        .route(
+            "/keys/:id",
+            get(get_key).patch(update_key).delete(delete_key),
+        )
         .route("/keys/:id/access", put(key_access))
         // teams
         .route("/teams", get(list_teams).post(create_team))
@@ -102,6 +105,7 @@ pub fn router() -> Router<AppState> {
         .route("/complete", get(complete))
         // spend
         .route("/spend", get(spend))
+        .route("/usage", get(usage))
 }
 
 // ---- principal extraction ------------------------------------------------
@@ -1874,6 +1878,70 @@ async fn delete_key(
     respond_unit(state.store.delete_api_key(&id).await)
 }
 
+/// `GET /keys/:id` — one key's metadata (owner or admin).
+async fn get_key(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match own_key_or_admin(&state, &principal, &id).await {
+        Ok(key) => Json(key).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `PATCH /keys/:id` — change a key's name and limits after it was issued
+/// (owner or admin). A field left out keeps its value; `null` clears it.
+async fn update_key(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Map<String, serde_json::Value>>,
+) -> Response {
+    let key = match own_key_or_admin(&state, &principal, &id).await {
+        Ok(key) => key,
+        Err(r) => return r,
+    };
+    let limit = |field: &str, current: Option<i64>| -> Result<Option<i64>, Response> {
+        match body.get(field) {
+            None => Ok(current),
+            Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => match value.as_i64() {
+                Some(n) if n >= 0 => Ok(Some(n)),
+                _ => Err(error_response(&Error::BadRequest(format!(
+                    "{field} must be a non-negative integer or null"
+                )))),
+            },
+        }
+    };
+    let limits = match (
+        limit("rpm_limit", key.rpm_limit),
+        limit("tpm_limit", key.tpm_limit),
+        limit("max_concurrent", key.max_concurrent),
+    ) {
+        (Ok(rpm), Ok(tpm), Ok(max_concurrent)) => LimitColumns {
+            rpm,
+            tpm,
+            max_concurrent,
+        },
+        (Err(r), _, _) | (_, Err(r), _) | (_, _, Err(r)) => return r,
+    };
+    if let Some(name) = body.get("name") {
+        let name = match name {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(name) => Some(name.as_str()),
+            _ => return error_response(&Error::BadRequest("name must be a string or null".into())),
+        };
+        if let Err(e) = state.store.rename_api_key(&id, name).await {
+            return error_response(&e);
+        }
+    }
+    if let Err(e) = state.store.update_api_key_limits(&id, limits).await {
+        return error_response(&e);
+    }
+    respond(state.store.get_api_key(&id).await)
+}
+
 /// `PUT /keys/:id/access` — edit a key's access policy (owner or admin).
 async fn key_access(
     principal: Principal,
@@ -2031,4 +2099,30 @@ async fn spend(principal: Principal, State(state): State<AppState>) -> Response 
         return r;
     }
     respond(state.store.spend_rows().await)
+}
+
+/// The days a usage report covers, both inclusive.
+#[derive(Deserialize)]
+struct UsageQuery {
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+}
+
+/// `GET /usage?from=YYYY-MM-DD&to=YYYY-MM-DD` — traffic per UTC day, key,
+/// person, model and surface (admins only): what a control plane reports
+/// usage from without reading every turn.
+async fn usage(
+    principal: Principal,
+    State(state): State<AppState>,
+    Query(query): Query<UsageQuery>,
+) -> Response {
+    if !principal.is_admin() {
+        return error_response(&Error::Forbidden("usage is for administrators".into()));
+    }
+    if query.to < query.from {
+        return error_response(&Error::BadRequest("to is before from".into()));
+    }
+    let midnight = |day: chrono::NaiveDate| day.and_time(chrono::NaiveTime::MIN).and_utc();
+    let end = midnight(query.to) + chrono::Duration::days(1);
+    respond(state.store.usage(midnight(query.from), end).await)
 }

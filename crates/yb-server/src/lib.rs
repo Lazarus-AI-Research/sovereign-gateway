@@ -36,7 +36,7 @@ use yb_core::spend::{BudgetAction, SubjectType};
 use yb_core::{
     new_id, now, AccessPolicy, EmbedFormat, Error, MediaFormat, UpstreamFormat, WireFormat,
 };
-use yb_gateway::{GatewayResponse, RequestCtx};
+use yb_gateway::{GatewayResponse, RequestCtx, TokenMeter};
 
 pub use state::AppState;
 
@@ -205,19 +205,51 @@ async fn discovery_access(state: &AppState, headers: &HeaderMap) -> Result<Acces
 /// only the model name would keep advertising a model whose sole provider is
 /// denied, and every call to it would come back "no eligible provider".
 async fn model_names(state: &AppState, access: &AccessPolicy) -> Vec<String> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut names = Vec::new();
+    listed_models(state, access)
+        .await
+        .into_iter()
+        .map(|model| model.name)
+        .collect()
+}
+
+/// A model discovery lists, with what its reachable deployments say it does.
+struct ListedModel {
+    name: String,
+    /// What the model answers: `chat`, `embedding`, `image_generation`,
+    /// `audio_speech` or `audio_transcription`.
+    mode: &'static str,
+    vision: bool,
+}
+
+/// The reachable models, in stable order, as [`model_names`] decides them.
+async fn listed_models(state: &AppState, access: &AccessPolicy) -> Vec<ListedModel> {
+    let mut models: Vec<ListedModel> = Vec::new();
     if let Ok(deployments) = state.store.list_deployments().await {
         for d in deployments {
             if !access.permits_model(&d.model_id) || !access.permits_provider(&d.provider_id) {
                 continue;
             }
-            if seen.insert(d.model_name.clone()) {
-                names.push(d.model_name);
+            match models.iter_mut().find(|m| m.name == d.model_name) {
+                Some(listed) => listed.vision |= d.extra.vision,
+                None => models.push(ListedModel {
+                    mode: mode_of(d.upstream_format),
+                    vision: d.extra.vision,
+                    name: d.model_name,
+                }),
             }
         }
     }
-    names
+    models
+}
+
+fn mode_of(format: UpstreamFormat) -> &'static str {
+    match format {
+        UpstreamFormat::Chat(_) => "chat",
+        UpstreamFormat::Embed(_) => "embedding",
+        UpstreamFormat::Media(MediaFormat::OpenaiImages) => "image_generation",
+        UpstreamFormat::Media(MediaFormat::OpenaiSpeech) => "audio_speech",
+        UpstreamFormat::Media(MediaFormat::OpenaiTranscription) => "audio_transcription",
+    }
 }
 
 /// `GET /v1/models` and `/openai/v1/models` — OpenAI-shaped model list.
@@ -226,10 +258,17 @@ async fn models_openai(State(state): State<AppState>, headers: HeaderMap) -> Res
         Ok(a) => a,
         Err(e) => return error_response(&e),
     };
-    let data: Vec<_> = model_names(&state, &access)
+    // `mode` and `supports_vision` are additions to OpenAI's shape, which
+    // clients ignore; they let a caller choose a model by what it does.
+    let data: Vec<_> = listed_models(&state, &access)
         .await
         .into_iter()
-        .map(|id| json!({ "id": id, "object": "model", "created": 0, "owned_by": "gateway" }))
+        .map(|model| {
+            json!({
+                "id": model.name, "object": "model", "created": 0, "owned_by": "gateway",
+                "mode": model.mode, "supports_vision": model.vision,
+            })
+        })
         .collect();
     Json(json!({ "object": "list", "data": data })).into_response()
 }
@@ -513,6 +552,16 @@ async fn run_inference(
 
     let access = effective_access(&state, &keyauth).await;
 
+    // Admission checked the tokens-per-minute budget; the turn's own tokens
+    // are charged against it once the upstream has reported them.
+    let token_meter = (state.ratelimit_enabled && limits.tpm > 0).then(|| {
+        let limiter = state.limiter.clone();
+        let scope = scope.clone();
+        TokenMeter::new(move |tokens| {
+            limiter.charge_tokens(&scope, limits, tokens, now());
+        })
+    });
+
     let ctx = RequestCtx {
         api_key: Some(keyauth.api_key.clone()),
         user_id: Some(keyauth.api_key.owner_user_id.clone()),
@@ -522,6 +571,7 @@ async fn run_inference(
         excluded_model_ids: Default::default(),
         excluded_provider_ids: Default::default(),
         access,
+        token_meter,
     };
 
     // Best-effort last-used bookkeeping; never fails the request.

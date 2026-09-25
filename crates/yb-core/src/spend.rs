@@ -166,6 +166,25 @@ pub struct SpendRow {
     pub output_tokens: i64,
 }
 
+/// One UTC day of traffic for one key, model and surface, summed from the
+/// per-turn record, so a control plane can report usage by day, key, person
+/// and model without reading every turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UsageRow {
+    /// `YYYY-MM-DD`, UTC.
+    pub day: String,
+    pub api_key_id: Option<String>,
+    pub user_id: Option<String>,
+    /// The model the caller asked for.
+    pub model: String,
+    pub surface: String,
+    pub requests: i64,
+    pub errors: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_micros: Micros,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
