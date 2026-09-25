@@ -1067,6 +1067,8 @@ struct StreamState {
     done: bool,
     /// Set once telemetry has been recorded (exactly once).
     recorded: bool,
+    /// The client's dialect, which says what ends its answer.
+    surface: WireFormat,
 }
 
 impl StreamState {
@@ -1102,6 +1104,18 @@ impl Drop for StreamState {
     }
 }
 
+/// Whether these bytes carry the end of the answer in the client's dialect:
+/// what a client waits for before it stops reading.
+fn ends_stream(surface: WireFormat, bytes: &[u8], events: &[StreamEvent]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    match surface {
+        WireFormat::OpenaiChat => text.contains("data: [DONE]"),
+        WireFormat::Anthropic => text.contains("message_stop"),
+        WireFormat::OpenaiResponses => text.contains("response.completed"),
+        WireFormat::Gemini => events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
+    }
+}
+
 /// Build the client-facing translated SSE stream.
 ///
 /// Upstream bytes are buffered and split on `\n`; each line is decoded into IR
@@ -1134,6 +1148,7 @@ fn translate_stream(
         rctx,
         done: false,
         recorded: false,
+        surface,
     };
 
     let s = stream::unfold(init, |mut st| async move {
@@ -1179,6 +1194,18 @@ fn translate_stream(
                         continue;
                     }
                     st.response_bytes += bytes.len() as i64;
+                    // A client that has its answer's end may hang up before
+                    // the upstream closes, and the turn would then read as
+                    // abandoned; it is recorded as complete the moment the
+                    // end goes out.
+                    if !st.recorded && ends_stream(st.surface, &bytes, &events) {
+                        let ir = st.ir_json();
+                        st.rctx
+                            .finish(st.usage, st.status, false, ir, st.response_bytes)
+                            .await;
+                        st.recorded = true;
+                        st.done = true;
+                    }
                     return Some((Ok(Bytes::from(bytes)), st));
                 }
                 Some(Err(e)) => {
