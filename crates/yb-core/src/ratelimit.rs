@@ -185,7 +185,10 @@ impl Limiter {
         bucket.refill(now);
         if bucket.tokens < 1.0 {
             let secs = 1.0 / bucket.refill_per_sec.max(1e-9);
-            (true, Duration::from_secs_f64(secs).max(Duration::from_secs(1)))
+            (
+                true,
+                Duration::from_secs_f64(secs).max(Duration::from_secs(1)),
+            )
         } else {
             (false, Duration::ZERO)
         }

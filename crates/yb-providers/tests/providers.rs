@@ -4,9 +4,9 @@
 use futures::StreamExt;
 use yb_core::WireFormat;
 
-use yb_providers::{append_headers, cloudflare_access_headers, 
-    auth_headers, build_url, is_model_not_found, is_retryable, MockClient, ResponseBody,
-    UpstreamClient, UpstreamRequest,
+use yb_providers::{
+    append_headers, auth_headers, build_url, cloudflare_access_headers, is_model_not_found,
+    is_retryable, MockClient, ResponseBody, UpstreamClient, UpstreamRequest,
 };
 
 fn req(url: &str, stream: bool) -> UpstreamRequest {
@@ -103,11 +103,18 @@ fn cloudflare_access_headers_are_the_service_token_pair() {
 #[test]
 fn cloudflare_access_composes_with_upstream_auth() {
     let mut headers = auth_headers(WireFormat::OpenaiChat, "sk-vllm");
-    headers.extend(yb_providers::cloudflare_access_headers("abc.access", "s3cret"));
+    headers.extend(yb_providers::cloudflare_access_headers(
+        "abc.access",
+        "s3cret",
+    ));
     let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(
         names,
-        vec!["authorization", "cf-access-client-id", "cf-access-client-secret"]
+        vec![
+            "authorization",
+            "cf-access-client-id",
+            "cf-access-client-secret"
+        ]
     );
     assert_eq!(headers[0].1, "Bearer sk-vllm");
 }
@@ -229,10 +236,7 @@ async fn mock_can_simulate_retryable_status() {
 #[test]
 fn extra_headers_can_never_displace_auth_or_the_service_token() {
     let mut headers = auth_headers(WireFormat::OpenaiChat, "sk-origin");
-    append_headers(
-        &mut headers,
-        cloudflare_access_headers("id.access", "shh"),
-    );
+    append_headers(&mut headers, cloudflare_access_headers("id.access", "shh"));
     // A row trying to override all three, plus one legitimate addition.
     append_headers(
         &mut headers,
@@ -257,4 +261,3 @@ fn extra_headers_can_never_displace_auth_or_the_service_token() {
     // ...while a non-colliding header is still added.
     assert_eq!(get("x-tenant"), vec!["acme"]);
 }
-

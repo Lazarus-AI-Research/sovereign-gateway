@@ -21,9 +21,7 @@ impl Action {
     /// The minimum role required to perform this action.
     pub fn min_role(self) -> Role {
         match self {
-            Action::ManageKeys
-            | Action::EditConfig
-            | Action::ManageMembers => Role::Admin,
+            Action::ManageKeys | Action::EditConfig | Action::ManageMembers => Role::Admin,
             // Members can view their own spend and read the catalog.
             Action::ViewSpend | Action::ReadCatalog => Role::Member,
         }

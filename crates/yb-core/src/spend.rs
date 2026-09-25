@@ -173,7 +173,10 @@ mod tests {
     #[test]
     fn week_bucket_is_monday() {
         // 2026-06-29 is a Monday.
-        let at = Utc.with_ymd_and_hms(2026, 6, 29, 13, 0, 0).single().unwrap();
+        let at = Utc
+            .with_ymd_and_hms(2026, 6, 29, 13, 0, 0)
+            .single()
+            .unwrap();
         let start = Period::Week.bucket_start(at);
         assert_eq!(start.weekday(), chrono::Weekday::Mon);
         assert_eq!(

@@ -52,7 +52,8 @@ fn emit_request(format: &str, req: &ChatRequest, opts: &EmitOptions) -> Vec<u8> 
         "gemini" => gemini::emit_request(req, opts),
         other => panic!("unknown target_format {other}"),
     };
-    r.unwrap_or_else(|e| panic!("emit_request({format}) failed: {e}")).0
+    r.unwrap_or_else(|e| panic!("emit_request({format}) failed: {e}"))
+        .0
 }
 
 fn decode_stream(format: &str, lines: &[String]) -> Vec<StreamEvent> {
@@ -182,7 +183,8 @@ fn run(name: &str) {
         let emitted = emit_request(target_format, &req, &opts);
         let got: Value = serde_json::from_slice(&emitted).unwrap();
         assert_eq!(
-            &got, expected,
+            &got,
+            expected,
             "[{name}] request {inbound_format} -> {target_format} mismatch\n got: {}\nwant: {}",
             serde_json::to_string_pretty(&got).unwrap(),
             serde_json::to_string_pretty(expected).unwrap(),
@@ -307,7 +309,10 @@ fn gemini_parse_request_shapes_ir() {
     let body = serde_json::to_vec(c.get("inbound_body").unwrap()).unwrap();
     let req = gemini::parse_request(&body).unwrap();
 
-    assert_eq!(req.system.as_ref().unwrap()[0], ContentBlock::text("You are helpful."));
+    assert_eq!(
+        req.system.as_ref().unwrap()[0],
+        ContentBlock::text("You are helpful.")
+    );
     assert_eq!(req.messages.len(), 3);
     assert_eq!(req.messages[0].role, Role::User);
     assert_eq!(req.messages[1].role, Role::Assistant);
@@ -366,7 +371,12 @@ fn anthropic_response_usage_and_stop_reason() {
 /// format, returning the cassette's `expected_upstream_body`. Tests do not call
 /// this (they read committed fixtures); it exists to (re)record them offline.
 #[allow(dead_code)]
-pub fn record(inbound_format: &str, inbound_body: &Value, target_format: &str, target_model: &str) -> Value {
+pub fn record(
+    inbound_format: &str,
+    inbound_body: &Value,
+    target_format: &str,
+    target_model: &str,
+) -> Value {
     let body = serde_json::to_vec(inbound_body).unwrap();
     let req = parse_request(inbound_format, &body);
     let opts = EmitOptions {
@@ -417,18 +427,27 @@ fn assert_responses_lifecycle(bytes: &[u8]) {
             }
             t if t.ends_with(".delta") => {
                 let id = v["item_id"].as_str().expect("delta carries item_id");
-                assert!(open.contains(id), "{t} for item {id} before output_item.added");
+                assert!(
+                    open.contains(id),
+                    "{t} for item {id} before output_item.added"
+                );
             }
             "response.completed" => {
                 saw_completed = true;
                 let u = &v["response"]["usage"];
-                assert!(u["total_tokens"].is_u64(), "usage.total_tokens missing: {u}");
+                assert!(
+                    u["total_tokens"].is_u64(),
+                    "usage.total_tokens missing: {u}"
+                );
             }
             _ => {}
         }
     }
     assert!(saw_completed, "stream never emitted response.completed");
-    assert!(open.is_empty(), "items left open at end of stream: {open:?}");
+    assert!(
+        open.is_empty(),
+        "items left open at end of stream: {open:?}"
+    );
 }
 
 /// Tool-lifecycle recording: reasoning -> message -> function_call in one turn.
@@ -436,16 +455,34 @@ fn assert_responses_lifecycle(bytes: &[u8]) {
 fn vllm_replay_tool_stream_decodes_and_reencodes() {
     let events = replay_vllm("vllm_responses_stream_tool");
 
-    let thinking: String = events.iter().filter_map(|e| match e {
-        StreamEvent::ThinkingDelta { text } => Some(text.as_str()), _ => None }).collect();
-    assert!(!thinking.is_empty(), "reasoning_text deltas must decode to ThinkingDelta");
+    let thinking: String = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ThinkingDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !thinking.is_empty(),
+        "reasoning_text deltas must decode to ThinkingDelta"
+    );
 
-    let starts: Vec<_> = events.iter().filter_map(|e| match e {
-        StreamEvent::ToolUseStart { name, .. } => Some(name.clone()), _ => None }).collect();
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ToolUseStart { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(starts, vec!["calc".to_string()], "one tool call to calc");
 
-    let args: String = events.iter().filter_map(|e| match e {
-        StreamEvent::ToolUseDelta { partial_json } => Some(partial_json.as_str()), _ => None }).collect();
+    let args: String = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ToolUseDelta { partial_json } => Some(partial_json.as_str()),
+            _ => None,
+        })
+        .collect();
     let parsed: Value = serde_json::from_str(&args).expect("tool args reassemble to JSON");
     assert_eq!(parsed["answer"], 42);
 
@@ -458,7 +495,10 @@ fn vllm_replay_tool_stream_decodes_and_reencodes() {
     // Gemini has no partial-tool encoding, so its encoder buffers tool args and
     // must emit ONE functionCall part carrying the complete args object.
     let gem = String::from_utf8(encode_stream("gemini", &events, false)).unwrap();
-    assert!(gem.contains("\"functionCall\""), "gemini output missing functionCall");
+    assert!(
+        gem.contains("\"functionCall\""),
+        "gemini output missing functionCall"
+    );
     assert!(
         gem.contains("\"answer\":42") || gem.contains("\"answer\": 42"),
         "gemini functionCall must carry the complete args, got: {gem}"
@@ -471,9 +511,18 @@ fn vllm_replay_tool_stream_decodes_and_reencodes() {
 fn vllm_replay_codex_stream_decodes_and_reencodes() {
     let events = replay_vllm("vllm_responses_stream_codex");
 
-    let text: String = events.iter().filter_map(|e| match e {
-        StreamEvent::TextDelta { text } => Some(text.as_str()), _ => None }).collect();
-    assert!(text.len() > 1000, "expected a long text answer, got {} chars", text.len());
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.len() > 1000,
+        "expected a long text answer, got {} chars",
+        text.len()
+    );
 
     let done = events.iter().any(|e| matches!(e, StreamEvent::Done { .. }));
     assert!(done, "stream must terminate with Done");
@@ -495,13 +544,17 @@ fn prompt_cache_key_roundtrips_on_openai_shapes() {
 
     // responses -> responses: key + default retention
     let out: Value = serde_json::from_slice(&emit_request(
-        "openai_responses", &req, &EmitOptions::new("m"))).unwrap();
+        "openai_responses",
+        &req,
+        &EmitOptions::new("m"),
+    ))
+    .unwrap();
     assert_eq!(out["prompt_cache_key"], "cache-abc");
     assert_eq!(out["prompt_cache_retention"], "24h");
 
     // responses -> chat: same fields on the chat shape
-    let chat: Value = serde_json::from_slice(&emit_request(
-        "openai_chat", &req, &EmitOptions::new("m"))).unwrap();
+    let chat: Value =
+        serde_json::from_slice(&emit_request("openai_chat", &req, &EmitOptions::new("m"))).unwrap();
     assert_eq!(chat["prompt_cache_key"], "cache-abc");
     assert_eq!(chat["prompt_cache_retention"], "24h");
 
@@ -512,12 +565,16 @@ fn prompt_cache_key_roundtrips_on_openai_shapes() {
     });
     let req2 = parse_request("openai_responses", &serde_json::to_vec(&inbound2).unwrap());
     let out2: Value = serde_json::from_slice(&emit_request(
-        "openai_responses", &req2, &EmitOptions::new("m"))).unwrap();
+        "openai_responses",
+        &req2,
+        &EmitOptions::new("m"),
+    ))
+    .unwrap();
     assert_eq!(out2["prompt_cache_retention"], "1h");
 
     // responses -> anthropic: no leak
-    let ant: Value = serde_json::from_slice(&emit_request(
-        "anthropic", &req, &EmitOptions::new("m"))).unwrap();
+    let ant: Value =
+        serde_json::from_slice(&emit_request("anthropic", &req, &EmitOptions::new("m"))).unwrap();
     assert!(ant.get("prompt_cache_key").is_none());
     assert!(ant.get("prompt_cache_retention").is_none());
 }
@@ -551,14 +608,17 @@ fn prompt_cache_fields_echo_on_response_object() {
     let events = vec![
         StreamEvent::MessageStart { model: "m".into() },
         StreamEvent::TextDelta { text: "hi".into() },
-        StreamEvent::Done { stop_reason: yb_wire::StopReason::EndTurn },
+        StreamEvent::Done {
+            stop_reason: yb_wire::StopReason::EndTurn,
+        },
     ];
     // No UsageDelta here, so `response.completed` is deferred; the real driver
     // flushes at end of stream, and so must this.
     let mut bytes = openai_responses::encode_sse(&events, &mut st);
     bytes.extend(st.finish());
     let sse = String::from_utf8(bytes).unwrap();
-    let completed = sse.lines()
+    let completed = sse
+        .lines()
         .filter(|l| l.starts_with("data:"))
         .map(|l| serde_json::from_str::<Value>(l[5..].trim()).unwrap())
         .find(|v| v["type"] == "response.completed")

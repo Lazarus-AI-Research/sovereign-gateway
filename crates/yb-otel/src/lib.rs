@@ -91,7 +91,10 @@ impl Observer for OtelSink {
 /// so nothing is lost there).
 async fn push_worker(sink: Arc<OtelSink>, endpoint: String, service: String, interval: Duration) {
     let client = reqwest::Client::new();
-    let start_ns = yb_core::now().timestamp_nanos_opt().unwrap_or(0).to_string();
+    let start_ns = yb_core::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .to_string();
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -99,10 +102,16 @@ async fn push_worker(sink: Arc<OtelSink>, endpoint: String, service: String, int
 
         let dropped = std::mem::take(&mut *sink.dropped.lock().unwrap());
         if dropped > 0 {
-            tracing::warn!(dropped, "otel: event queue overflowed; oldest events dropped");
+            tracing::warn!(
+                dropped,
+                "otel: event queue overflowed; oldest events dropped"
+            );
         }
 
-        let now_ns = yb_core::now().timestamp_nanos_opt().unwrap_or(0).to_string();
+        let now_ns = yb_core::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .to_string();
         let snapshot = sink.registry.snapshot();
         if !snapshot.is_empty() {
             let body = otlp::metrics_payload(&service, &snapshot, &start_ns, &now_ns);
@@ -119,7 +128,13 @@ async fn push_worker(sink: Arc<OtelSink>, endpoint: String, service: String, int
 }
 
 async fn post(client: &reqwest::Client, url: &str, body: &serde_json::Value) {
-    match client.post(url).json(body).timeout(Duration::from_secs(10)).send().await {
+    match client
+        .post(url)
+        .json(body)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
         Ok(resp) if !resp.status().is_success() => {
             tracing::warn!(url, status = %resp.status(), "otel: push rejected");
         }

@@ -40,8 +40,7 @@ impl Gateway {
 
         // Anything past this point is an attempted turn — same guarantees as
         // chat: failures and abandonment are recorded, not silently dropped.
-        let mut guard =
-            self.turn_guard(&ctx, surface.as_str(), &req.model, started, created_at);
+        let mut guard = self.turn_guard(&ctx, surface.as_str(), &req.model, started, created_at);
 
         // 2. Route through the same resolver (aliases + access policy apply).
         let route = build_embed_route_request(&req, &ctx);
@@ -73,8 +72,7 @@ impl Gateway {
             saw_chat_only = false;
 
             let opts = EmbedEmitOptions::new(deployment.upstream_model.clone());
-            let (up_body, mut headers) = match wire::emit_embed_request(upstream_fmt, &req, &opts)
-            {
+            let (up_body, mut headers) = match wire::emit_embed_request(upstream_fmt, &req, &opts) {
                 Ok(v) => v,
                 Err(e) => {
                     guard.fail(e.http_status()).await;
@@ -122,10 +120,16 @@ impl Gateway {
                 // Non-retryable: committed error turn.
                 guard.disarm();
                 let rctx = self.record_ctx(
-                    &ctx, surface.as_str(), &req.model, &deployment,
-                    body.to_vec(), started, created_at,
+                    &ctx,
+                    surface.as_str(),
+                    &req.model,
+                    &deployment,
+                    body.to_vec(),
+                    started,
+                    created_at,
                 );
-                rctx.finish(Usage::default(), status, true, Vec::new(), 0).await;
+                rctx.finish(Usage::default(), status, true, Vec::new(), 0)
+                    .await;
                 return Err(Error::Upstream {
                     provider: deployment.provider.clone(),
                     status,
@@ -148,8 +152,13 @@ impl Gateway {
 
             guard.disarm();
             let rctx = self.record_ctx(
-                &ctx, surface.as_str(), &req.model, &deployment,
-                body.to_vec(), started, created_at,
+                &ctx,
+                surface.as_str(),
+                &req.model,
+                &deployment,
+                body.to_vec(),
+                started,
+                created_at,
             );
             let usage = Usage {
                 input_tokens: parsed.usage.input_tokens,

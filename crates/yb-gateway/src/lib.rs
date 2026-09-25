@@ -29,6 +29,6 @@ pub mod router;
 pub mod service;
 pub mod wire;
 
+pub use health::HealthReport;
 pub use router::DeploymentRouter;
 pub use service::{Gateway, GatewayResponse, RequestCtx};
-pub use health::HealthReport;

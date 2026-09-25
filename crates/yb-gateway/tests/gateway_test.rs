@@ -470,7 +470,11 @@ async fn aggregates_streaming_upstream_for_nonstreaming_client() {
         "messages": [{"role": "user", "content": "hi"}]
     });
     let resp = gateway
-        .handle(WireFormat::Anthropic, &serde_json::to_vec(&inbound).unwrap(), RequestCtx::new())
+        .handle(
+            WireFormat::Anthropic,
+            &serde_json::to_vec(&inbound).unwrap(),
+            RequestCtx::new(),
+        )
         .await
         .expect("handle succeeds");
 
@@ -482,8 +486,14 @@ async fn aggregates_streaming_upstream_for_nonstreaming_client() {
         GatewayResponse::Stream { .. } => panic!("non-streaming client must get a buffered body"),
     };
     let v: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["type"], "message", "aggregated into an Anthropic envelope");
-    assert_eq!(v["content"][0]["text"], "Hello world", "deltas were concatenated");
+    assert_eq!(
+        v["type"], "message",
+        "aggregated into an Anthropic envelope"
+    );
+    assert_eq!(
+        v["content"][0]["text"], "Hello world",
+        "deltas were concatenated"
+    );
 
     let rows = store.telemetry();
     assert_eq!(rows.len(), 1, "one telemetry row for the aggregated turn");

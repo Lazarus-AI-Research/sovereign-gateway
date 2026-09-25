@@ -31,7 +31,10 @@ pub enum Error {
 
     /// Rate limited. Maps to 429 with a `Retry-After` header.
     #[error("rate limited: retry after {retry_after:?}")]
-    RateLimited { retry_after: Duration, reason: String },
+    RateLimited {
+        retry_after: Duration,
+        reason: String,
+    },
 
     /// No deployment can serve the request after access/exclusion filtering.
     /// Distinct from an upstream outage — this is a 4xx client/config error.

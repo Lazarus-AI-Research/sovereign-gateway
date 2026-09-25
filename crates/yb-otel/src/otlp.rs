@@ -159,7 +159,11 @@ pub fn logs_payload(service_name: &str, recs: &[TelemetryRecord]) -> Value {
         .map(|rec| {
             let mut attrs = turn_attrs(rec);
             attrs.push(kv_str("event.name", "gateway.turn"));
-            let (severity, text) = if rec.is_error { (13, "WARN") } else { (9, "INFO") };
+            let (severity, text) = if rec.is_error {
+                (13, "WARN")
+            } else {
+                (9, "INFO")
+            };
             json!({
                 "timeUnixNano": nanos(&rec.created_at),
                 "severityNumber": severity,
@@ -252,7 +256,10 @@ mod tests {
         let h = &metrics[4]["histogram"]["dataPoints"][0];
         let buckets = h["bucketCounts"].as_array().unwrap();
         assert_eq!(buckets.len(), LATENCY_BUCKETS_MS.len() + 1);
-        let total: u64 = buckets.iter().map(|b| b.as_str().unwrap().parse::<u64>().unwrap()).sum();
+        let total: u64 = buckets
+            .iter()
+            .map(|b| b.as_str().unwrap().parse::<u64>().unwrap())
+            .sum();
         assert_eq!(total.to_string(), h["count"].as_str().unwrap());
     }
 
@@ -263,8 +270,9 @@ mod tests {
         assert_eq!(lr["body"]["stringValue"], "gateway.turn");
         let attrs = lr["attributes"].as_array().unwrap();
         assert!(attrs.iter().any(|a| a["key"] == "request_id"));
-        assert!(attrs.iter().any(|a| a["key"] == "requested_model"
-            && a["value"]["stringValue"] == "claude-opus-4-8"));
+        assert!(attrs.iter().any(
+            |a| a["key"] == "requested_model" && a["value"]["stringValue"] == "claude-opus-4-8"
+        ));
         // no body-like fields, only structured metadata
         assert!(!attrs.iter().any(|a| a["key"] == "request_body"));
     }

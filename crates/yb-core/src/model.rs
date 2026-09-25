@@ -90,7 +90,10 @@ impl AccessPolicy {
         AccessPolicy {
             allowed_model_ids: intersect_allow(&self.allowed_model_ids, &other.allowed_model_ids),
             denied_model_ids: union(&self.denied_model_ids, &other.denied_model_ids),
-            allowed_provider_ids: intersect_allow(&self.allowed_provider_ids, &other.allowed_provider_ids),
+            allowed_provider_ids: intersect_allow(
+                &self.allowed_provider_ids,
+                &other.allowed_provider_ids,
+            ),
             denied_provider_ids: union(&self.denied_provider_ids, &other.denied_provider_ids),
         }
     }
@@ -180,7 +183,9 @@ impl KeyScope {
         match s {
             "inference" => Ok(KeyScope::Inference),
             "admin" => Ok(KeyScope::Admin),
-            other => Err(crate::Error::BadRequest(format!("unknown key scope: {other}"))),
+            other => Err(crate::Error::BadRequest(format!(
+                "unknown key scope: {other}"
+            ))),
         }
     }
 
@@ -191,7 +196,11 @@ impl KeyScope {
     /// string defaults to inference-only.
     pub fn parse_set(s: &str) -> crate::Result<Vec<KeyScope>> {
         let mut out = Vec::new();
-        for part in s.split([' ', ',', '\t']).map(str::trim).filter(|p| !p.is_empty()) {
+        for part in s
+            .split([' ', ',', '\t'])
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
             let scope = KeyScope::parse(part)?;
             if !out.contains(&scope) {
                 out.push(scope);

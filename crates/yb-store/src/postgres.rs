@@ -14,7 +14,9 @@ use yb_core::model::{
     TelemetryRecord, User,
 };
 use yb_core::principal::KeyAuth;
-use yb_core::routing::{DeploymentRecord, HealthRecord, ModelRecord, NewDeployment, ProviderRecord};
+use yb_core::routing::{
+    DeploymentRecord, HealthRecord, ModelRecord, NewDeployment, ProviderRecord,
+};
 use yb_core::spend::{Budget, BudgetAction, Period, RollupDelta, SpendRow, SubjectType};
 use yb_core::{new_id, now, Error, LimitColumns, Micros, Result, Store, Timestamp};
 
@@ -112,7 +114,8 @@ fn dec_extra(raw: Option<String>) -> yb_core::Extra {
 
 /// Encode optional pricing as JSON text (`None` → SQL NULL).
 fn enc_pricing(p: &Option<yb_core::catalog::ModelPrice>) -> Option<String> {
-    p.as_ref().map(|p| serde_json::to_string(p).unwrap_or_default())
+    p.as_ref()
+        .map(|p| serde_json::to_string(p).unwrap_or_default())
 }
 
 // ---- row mappers -------------------------------------------------------
@@ -190,7 +193,8 @@ fn map_budget(r: &PgRow) -> Result<Budget> {
     Ok(Budget {
         id: r.try_get("id").map_err(storage_err)?,
         subject_type: SubjectType::parse(
-            &r.try_get::<String, _>("subject_type").map_err(storage_err)?,
+            &r.try_get::<String, _>("subject_type")
+                .map_err(storage_err)?,
         )?,
         subject_id: r.try_get("subject_id").map_err(storage_err)?,
         period: Period::parse(&r.try_get::<String, _>("period").map_err(storage_err)?)?,
@@ -271,7 +275,8 @@ fn map_deployment(r: &PgRow) -> Result<DeploymentRecord> {
             None => None,
         },
         health_check: serde_json::from_value(serde_json::Value::String(
-            r.try_get::<String, _>("health_check").map_err(storage_err)?,
+            r.try_get::<String, _>("health_check")
+                .map_err(storage_err)?,
         ))
         .map_err(storage_err)?,
         health_path: r.try_get("health_path").map_err(storage_err)?,
@@ -404,12 +409,10 @@ impl Store for PostgresStore {
     }
 
     async fn count_admins(&self) -> Result<i64> {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(storage_err)
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage_err)
     }
 
     // ---- web sessions (cookie token → user) ---------------------------
@@ -1004,7 +1007,9 @@ impl Store for PostgresStore {
             .await
             .map_err(storage_err)?;
         if taken.is_some() {
-            return Err(Error::Conflict(format!("model \"{new_name}\" already exists")));
+            return Err(Error::Conflict(format!(
+                "model \"{new_name}\" already exists"
+            )));
         }
 
         // An alias of *this* model is consumed rather than conflicting, so
@@ -1060,28 +1065,34 @@ impl Store for PostgresStore {
 
     // ---- providers (an endpoint, its credentials, its deployments) -----
     async fn list_providers(&self) -> Result<Vec<ProviderRecord>> {
-        let rows = sqlx::query(&format!("SELECT {PROVIDER_COLS} FROM providers ORDER BY name"))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage_err)?;
+        let rows = sqlx::query(&format!(
+            "SELECT {PROVIDER_COLS} FROM providers ORDER BY name"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_err)?;
         rows.iter().map(map_provider).collect()
     }
 
     async fn get_provider(&self, id: &str) -> Result<Option<ProviderRecord>> {
-        let row = sqlx::query(&format!("SELECT {PROVIDER_COLS} FROM providers WHERE id = $1"))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(storage_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {PROVIDER_COLS} FROM providers WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_err)?;
         row.as_ref().map(map_provider).transpose()
     }
 
     async fn get_provider_by_name(&self, name: &str) -> Result<Option<ProviderRecord>> {
-        let row = sqlx::query(&format!("SELECT {PROVIDER_COLS} FROM providers WHERE name = $1"))
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(storage_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {PROVIDER_COLS} FROM providers WHERE name = $1"
+        ))
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_err)?;
         row.as_ref().map(map_provider).transpose()
     }
 
@@ -1117,7 +1128,9 @@ impl Store for PostgresStore {
             .await
             .map_err(storage_err)?;
         if taken.is_some() {
-            return Err(Error::Conflict(format!("provider \"{name}\" already exists")));
+            return Err(Error::Conflict(format!(
+                "provider \"{name}\" already exists"
+            )));
         }
         // `api_key = NULL` means "leave it alone": the admin API never reads a
         // key back out, so an edit round-trip must not blank one by omission.
@@ -1140,13 +1153,12 @@ impl Store for PostgresStore {
     }
 
     async fn delete_provider(&self, id: &str) -> Result<()> {
-        let in_use = sqlx::query(
-            "SELECT 1 FROM deployments WHERE provider_id = $1 AND deleted_at IS NULL",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage_err)?;
+        let in_use =
+            sqlx::query("SELECT 1 FROM deployments WHERE provider_id = $1 AND deleted_at IS NULL")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(storage_err)?;
         if in_use.is_some() {
             return Err(Error::Conflict(
                 "provider still has deployments; delete them first".into(),

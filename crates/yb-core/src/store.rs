@@ -77,8 +77,7 @@ pub trait Store: Send + Sync {
     async fn delete_team(&self, id: &str) -> crate::Result<()>;
     async fn update_team_access(&self, id: &str, policy: &AccessPolicy) -> crate::Result<()>;
     async fn upsert_membership(&self, m: &TeamMembership) -> crate::Result<()>;
-    async fn list_memberships_for_user(&self, user_id: &str)
-        -> crate::Result<Vec<TeamMembership>>;
+    async fn list_memberships_for_user(&self, user_id: &str) -> crate::Result<Vec<TeamMembership>>;
     async fn list_team_members(&self, team_id: &str) -> crate::Result<Vec<TeamMembership>>;
     async fn delete_membership(&self, team_id: &str, user_id: &str) -> crate::Result<()>;
 

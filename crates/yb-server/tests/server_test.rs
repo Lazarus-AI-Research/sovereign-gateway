@@ -273,7 +273,11 @@ async fn mock_idp() -> String {
             }))
             .into_response()
         } else {
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid_code" }))).into_response()
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_code" })),
+            )
+                .into_response()
         }
     }
     // Unified-session introspection: the one shared token resolves to the identity.
@@ -284,7 +288,11 @@ async fn mock_idp() -> String {
             Json(json!({ "user": { "id": "u1", "email": "admin@example.com", "name": "Admin" }, "role": "x" }))
                 .into_response()
         } else {
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid_session" }))).into_response()
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_session" })),
+            )
+                .into_response()
         }
     }
 
@@ -292,7 +300,10 @@ async fn mock_idp() -> String {
         .route("/api/login/start", post(start))
         .route("/api/login/code", post(code))
         .route("/api/session/introspect", post(introspect))
-        .route("/api/users/invite", post(|| async { Json(json!({ "ok": true })) }));
+        .route(
+            "/api/users/invite",
+            post(|| async { Json(json!({ "ok": true })) }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -303,7 +314,10 @@ async fn mock_idp() -> String {
 
 /// Build an [`AppState`] with a chosen set of auth providers, optionally wired to
 /// a mock IdP base URL. No models/keys needed for auth tests.
-async fn setup_auth(providers: Vec<yb_core::config::AuthProvider>, sso_base: Option<String>) -> AppState {
+async fn setup_auth(
+    providers: Vec<yb_core::config::AuthProvider>,
+    sso_base: Option<String>,
+) -> AppState {
     setup_auth_ts(providers, sso_base, None).await
 }
 
@@ -345,7 +359,12 @@ async fn setup_auth_ts(
         Strategy::Simple,
     ));
     let client: Arc<dyn UpstreamClient> = Arc::new(MockClient::json(upstream_completion()));
-    let gateway = Arc::new(Gateway::new(client, router.clone(), store.clone(), Arc::new(NullLogger)));
+    let gateway = Arc::new(Gateway::new(
+        client,
+        router.clone(),
+        store.clone(),
+        Arc::new(NullLogger),
+    ));
 
     AppState {
         store,
@@ -363,7 +382,11 @@ async fn setup_auth_ts(
     }
 }
 
-async fn post_json(app: &axum::Router, uri: &str, body: Value) -> axum::http::Response<axum::body::Body> {
+async fn post_json(
+    app: &axum::Router,
+    uri: &str,
+    body: Value,
+) -> axum::http::Response<axum::body::Body> {
     app.clone()
         .oneshot(
             Request::builder()
@@ -388,28 +411,56 @@ async fn sso_code_login_provisions_user_and_sets_cookie() {
     // config advertises both providers
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/admin/v1/auth/config").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/admin/v1/auth/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let v: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let v: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(v["providers"], json!(["local", "sso"]));
 
     // start → dev code passthrough
-    let resp = post_json(&app, "/admin/v1/auth/sso/start", json!({"email":"admin@example.com"})).await;
+    let resp = post_json(
+        &app,
+        "/admin/v1/auth/sso/start",
+        json!({"email":"admin@example.com"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let v: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let v: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(v["dev_code"], "123456");
 
     // code → session cookie + auto-provisioned user. Role is the gateway's, not the
     // IdP's: a brand-new sso user is a Member (the IdP said "whatever-the-idp-says").
-    let resp = post_json(&app, "/admin/v1/auth/sso/code", json!({"email":"admin@example.com","code":"123456"})).await;
+    let resp = post_json(
+        &app,
+        "/admin/v1/auth/sso/code",
+        json!({"email":"admin@example.com","code":"123456"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(resp.headers().get("set-cookie").unwrap().to_str().unwrap().contains("yb_session="));
-    let v: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("yb_session="));
+    let v: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(v["role"], "member");
 
     // the user now exists locally, keyed by email, with a non-verifying password
-    let u = store.get_user_by_username("admin@example.com").await.unwrap().unwrap();
+    let u = store
+        .get_user_by_username("admin@example.com")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(u.role, Role::Member);
     assert_eq!(u.password_hash, "!sso");
 }
@@ -440,12 +491,26 @@ async fn preset_role_persists_across_first_sso_login() {
         .unwrap();
 
     let app = build_router(state);
-    let resp = post_json(&app, "/admin/v1/auth/sso/code", json!({"email":"admin@example.com","code":"123456"})).await;
+    let resp = post_json(
+        &app,
+        "/admin/v1/auth/sso/code",
+        json!({"email":"admin@example.com","code":"123456"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let v: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let v: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     // The pre-set admin role is preserved — sso login does not downgrade it.
     assert_eq!(v["role"], "admin");
-    assert_eq!(store.get_user_by_username("admin@example.com").await.unwrap().unwrap().role, Role::Admin);
+    assert_eq!(
+        store
+            .get_user_by_username("admin@example.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        Role::Admin
+    );
 }
 
 #[tokio::test]
@@ -454,7 +519,12 @@ async fn sso_wrong_code_is_401() {
     let idp = mock_idp().await;
     let state = setup_auth(vec![Local, Sso], Some(idp)).await;
     let app = build_router(state);
-    let resp = post_json(&app, "/admin/v1/auth/sso/code", json!({"email":"admin@example.com","code":"000000"})).await;
+    let resp = post_json(
+        &app,
+        "/admin/v1/auth/sso/code",
+        json!({"email":"admin@example.com","code":"000000"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -463,7 +533,12 @@ async fn sso_routes_403_when_provider_disabled() {
     use yb_core::config::AuthProvider::Local;
     let state = setup_auth(vec![Local], None).await; // sso not enabled
     let app = build_router(state);
-    let resp = post_json(&app, "/admin/v1/auth/sso/start", json!({"email":"x@example.com"})).await;
+    let resp = post_json(
+        &app,
+        "/admin/v1/auth/sso/start",
+        json!({"email":"x@example.com"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
@@ -473,7 +548,12 @@ async fn local_login_403_when_local_disabled() {
     let idp = mock_idp().await;
     let state = setup_auth(vec![Sso], Some(idp)).await; // local not enabled
     let app = build_router(state);
-    let resp = post_json(&app, "/admin/v1/auth/login", json!({"username":"admin","password":"admin"})).await;
+    let resp = post_json(
+        &app,
+        "/admin/v1/auth/login",
+        json!({"username":"admin","password":"admin"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
@@ -487,18 +567,29 @@ async fn turnstile_sitekey_exposed_and_token_forwarded() {
     // /auth/config exposes the sitekey so the SPA can render the widget.
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/admin/v1/auth/config").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/admin/v1/auth/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let v: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let v: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(v["providers"], json!(["sso"]));
     assert_eq!(v["turnstile_sitekey"], "SITEKEY-123");
 
     // The gateway forwards the turnstile_token to the IdP (mock echoes it as dev_code).
-    let resp = post_json(&app, "/admin/v1/auth/sso/start",
-        json!({"email":"admin@example.com","turnstile_token":"TS-TOKEN-XYZ"})).await;
+    let resp = post_json(
+        &app,
+        "/admin/v1/auth/sso/start",
+        json!({"email":"admin@example.com","turnstile_token":"TS-TOKEN-XYZ"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let v: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let v: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(v["dev_code"], "TS-TOKEN-XYZ");
 }
 
@@ -511,7 +602,12 @@ async fn sso_login_sets_shared_cookie_and_it_authenticates() {
 
     // Log in via the code flow → response sets BOTH yb_session and the unified
     // lzr_session (Domain=lzrlab.dev) from the IdP-issued token.
-    let resp = post_json(&app, "/admin/v1/auth/sso/code", json!({"email":"admin@example.com","code":"123456"})).await;
+    let resp = post_json(
+        &app,
+        "/admin/v1/auth/sso/code",
+        json!({"email":"admin@example.com","code":"123456"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let cookies: Vec<String> = resp
         .headers()
@@ -519,7 +615,10 @@ async fn sso_login_sets_shared_cookie_and_it_authenticates() {
         .iter()
         .map(|v| v.to_str().unwrap().to_string())
         .collect();
-    let shared = cookies.iter().find(|c| c.starts_with("lzr_session=")).expect("shared cookie set");
+    let shared = cookies
+        .iter()
+        .find(|c| c.starts_with("lzr_session="))
+        .expect("shared cookie set");
     assert!(shared.contains("lzr_session=SHARED-SESSION-TOKEN"));
     assert!(shared.contains("Domain=lzrlab.dev"), "{shared}");
 
@@ -537,7 +636,8 @@ async fn sso_login_sets_shared_cookie_and_it_authenticates() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let v: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let v: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(v["username"], "admin@example.com");
 
     // A bogus unified cookie does not authenticate.
@@ -563,31 +663,72 @@ async fn invite_provisions_local_user_with_role_and_password_create_is_blocked()
     let store = state.store.clone();
     // Seed a local admin + session so we can call the admin API with a cookie.
     let admin = User {
-        id: new_id(), username: "boss".into(), password_hash: "!sso".into(),
-        role: Role::Admin, rpm_limit: None, tpm_limit: None, max_concurrent: None,
-        created_at: now(), last_login_at: None, deleted_at: None,
+        id: new_id(),
+        username: "boss".into(),
+        password_hash: "!sso".into(),
+        role: Role::Admin,
+        rpm_limit: None,
+        tpm_limit: None,
+        max_concurrent: None,
+        created_at: now(),
+        last_login_at: None,
+        deleted_at: None,
     };
     store.create_user(&admin).await.unwrap();
-    let sess = yb_core::model::Session { token: "adm".into(), user_id: admin.id.clone(), created_at: now(), expires_at: now() + chrono::Duration::hours(1) };
+    let sess = yb_core::model::Session {
+        token: "adm".into(),
+        user_id: admin.id.clone(),
+        created_at: now(),
+        expires_at: now() + chrono::Duration::hours(1),
+    };
     store.create_session(&sess).await.unwrap();
     let app = build_router(state);
     let c = "cookie: yb_session=adm";
 
     // Invite creates a local user (email as username, sentinel pw, admin role).
-    let resp = app.clone().oneshot(Request::builder().method("POST").uri("/admin/v1/users/invite")
-        .header("content-type", "application/json").header("cookie", &c[8..])
-        .body(Body::from(serde_json::to_vec(&json!({"email":"NewGuy@lazarus.enterprises","role":"admin"})).unwrap())).unwrap())
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/v1/users/invite")
+                .header("content-type", "application/json")
+                .header("cookie", &c[8..])
+                .body(Body::from(
+                    serde_json::to_vec(
+                        &json!({"email":"NewGuy@lazarus.enterprises","role":"admin"}),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let u = store.get_user_by_username("newguy@lazarus.enterprises").await.unwrap().expect("provisioned");
+    let u = store
+        .get_user_by_username("newguy@lazarus.enterprises")
+        .await
+        .unwrap()
+        .expect("provisioned");
     assert_eq!(u.role, Role::Admin);
     assert_eq!(u.password_hash, "!sso");
 
     // Password create is blocked when local is disabled.
-    let resp = app.oneshot(Request::builder().method("POST").uri("/admin/v1/users")
-        .header("content-type", "application/json").header("cookie", &c[8..])
-        .body(Body::from(serde_json::to_vec(&json!({"username":"x","password":"y","role":"member"})).unwrap())).unwrap())
-        .await.unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/v1/users")
+                .header("content-type", "application/json")
+                .header("cookie", &c[8..])
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"username":"x","password":"y","role":"member"}))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 // ---------------------------------------------------------------------------
@@ -612,12 +753,22 @@ async fn seed_dep(store: &dyn Store, model_name: &str, provider: &str) {
 /// The model id behind a public name, for tests that must speak ids (an access
 /// policy) while reading like they speak names.
 async fn model_id(store: &dyn Store, name: &str) -> String {
-    store.get_model_by_name(name).await.unwrap().expect("model exists").id
+    store
+        .get_model_by_name(name)
+        .await
+        .unwrap()
+        .expect("model exists")
+        .id
 }
 
 /// The provider id behind a provider name, for the same reason.
 async fn provider_id(store: &dyn Store, name: &str) -> String {
-    store.get_provider_by_name(name).await.unwrap().expect("provider exists").id
+    store
+        .get_provider_by_name(name)
+        .await
+        .unwrap()
+        .expect("provider exists")
+        .id
 }
 
 /// Log `user_id` in by minting a session row directly, returning the cookie
@@ -680,7 +831,12 @@ async fn complete_suggests_models_and_providers_that_exist() {
     assert_eq!(status, StatusCode::OK);
     // `value` is the model id now (that is what a policy stores); the name is
     // the label.
-    let names: Vec<&str> = v.as_array().unwrap().iter().map(|s| s["label"].as_str().unwrap()).collect();
+    let names: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["label"].as_str().unwrap())
+        .collect();
     assert_eq!(names, vec!["claude-sonnet", "gpt-4o"]);
     // Both providers of gpt-4o show up as a hint; the alias annotates its target.
     let hint = |name: &str| -> String {
@@ -716,9 +872,17 @@ async fn complete_suggests_models_and_providers_that_exist() {
     // Providers are distinct, with a deployment count as the hint. As with
     // models, the value is the id a policy stores and the label is the name.
     let (_, v) = get_json(&app, "/admin/v1/complete?kind=provider", &cookie).await;
-    let provs: Vec<&str> = v.as_array().unwrap().iter().map(|s| s["label"].as_str().unwrap()).collect();
+    let provs: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["label"].as_str().unwrap())
+        .collect();
     assert_eq!(provs, vec!["anthropic", "azure", "openai"]);
-    assert_eq!(v[0]["value"], provider_id(store.as_ref(), "anthropic").await);
+    assert_eq!(
+        v[0]["value"],
+        provider_id(store.as_ref(), "anthropic").await
+    );
     assert_eq!(v[0]["hint"], "1 deployment");
 
     // Completing the user list is member-forbidden: it discloses the accounts.
@@ -761,12 +925,7 @@ async fn key_with(store: &dyn Store, access: AccessPolicy, team_id: Option<Strin
 }
 
 /// `PUT uri` with `body`, authenticated by a session cookie.
-async fn put_json(
-    app: &axum::Router,
-    uri: &str,
-    cookie: &str,
-    body: Value,
-) -> (StatusCode, Value) {
+async fn put_json(app: &axum::Router, uri: &str, cookie: &str, body: Value) -> (StatusCode, Value) {
     let resp = app
         .clone()
         .oneshot(
@@ -782,7 +941,10 @@ async fn put_json(
         .unwrap();
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// `POST uri` with `body`, authenticated by a session cookie.
@@ -807,7 +969,10 @@ async fn post_json_as(
         .unwrap();
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// A session cookie for a freshly created admin, for the mutation endpoints.
@@ -852,11 +1017,19 @@ async fn rename_keeps_the_old_name_routable() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["name"], "gpt-4o-2024");
-    assert_eq!(body["id"], id, "rename must not change the model's identity");
+    assert_eq!(
+        body["id"], id,
+        "rename must not change the model's identity"
+    );
 
     // Discovery shows only the new name...
     let (_, v) = get_json(&app, "/admin/v1/models", &cookie).await;
-    let names: Vec<&str> = v.as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
     assert_eq!(names, vec!["gpt-4o-2024"]);
 
     // ...while the old one survives as an alias, pointing at the same model.
@@ -868,12 +1041,17 @@ async fn rename_keeps_the_old_name_routable() {
     // And the router resolves both, with no restart.
     let snap_resolves = |name: &str| {
         use yb_core::Router as _;
-        let mut rq = yb_core::RouteRequest::default();
-        rq.requested_model = name.to_string();
+        let rq = yb_core::RouteRequest {
+            requested_model: name.to_string(),
+            ..Default::default()
+        };
         state.router.resolve(&rq).is_ok()
     };
     assert!(snap_resolves("gpt-4o-2024"), "the new name must route");
-    assert!(snap_resolves("gpt-4o"), "the old name must still route via the alias");
+    assert!(
+        snap_resolves("gpt-4o"),
+        "the old name must still route via the alias"
+    );
 }
 
 /// The security regression this whole normalization exists for.
@@ -906,8 +1084,12 @@ async fn a_deny_survives_a_rename() {
     // Denied before the rename.
     let (_, v) = get_as(&app, "/v1/models", &token).await;
     let listed = |v: &Value| -> Vec<String> {
-        v["data"].as_array().unwrap().iter()
-            .map(|m| m["id"].as_str().unwrap().to_string()).collect()
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect()
     };
     assert_eq!(listed(&v), vec!["claude-sonnet".to_string()]);
 
@@ -953,7 +1135,11 @@ async fn bulk_deployments_create_and_are_idempotent() {
     assert_eq!(v["skipped"], 0);
 
     // The provider was created on demand, and both models exist.
-    assert!(store.get_provider_by_name("local-vllm").await.unwrap().is_some());
+    assert!(store
+        .get_provider_by_name("local-vllm")
+        .await
+        .unwrap()
+        .is_some());
     assert!(store.get_model_by_name("fast").await.unwrap().is_some());
     let deps = store.list_deployments().await.unwrap();
     assert_eq!(deps.len(), 2);
@@ -970,8 +1156,12 @@ async fn bulk_deployments_create_and_are_idempotent() {
 
     // And the router picked them up without a restart.
     let (_, v) = get_json(&app, "/admin/v1/models", &cookie).await;
-    let names: Vec<&str> = v.as_array().unwrap().iter()
-        .map(|m| m["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
     assert_eq!(names, vec!["fast", "gpt-4o"]);
 }
 
@@ -986,22 +1176,45 @@ async fn discovery_rejects_unknown_providers_and_non_admins() {
     let cookie = admin_cookie(store.as_ref()).await;
     let app = build_router(state);
 
-    let (status, _) = post_json_as(&app, "/admin/v1/providers/nope/discover", &cookie,
-                                   json!({ "upstream_format": "openai_chat" })).await;
+    let (status, _) = post_json_as(
+        &app,
+        "/admin/v1/providers/nope/discover",
+        &cookie,
+        json!({ "upstream_format": "openai_chat" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Voyage publishes no model list; discovery must say so rather than
     // inventing a URL that 404s.
-    let (status, v) = post_json_as(&app, &format!("/admin/v1/providers/{id}/discover"), &cookie,
-                                   json!({ "upstream_format": "voyage_embed" })).await;
+    let (status, v) = post_json_as(
+        &app,
+        &format!("/admin/v1/providers/{id}/discover"),
+        &cookie,
+        json!({ "upstream_format": "voyage_embed" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(v["error"]["message"].as_str().unwrap().contains("no model-listing endpoint"));
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no model-listing endpoint"));
 
-    let member = store.list_users().await.unwrap().into_iter()
-        .find(|u| u.role == Role::Member).expect("seeded member");
+    let member = store
+        .list_users()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|u| u.role == Role::Member)
+        .expect("seeded member");
     let member_cookie = session_cookie(store.as_ref(), &member.id).await;
-    let (status, _) = post_json_as(&app, &format!("/admin/v1/providers/{id}/discover"),
-                                   &member_cookie, json!({ "upstream_format": "openai_chat" })).await;
+    let (status, _) = post_json_as(
+        &app,
+        &format!("/admin/v1/providers/{id}/discover"),
+        &member_cookie,
+        json!({ "upstream_format": "openai_chat" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
@@ -1022,7 +1235,10 @@ async fn a_provider_deny_survives_a_provider_rename() {
     let denied = provider_id(store.as_ref(), "anthropic").await;
     let token = key_with(
         store.as_ref(),
-        AccessPolicy { denied_provider_ids: vec![denied.clone()], ..Default::default() },
+        AccessPolicy {
+            denied_provider_ids: vec![denied.clone()],
+            ..Default::default()
+        },
         None,
     )
     .await;
@@ -1030,11 +1246,19 @@ async fn a_provider_deny_survives_a_provider_rename() {
     let app = build_router(state.clone());
 
     let listed = |v: &Value| -> Vec<String> {
-        v["data"].as_array().unwrap().iter()
-            .map(|m| m["id"].as_str().unwrap().to_string()).collect()
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect()
     };
     let (_, v) = get_as(&app, "/v1/models", &token).await;
-    assert_eq!(listed(&v), vec!["gpt-4o".to_string()], "denied before the rename");
+    assert_eq!(
+        listed(&v),
+        vec!["gpt-4o".to_string()],
+        "denied before the rename"
+    );
 
     let (status, _) = put_json(
         &app,
@@ -1075,7 +1299,10 @@ async fn deployments_read_their_providers_endpoint() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     // The credential is never disclosed, only whether one is set.
     assert_eq!(body["has_api_key"], true);
-    assert!(body.get("api_key").is_none(), "a key must never be read back out");
+    assert!(
+        body.get("api_key").is_none(),
+        "a key must never be read back out"
+    );
 
     let deps = store.list_deployments().await.unwrap();
     assert_eq!(deps.len(), 2);
@@ -1085,8 +1312,13 @@ async fn deployments_read_their_providers_endpoint() {
     }
 
     // A second edit that omits the key keeps it, rather than blanking it.
-    let (status, _) = put_json(&app, &format!("/admin/v1/providers/{id}"), &cookie,
-                               json!({ "name": "openai", "api_base": "https://api.example/v1" })).await;
+    let (status, _) = put_json(
+        &app,
+        &format!("/admin/v1/providers/{id}"),
+        &cookie,
+        json!({ "name": "openai", "api_base": "https://api.example/v1" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let deps = store.list_deployments().await.unwrap();
     assert_eq!(deps[0].api_key.as_deref(), Some("sk-shared"));
@@ -1103,28 +1335,57 @@ async fn rename_rejects_bad_input_and_non_admins() {
     let app = build_router(state);
 
     // A name another model already holds.
-    let (status, _) = put_json(&app, &format!("/admin/v1/models/{id}/name"), &cookie,
-                               json!({ "name": "claude-sonnet" })).await;
+    let (status, _) = put_json(
+        &app,
+        &format!("/admin/v1/models/{id}/name"),
+        &cookie,
+        json!({ "name": "claude-sonnet" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
 
     // Blank, and whitespace-only, are both rejected.
     for bad in ["", "   "] {
-        let (status, _) = put_json(&app, &format!("/admin/v1/models/{id}/name"), &cookie,
-                                   json!({ "name": bad })).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "name {bad:?} should be rejected");
+        let (status, _) = put_json(
+            &app,
+            &format!("/admin/v1/models/{id}/name"),
+            &cookie,
+            json!({ "name": bad }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "name {bad:?} should be rejected"
+        );
     }
 
     // An unknown model.
-    let (status, _) = put_json(&app, "/admin/v1/models/nope/name", &cookie,
-                               json!({ "name": "whatever" })).await;
+    let (status, _) = put_json(
+        &app,
+        "/admin/v1/models/nope/name",
+        &cookie,
+        json!({ "name": "whatever" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // A plain member may read the catalog but not rename.
-    let member = store.list_users().await.unwrap().into_iter()
-        .find(|u| u.role == Role::Member).expect("seeded member");
+    let member = store
+        .list_users()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|u| u.role == Role::Member)
+        .expect("seeded member");
     let member_cookie = session_cookie(store.as_ref(), &member.id).await;
-    let (status, _) = put_json(&app, &format!("/admin/v1/models/{id}/name"), &member_cookie,
-                               json!({ "name": "member-rename" })).await;
+    let (status, _) = put_json(
+        &app,
+        &format!("/admin/v1/models/{id}/name"),
+        &member_cookie,
+        json!({ "name": "member-rename" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // Nothing above changed the name.
@@ -1146,7 +1407,10 @@ async fn get_as(app: &axum::Router, uri: &str, token: &str) -> (StatusCode, Valu
         .unwrap();
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// The `id`s in an OpenAI-shaped model list.
@@ -1257,7 +1521,12 @@ async fn discovery_applies_the_team_policy_too() {
         created_by: None,
     };
     store.create_team(&team).await.unwrap();
-    let token = key_with(store.as_ref(), AccessPolicy::default(), Some(team.id.clone())).await;
+    let token = key_with(
+        store.as_ref(),
+        AccessPolicy::default(),
+        Some(team.id.clone()),
+    )
+    .await;
     let app = build_router(state);
 
     let (_, v) = get_as(&app, "/v1/models", &token).await;

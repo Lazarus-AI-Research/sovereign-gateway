@@ -30,7 +30,10 @@ pub fn parse_request(body: &[u8]) -> Result<EmbedRequest> {
         Some("base64") => Some(EncodingFormat::Base64),
         Some("float") => Some(EncodingFormat::Float),
         Some(other) => {
-            return Err(WireError::invalid("encoding_format", format!("unknown {other}")))
+            return Err(WireError::invalid(
+                "encoding_format",
+                format!("unknown {other}"),
+            ))
         }
         None => None,
     };
@@ -68,7 +71,9 @@ fn parse_input(v: Option<&Value>) -> Result<Vec<EmbedInput>> {
                         if let Some(Value::String(text)) = o.get("text") {
                             out.push(EmbedInput::text(text.clone()));
                         } else if let Some(Value::String(image)) = o.get("image") {
-                            out.push(EmbedInput { parts: vec![parse_image_value(image)] });
+                            out.push(EmbedInput {
+                                parts: vec![parse_image_value(image)],
+                            });
                         } else {
                             return Err(WireError::invalid(
                                 "input[]",
@@ -89,11 +94,23 @@ fn parse_input(v: Option<&Value>) -> Result<Vec<EmbedInput>> {
 /// A Jina-style image value: http(s) URL, `data:` URI, or raw base64.
 fn parse_image_value(s: &str) -> EmbedPart {
     if s.starts_with("http://") || s.starts_with("https://") {
-        EmbedPart::Image { media_type: None, data: None, url: Some(s.to_string()) }
+        EmbedPart::Image {
+            media_type: None,
+            data: None,
+            url: Some(s.to_string()),
+        }
     } else if let Some((media_type, data)) = parse_data_url(s) {
-        EmbedPart::Image { media_type: Some(media_type), data: Some(data), url: None }
+        EmbedPart::Image {
+            media_type: Some(media_type),
+            data: Some(data),
+            url: None,
+        }
     } else {
-        EmbedPart::Image { media_type: None, data: Some(s.to_string()), url: None }
+        EmbedPart::Image {
+            media_type: None,
+            data: Some(s.to_string()),
+            url: None,
+        }
     }
 }
 
@@ -110,7 +127,10 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
     let all_text = req.inputs.iter().all(|i| i.as_single_text().is_some());
     let input: Value = if all_text {
         Value::Array(
-            req.inputs.iter().map(|i| json!(i.as_single_text().unwrap())).collect(),
+            req.inputs
+                .iter()
+                .map(|i| json!(i.as_single_text().unwrap()))
+                .collect(),
         )
     } else {
         // Jina-style objects; each input must be a single part (this dialect
@@ -119,13 +139,19 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
         for i in &req.inputs {
             match i.parts.as_slice() {
                 [EmbedPart::Text { text }] => items.push(json!({"text": text})),
-                [EmbedPart::Image { media_type, data, url }] => {
+                [EmbedPart::Image {
+                    media_type,
+                    data,
+                    url,
+                }] => {
                     let image = match (url, data) {
                         (Some(u), _) => u.clone(),
                         (None, Some(_)) => {
                             image_to_data_uri(media_type.as_deref(), data.as_deref())?
                         }
-                        _ => return Err(WireError::invalid("input[]", "image without data or url")),
+                        _ => {
+                            return Err(WireError::invalid("input[]", "image without data or url"))
+                        }
                     };
                     items.push(json!({"image": image}));
                 }
@@ -251,10 +277,16 @@ mod tests {
         let resp = EmbedResponse {
             model: "m".into(),
             embeddings: vec![vec![1.0, 2.0]],
-            usage: EmbedUsage { input_tokens: 3, image_units: 0 },
+            usage: EmbedUsage {
+                input_tokens: 3,
+                image_units: 0,
+            },
         };
         let out: Value = serde_json::from_slice(&emit_response(&resp, &req).unwrap()).unwrap();
-        assert_eq!(out["data"][0]["embedding"], json!(f32s_to_base64(&[1.0, 2.0])));
+        assert_eq!(
+            out["data"][0]["embedding"],
+            json!(f32s_to_base64(&[1.0, 2.0]))
+        );
     }
 
     #[test]
@@ -290,7 +322,11 @@ mod tests {
             inputs: vec![EmbedInput {
                 parts: vec![
                     EmbedPart::Text { text: "t".into() },
-                    EmbedPart::Image { media_type: None, data: Some("QUJD".into()), url: None },
+                    EmbedPart::Image {
+                        media_type: None,
+                        data: Some("QUJD".into()),
+                        url: None,
+                    },
                 ],
             }],
             input_type: None,

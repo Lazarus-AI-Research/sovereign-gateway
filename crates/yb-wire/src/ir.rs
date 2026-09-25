@@ -369,8 +369,16 @@ mod usage_tests {
         assert!(u.is_empty());
 
         // Anthropic's rhythm: input once, output growing.
-        u.merge(&Usage { input_tokens: 41, output_tokens: 0, ..Default::default() });
-        u.merge(&Usage { input_tokens: 41, output_tokens: 30, ..Default::default() });
+        u.merge(&Usage {
+            input_tokens: 41,
+            output_tokens: 0,
+            ..Default::default()
+        });
+        u.merge(&Usage {
+            input_tokens: 41,
+            output_tokens: 30,
+            ..Default::default()
+        });
         assert_eq!((u.input_tokens, u.output_tokens), (41, 30));
         assert!(!u.is_empty());
 
@@ -380,8 +388,15 @@ mod usage_tests {
         assert_eq!((u.input_tokens, u.output_tokens), (41, 30));
 
         // Cache fields fold the same way.
-        u.merge(&Usage { cache_read_tokens: 7, ..Default::default() });
-        u.merge(&Usage { cache_read_tokens: 0, cache_write_tokens: 3, ..Default::default() });
+        u.merge(&Usage {
+            cache_read_tokens: 7,
+            ..Default::default()
+        });
+        u.merge(&Usage {
+            cache_read_tokens: 0,
+            cache_write_tokens: 3,
+            ..Default::default()
+        });
         assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (7, 3));
     }
 }
@@ -411,15 +426,17 @@ impl ChatRequest {
     }
 }
 
-
 #[cfg(test)]
 mod passthrough_tests {
     use crate::{anthropic, openai_chat, openai_responses, EmitOptions};
     use serde_json::{json, Value};
 
+    type Emit =
+        fn(&crate::ChatRequest, &EmitOptions) -> crate::Result<(Vec<u8>, Vec<(String, String)>)>;
+
     fn relay(
         parse: fn(&[u8]) -> crate::Result<crate::ChatRequest>,
-        emit: fn(&crate::ChatRequest, &EmitOptions) -> crate::Result<(Vec<u8>, Vec<(String, String)>)>,
+        emit: Emit,
         body: Value,
     ) -> String {
         let req = parse(&serde_json::to_vec(&body).unwrap()).expect("parses");
@@ -436,14 +453,21 @@ mod passthrough_tests {
     /// the whole request with it.
     #[test]
     fn anthropic_to_anthropic_preserves_thinking() {
-        let s = relay(anthropic::parse_request, anthropic::emit_request, json!({
+        let s = relay(
+            anthropic::parse_request,
+            anthropic::emit_request,
+            json!({
             "model":"m","max_tokens":16,"messages":[
               {"role":"assistant","content":[
                  {"type":"thinking","thinking":"deep","signature":"SIG-BLOB"},
                  {"type":"redacted_thinking","data":"REDACTED-BLOB"}]},
-              {"role":"user","content":"hi"}]}));
+              {"role":"user","content":"hi"}]}),
+        );
         assert!(s.contains("SIG-BLOB"), "thinking signature dropped: {s}");
-        assert!(s.contains("REDACTED-BLOB"), "redacted_thinking dropped: {s}");
+        assert!(
+            s.contains("REDACTED-BLOB"),
+            "redacted_thinking dropped: {s}"
+        );
     }
 
     /// An unmodeled Anthropic block must parse, not 400.
@@ -452,17 +476,24 @@ mod passthrough_tests {
         let body = json!({"model":"m","max_tokens":16,"messages":[
             {"role":"user","content":[{"type":"some_future_block","payload":"X"}]}]});
         let req = anthropic::parse_request(&serde_json::to_vec(&body).unwrap());
-        assert!(req.is_ok(), "an unknown block must not fail the turn: {req:?}");
+        assert!(
+            req.is_ok(),
+            "an unknown block must not fail the turn: {req:?}"
+        );
     }
 
     /// Assistant reasoning must round-trip a chat history, as it already does
     /// on the stream.
     #[test]
     fn chat_to_chat_preserves_reasoning() {
-        let s = relay(openai_chat::parse_request, openai_chat::emit_request, json!({
+        let s = relay(
+            openai_chat::parse_request,
+            openai_chat::emit_request,
+            json!({
             "model":"m","messages":[
               {"role":"assistant","content":"hi","reasoning_content":"REASON-BLOB"},
-              {"role":"user","content":"yo"}]}));
+              {"role":"user","content":"yo"}]}),
+        );
         assert!(s.contains("REASON-BLOB"), "reasoning_content dropped: {s}");
     }
 
@@ -475,12 +506,24 @@ mod passthrough_tests {
                {"type":"redacted_thinking","data":"REDACTED-BLOB"}]}]});
         let req = anthropic::parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
         for (name, bytes) in [
-            ("openai_chat", openai_chat::emit_request(&req, &EmitOptions::new("t")).unwrap().0),
-            ("openai_responses",
-             openai_responses::emit_request(&req, &EmitOptions::new("t")).unwrap().0),
+            (
+                "openai_chat",
+                openai_chat::emit_request(&req, &EmitOptions::new("t"))
+                    .unwrap()
+                    .0,
+            ),
+            (
+                "openai_responses",
+                openai_responses::emit_request(&req, &EmitOptions::new("t"))
+                    .unwrap()
+                    .0,
+            ),
         ] {
             let s = String::from_utf8(bytes).unwrap();
-            assert!(!s.contains("REDACTED-BLOB"), "{name} received an Anthropic-only block");
+            assert!(
+                !s.contains("REDACTED-BLOB"),
+                "{name} received an Anthropic-only block"
+            );
         }
     }
 }

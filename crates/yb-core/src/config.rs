@@ -489,7 +489,10 @@ extra = { cloudflare_access = true, headers = { "X-Tenant" = "acme" } }
         )
         .unwrap();
         assert!(dc.extra.cloudflare_access);
-        assert_eq!(dc.extra.headers.get("X-Tenant").map(String::as_str), Some("acme"));
+        assert_eq!(
+            dc.extra.headers.get("X-Tenant").map(String::as_str),
+            Some("acme")
+        );
         assert!(!dc.extra.is_empty());
 
         // An unrecognized key is kept rather than rejected, so a value written by
@@ -504,7 +507,10 @@ extra = { future_knob = 7 }
         )
         .unwrap();
         assert!(!dc.extra.is_empty());
-        assert_eq!(dc.extra.rest.get("future_knob").and_then(|v| v.as_i64()), Some(7));
+        assert_eq!(
+            dc.extra.rest.get("future_knob").and_then(|v| v.as_i64()),
+            Some(7)
+        );
     }
 
     #[test]

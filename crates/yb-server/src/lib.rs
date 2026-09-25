@@ -33,7 +33,7 @@ use yb_core::config::DeploymentMode;
 use yb_core::principal::KeyAuth;
 use yb_core::ratelimit::Limits;
 use yb_core::spend::{BudgetAction, SubjectType};
-use yb_core::{AccessPolicy, EmbedFormat, UpstreamFormat, new_id, now, Error, WireFormat};
+use yb_core::{new_id, now, AccessPolicy, EmbedFormat, Error, UpstreamFormat, WireFormat};
 use yb_gateway::{GatewayResponse, RequestCtx};
 
 pub use state::AppState;
@@ -336,11 +336,7 @@ async fn openai_embeddings(
 }
 
 /// `POST /v2/embed` — Cohere-dialect embeddings.
-async fn cohere_embed(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn cohere_embed(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     run_inference(state, EmbedFormat::CohereEmbed.into(), headers, body).await
 }
 
@@ -387,7 +383,10 @@ async fn gemini(
             EmbedFormat::GeminiEmbed.into()
         }
         _ => {
-            obj.insert("stream".to_string(), json!(action == "streamGenerateContent"));
+            obj.insert(
+                "stream".to_string(),
+                json!(action == "streamGenerateContent"),
+            );
             WireFormat::Gemini.into()
         }
     };
@@ -472,8 +471,8 @@ async fn run_inference(
 
     // 4. Build the request context and orchestrate.
     let request_id = header_str(&headers, "x-request-id").unwrap_or_else(new_id);
-    let trace_id = header_str(&headers, "x-trace-id")
-        .or_else(|| header_str(&headers, "traceparent"));
+    let trace_id =
+        header_str(&headers, "x-trace-id").or_else(|| header_str(&headers, "traceparent"));
 
     let access = effective_access(&state, &keyauth).await;
 
@@ -601,7 +600,6 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
     }
     s
 }
-
 
 // ---- response mapping ----------------------------------------------------
 

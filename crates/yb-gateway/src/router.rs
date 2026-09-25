@@ -52,11 +52,13 @@ impl Snapshot {
     ) -> Self {
         let mut models: HashMap<String, ModelEntry> = HashMap::new();
         for d in deployments {
-            let entry = models.entry(d.model_name.clone()).or_insert_with(|| ModelEntry {
-                deployments: Vec::new(),
-                rr: AtomicUsize::new(0),
-                load: Vec::new(),
-            });
+            let entry = models
+                .entry(d.model_name.clone())
+                .or_insert_with(|| ModelEntry {
+                    deployments: Vec::new(),
+                    rr: AtomicUsize::new(0),
+                    load: Vec::new(),
+                });
             entry.deployments.push(d);
             entry.load.push(AtomicUsize::new(0));
         }
@@ -195,7 +197,12 @@ impl DeploymentRouter {
     }
 
     /// Order the surviving deployment indices of `entry` per `strategy`.
-    fn order(&self, strategy: Strategy, entry: &ModelEntry, survivors: Vec<usize>) -> Vec<Deployment> {
+    fn order(
+        &self,
+        strategy: Strategy,
+        entry: &ModelEntry,
+        survivors: Vec<usize>,
+    ) -> Vec<Deployment> {
         match strategy {
             Strategy::Simple => {
                 // Weighted shuffle (Efraimidis–Spirakis): key = u^(1/weight),
@@ -268,7 +275,11 @@ impl DeploymentRouter {
         }
 
         for d in self.order(snap.strategy, entry, survivors) {
-            let key = (d.provider_id.clone(), d.upstream_model.clone(), d.model_id.clone());
+            let key = (
+                d.provider_id.clone(),
+                d.upstream_model.clone(),
+                d.model_id.clone(),
+            );
             if seen.insert(key) {
                 out.push(d);
             }
@@ -375,7 +386,10 @@ mod tests {
     fn upstream_format_passes_through() {
         let r = mk_router(Strategy::Simple);
         let d = r.resolve(&req("cheap")).unwrap();
-        assert_eq!(d.candidates[0].upstream_format, WireFormat::OpenaiChat.into());
+        assert_eq!(
+            d.candidates[0].upstream_format,
+            WireFormat::OpenaiChat.into()
+        );
     }
 
     #[test]
@@ -405,7 +419,8 @@ mod tests {
     fn denied_provider_filtered() {
         let r = mk_router(Strategy::Simple);
         let mut rq = req("smart");
-        rq.denied_provider_ids = BTreeSet::from([cfg_provider_id("openai"), cfg_provider_id("openrouter")]);
+        rq.denied_provider_ids =
+            BTreeSet::from([cfg_provider_id("openai"), cfg_provider_id("openrouter")]);
         let d = r.resolve(&rq).unwrap();
         assert_eq!(d.candidates.len(), 1);
         assert_eq!(d.candidates[0].provider, "anthropic");

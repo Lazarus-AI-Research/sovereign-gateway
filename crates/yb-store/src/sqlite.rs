@@ -18,7 +18,9 @@ use yb_core::model::{
     TelemetryRecord, User,
 };
 use yb_core::principal::KeyAuth;
-use yb_core::routing::{DeploymentRecord, HealthRecord, ModelRecord, NewDeployment, ProviderRecord};
+use yb_core::routing::{
+    DeploymentRecord, HealthRecord, ModelRecord, NewDeployment, ProviderRecord,
+};
 use yb_core::spend::{Budget, BudgetAction, Period, RollupDelta, SpendRow, SubjectType};
 use yb_core::{new_id, now, Error, LimitColumns, Micros, Result, Store, Timestamp};
 
@@ -90,7 +92,8 @@ fn dec_extra(raw: Option<String>) -> yb_core::Extra {
 
 /// Encode optional pricing as JSON text (`None` → SQL NULL).
 fn enc_pricing(p: &Option<yb_core::catalog::ModelPrice>) -> Option<String> {
-    p.as_ref().map(|p| serde_json::to_string(p).unwrap_or_default())
+    p.as_ref()
+        .map(|p| serde_json::to_string(p).unwrap_or_default())
 }
 
 /// Map a `providers` row to a [`ProviderRecord`].
@@ -264,7 +267,8 @@ fn map_budget(r: &SqliteRow) -> Result<Budget> {
     Ok(Budget {
         id: r.try_get("id").map_err(storage_err)?,
         subject_type: SubjectType::parse(
-            &r.try_get::<String, _>("subject_type").map_err(storage_err)?,
+            &r.try_get::<String, _>("subject_type")
+                .map_err(storage_err)?,
         )?,
         subject_id: r.try_get("subject_id").map_err(storage_err)?,
         period: Period::parse(&r.try_get::<String, _>("period").map_err(storage_err)?)?,
@@ -283,7 +287,10 @@ fn map_spend_row(r: &SqliteRow) -> Result<SpendRow> {
         subject_type: r.try_get("subject_type").map_err(storage_err)?,
         subject_id: r.try_get("subject_id").map_err(storage_err)?,
         period: r.try_get("period").map_err(storage_err)?,
-        period_start: parse_ts(&r.try_get::<String, _>("period_start").map_err(storage_err)?)?,
+        period_start: parse_ts(
+            &r.try_get::<String, _>("period_start")
+                .map_err(storage_err)?,
+        )?,
         spend_micros: r.try_get("spend_micros").map_err(storage_err)?,
         request_count: r.try_get("request_count").map_err(storage_err)?,
         input_tokens: r.try_get("input_tokens").map_err(storage_err)?,
@@ -428,12 +435,10 @@ impl Store for SqliteStore {
     }
 
     async fn count_admins(&self) -> Result<i64> {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(storage_err)
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage_err)
     }
 
     // ---- web sessions (cookie token → user) ---------------------------
@@ -1029,7 +1034,9 @@ impl Store for SqliteStore {
             .await
             .map_err(storage_err)?;
         if taken.is_some() {
-            return Err(Error::Conflict(format!("model \"{new_name}\" already exists")));
+            return Err(Error::Conflict(format!(
+                "model \"{new_name}\" already exists"
+            )));
         }
 
         // ...nor to another model's alias. An alias of *this* model is consumed
@@ -1085,28 +1092,34 @@ impl Store for SqliteStore {
 
     // ---- providers (an endpoint, its credentials, its deployments) -----
     async fn list_providers(&self) -> Result<Vec<ProviderRecord>> {
-        let rows = sqlx::query(&format!("SELECT {PROVIDER_COLS} FROM providers ORDER BY name"))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage_err)?;
+        let rows = sqlx::query(&format!(
+            "SELECT {PROVIDER_COLS} FROM providers ORDER BY name"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_err)?;
         rows.iter().map(map_provider).collect()
     }
 
     async fn get_provider(&self, id: &str) -> Result<Option<ProviderRecord>> {
-        let row = sqlx::query(&format!("SELECT {PROVIDER_COLS} FROM providers WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(storage_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {PROVIDER_COLS} FROM providers WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_err)?;
         row.as_ref().map(map_provider).transpose()
     }
 
     async fn get_provider_by_name(&self, name: &str) -> Result<Option<ProviderRecord>> {
-        let row = sqlx::query(&format!("SELECT {PROVIDER_COLS} FROM providers WHERE name = ?"))
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(storage_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {PROVIDER_COLS} FROM providers WHERE name = ?"
+        ))
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_err)?;
         row.as_ref().map(map_provider).transpose()
     }
 
@@ -1142,7 +1155,9 @@ impl Store for SqliteStore {
             .await
             .map_err(storage_err)?;
         if taken.is_some() {
-            return Err(Error::Conflict(format!("provider \"{name}\" already exists")));
+            return Err(Error::Conflict(format!(
+                "provider \"{name}\" already exists"
+            )));
         }
         // `api_key = NULL` means "leave it alone": the admin API never reads a
         // key back out, so an edit round-trip must not blank one by omission.
@@ -1165,13 +1180,12 @@ impl Store for SqliteStore {
     }
 
     async fn delete_provider(&self, id: &str) -> Result<()> {
-        let in_use = sqlx::query(
-            "SELECT 1 FROM deployments WHERE provider_id = ? AND deleted_at IS NULL",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage_err)?;
+        let in_use =
+            sqlx::query("SELECT 1 FROM deployments WHERE provider_id = ? AND deleted_at IS NULL")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(storage_err)?;
         if in_use.is_some() {
             return Err(Error::Conflict(
                 "provider still has deployments; delete them first".into(),

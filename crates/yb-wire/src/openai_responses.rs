@@ -41,8 +41,10 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
     }
     match v.get("input") {
         Some(Value::String(s)) => {
-            req.messages
-                .push(Message::new(Role::User, vec![ContentBlock::text(s.clone())]));
+            req.messages.push(Message::new(
+                Role::User,
+                vec![ContentBlock::text(s.clone())],
+            ));
         }
         Some(Value::Array(items)) => {
             for item in items {
@@ -187,7 +189,11 @@ fn tool_call_message(item: &Value) -> Message {
     };
     Message::new(
         Role::Assistant,
-        vec![ContentBlock::ToolUse { id: call_id_of(item), name, input }],
+        vec![ContentBlock::ToolUse {
+            id: call_id_of(item),
+            name,
+            input,
+        }],
     )
 }
 
@@ -352,14 +358,22 @@ fn emit_input_items(m: &Message, out: &mut Vec<Value>) -> Result<()> {
             let mut parts: Vec<Value> = Vec::new();
             for b in &m.content {
                 match b {
-                    ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
                         out.push(json!({"type": "function_call_output",
                             "call_id": tool_use_id, "output": join_text(content)}));
                     }
                     ContentBlock::Text { text } => {
                         parts.push(json!({"type": "input_text", "text": text}));
                     }
-                    ContentBlock::Image { media_type, data, url } => {
+                    ContentBlock::Image {
+                        media_type,
+                        data,
+                        url,
+                    } => {
                         let u = match (url, data) {
                             (Some(url), _) => url.clone(),
                             (None, Some(d)) => build_data_url(media_type.as_deref(), d),
@@ -376,7 +390,12 @@ fn emit_input_items(m: &Message, out: &mut Vec<Value>) -> Result<()> {
         }
         Role::Tool => {
             for b in &m.content {
-                if let ContentBlock::ToolResult { tool_use_id, content, .. } = b {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = b
+                {
                     out.push(json!({"type": "function_call_output",
                         "call_id": tool_use_id, "output": join_text(content)}));
                 }
@@ -448,7 +467,10 @@ pub fn parse_response(bytes: &[u8]) -> Result<ChatResponse> {
                         })
                         .unwrap_or_default();
                     if !text.is_empty() {
-                        content.push(ContentBlock::Thinking { text, signature: None });
+                        content.push(ContentBlock::Thinking {
+                            text,
+                            signature: None,
+                        });
                     }
                 }
                 _ => {}
@@ -583,12 +605,18 @@ fn parse_tool_choice(v: &Value) -> Result<ToolChoice> {
             "auto" => Ok(ToolChoice::Auto),
             "none" => Ok(ToolChoice::None),
             "required" => Ok(ToolChoice::Required),
-            other => Err(WireError::invalid("tool_choice", format!("unknown {other}"))),
+            other => Err(WireError::invalid(
+                "tool_choice",
+                format!("unknown {other}"),
+            )),
         },
         Value::Object(_) => Ok(ToolChoice::Tool(
             opt_str(v, "name").unwrap_or_default().to_string(),
         )),
-        _ => Err(WireError::invalid("tool_choice", "expected string or object")),
+        _ => Err(WireError::invalid(
+            "tool_choice",
+            "expected string or object",
+        )),
     }
 }
 
@@ -625,7 +653,9 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
                 .get("response")
                 .and_then(|r| opt_str(r, "model"))
                 .unwrap_or_default();
-            vec![StreamEvent::MessageStart { model: model.to_string() }]
+            vec![StreamEvent::MessageStart {
+                model: model.to_string(),
+            }]
         }
         // `response.in_progress` repeats the created envelope — already handled.
         Some("response.in_progress") => vec![],
@@ -662,7 +692,9 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
                 .and_then(|r| r.get("usage"))
                 .filter(|u| !u.is_null())
             {
-                out.push(StreamEvent::UsageDelta { usage: parse_usage(Some(u)) });
+                out.push(StreamEvent::UsageDelta {
+                    usage: parse_usage(Some(u)),
+                });
             }
             out.push(StreamEvent::Done {
                 stop_reason: state.stop_reason.take().unwrap_or(StopReason::EndTurn),
@@ -711,9 +743,23 @@ impl EmitState {
 
 #[derive(Debug, Clone)]
 enum OpenItem {
-    Message { id: String, index: u64, text: String },
-    Reasoning { id: String, index: u64, text: String },
-    Tool { id: String, index: u64, call_id: String, name: String, args: String },
+    Message {
+        id: String,
+        index: u64,
+        text: String,
+    },
+    Reasoning {
+        id: String,
+        index: u64,
+        text: String,
+    },
+    Tool {
+        id: String,
+        index: u64,
+        call_id: String,
+        name: String,
+        args: String,
+    },
 }
 
 /// Encode IR events into OpenAI Responses client SSE bytes, emitting the full
@@ -729,57 +775,100 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
                     state.resp_id = "resp_stream".to_string();
                 }
                 let resp = state.response_obj("in_progress", json!([]));
-                write_event(&mut out, state, "response.created",
-                    json!({"type": "response.created", "response": resp.clone()}));
-                write_event(&mut out, state, "response.in_progress",
-                    json!({"type": "response.in_progress", "response": resp}));
+                write_event(
+                    &mut out,
+                    state,
+                    "response.created",
+                    json!({"type": "response.created", "response": resp.clone()}),
+                );
+                write_event(
+                    &mut out,
+                    state,
+                    "response.in_progress",
+                    json!({"type": "response.in_progress", "response": resp}),
+                );
             }
             StreamEvent::TextDelta { text } => {
                 ensure_message(&mut out, state);
                 let (id, index) = match state.open.as_mut() {
-                    Some(OpenItem::Message { id, index, text: acc }) => {
+                    Some(OpenItem::Message {
+                        id,
+                        index,
+                        text: acc,
+                    }) => {
                         acc.push_str(text);
                         (id.clone(), *index)
                     }
                     _ => continue,
                 };
-                write_event(&mut out, state, "response.output_text.delta", json!({
+                write_event(
+                    &mut out,
+                    state,
+                    "response.output_text.delta",
+                    json!({
                     "type": "response.output_text.delta", "item_id": id,
-                    "output_index": index, "content_index": 0, "delta": text, "logprobs": []}));
+                    "output_index": index, "content_index": 0, "delta": text, "logprobs": []}),
+                );
             }
             StreamEvent::ThinkingDelta { text } => {
                 ensure_reasoning(&mut out, state);
                 let (id, index) = match state.open.as_mut() {
-                    Some(OpenItem::Reasoning { id, index, text: acc }) => {
+                    Some(OpenItem::Reasoning {
+                        id,
+                        index,
+                        text: acc,
+                    }) => {
                         acc.push_str(text);
                         (id.clone(), *index)
                     }
                     _ => continue,
                 };
-                write_event(&mut out, state, "response.reasoning_text.delta", json!({
+                write_event(
+                    &mut out,
+                    state,
+                    "response.reasoning_text.delta",
+                    json!({
                     "type": "response.reasoning_text.delta", "item_id": id,
-                    "output_index": index, "content_index": 0, "delta": text}));
+                    "output_index": index, "content_index": 0, "delta": text}),
+                );
             }
             StreamEvent::ToolUseStart { id, name } => {
                 close_open(&mut out, state);
                 let index = state.next_index;
                 state.next_index += 1;
                 let item_id = format!("fc_{index}");
-                write_event(&mut out, state, "response.output_item.added", json!({
+                write_event(
+                    &mut out,
+                    state,
+                    "response.output_item.added",
+                    json!({
                     "type": "response.output_item.added", "output_index": index,
                     "item": {"id": item_id, "type": "function_call", "call_id": id,
-                             "name": name, "arguments": "", "status": "in_progress"}}));
+                             "name": name, "arguments": "", "status": "in_progress"}}),
+                );
                 state.open = Some(OpenItem::Tool {
-                    id: item_id, index, call_id: id.clone(), name: name.clone(), args: String::new(),
+                    id: item_id,
+                    index,
+                    call_id: id.clone(),
+                    name: name.clone(),
+                    args: String::new(),
                 });
             }
             StreamEvent::ToolUseDelta { partial_json } => {
-                if let Some(OpenItem::Tool { id, index, args, .. }) = state.open.as_mut() {
+                if let Some(OpenItem::Tool {
+                    id, index, args, ..
+                }) = state.open.as_mut()
+                {
                     args.push_str(partial_json);
                     let (id, index) = (id.clone(), *index);
-                    write_event(&mut out, state, "response.function_call_arguments.delta", json!({
+                    write_event(
+                        &mut out,
+                        state,
+                        "response.function_call_arguments.delta",
+                        json!({
                         "type": "response.function_call_arguments.delta",
-                        "item_id": id, "output_index": index, "delta": partial_json}));
+                        "item_id": id, "output_index": index, "delta": partial_json}),
+                    );
                 }
             }
             StreamEvent::UsageDelta { usage } => {
@@ -807,8 +896,12 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
 /// Write the terminal `response.completed` event.
 fn write_completed(out: &mut String, state: &mut EmitState) {
     let resp = state.response_obj("completed", json!(state.done_items.clone()));
-    write_event(out, state, "response.completed",
-        json!({"type": "response.completed", "response": resp}));
+    write_event(
+        out,
+        state,
+        "response.completed",
+        json!({"type": "response.completed", "response": resp}),
+    );
 }
 
 impl EmitState {
@@ -828,9 +921,14 @@ impl EmitState {
     }
 
     fn response_obj(&self, status: &str, output: Value) -> Value {
-        let usage = self.usage.map(|u| json!({
+        let usage = self
+            .usage
+            .map(|u| {
+                json!({
             "input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
-            "total_tokens": u.input_tokens + u.output_tokens})).unwrap_or(Value::Null);
+            "total_tokens": u.input_tokens + u.output_tokens})
+            })
+            .unwrap_or(Value::Null);
         let mut resp = json!({"id": self.resp_id, "object": "response", "status": status,
                "model": self.model, "output": output, "usage": usage});
         if let (Some(obj), Some(key)) = (resp.as_object_mut(), &self.prompt_cache_key) {
@@ -851,13 +949,27 @@ fn ensure_message(out: &mut String, state: &mut EmitState) {
     let index = state.next_index;
     state.next_index += 1;
     let id = format!("msg_{index}");
-    write_event(out, state, "response.output_item.added", json!({
+    write_event(
+        out,
+        state,
+        "response.output_item.added",
+        json!({
         "type": "response.output_item.added", "output_index": index,
-        "item": {"id": id, "type": "message", "role": "assistant", "content": [], "status": "in_progress"}}));
-    write_event(out, state, "response.content_part.added", json!({
+        "item": {"id": id, "type": "message", "role": "assistant", "content": [], "status": "in_progress"}}),
+    );
+    write_event(
+        out,
+        state,
+        "response.content_part.added",
+        json!({
         "type": "response.content_part.added", "item_id": id, "output_index": index,
-        "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": [], "logprobs": []}}));
-    state.open = Some(OpenItem::Message { id, index, text: String::new() });
+        "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": [], "logprobs": []}}),
+    );
+    state.open = Some(OpenItem::Message {
+        id,
+        index,
+        text: String::new(),
+    });
 }
 
 /// Open a reasoning item (with its text part) if one isn't already open.
@@ -869,54 +981,113 @@ fn ensure_reasoning(out: &mut String, state: &mut EmitState) {
     let index = state.next_index;
     state.next_index += 1;
     let id = format!("rs_{index}");
-    write_event(out, state, "response.output_item.added", json!({
+    write_event(
+        out,
+        state,
+        "response.output_item.added",
+        json!({
         "type": "response.output_item.added", "output_index": index,
-        "item": {"id": id, "type": "reasoning", "summary": [], "content": null, "status": "in_progress"}}));
-    write_event(out, state, "response.reasoning_part.added", json!({
+        "item": {"id": id, "type": "reasoning", "summary": [], "content": null, "status": "in_progress"}}),
+    );
+    write_event(
+        out,
+        state,
+        "response.reasoning_part.added",
+        json!({
         "type": "response.reasoning_part.added", "item_id": id, "output_index": index,
-        "content_index": 0, "part": {"type": "reasoning_text", "text": ""}}));
-    state.open = Some(OpenItem::Reasoning { id, index, text: String::new() });
+        "content_index": 0, "part": {"type": "reasoning_text", "text": ""}}),
+    );
+    state.open = Some(OpenItem::Reasoning {
+        id,
+        index,
+        text: String::new(),
+    });
 }
 
 /// Close the currently-open item, emitting its `*.done` events and recording the
 /// finished item for `response.completed`.
 fn close_open(out: &mut String, state: &mut EmitState) {
-    let Some(item) = state.open.take() else { return };
+    let Some(item) = state.open.take() else {
+        return;
+    };
     match item {
         OpenItem::Message { id, index, text } => {
-            write_event(out, state, "response.output_text.done", json!({
+            write_event(
+                out,
+                state,
+                "response.output_text.done",
+                json!({
                 "type": "response.output_text.done", "item_id": id, "output_index": index,
-                "content_index": 0, "text": text, "logprobs": []}));
-            write_event(out, state, "response.content_part.done", json!({
+                "content_index": 0, "text": text, "logprobs": []}),
+            );
+            write_event(
+                out,
+                state,
+                "response.content_part.done",
+                json!({
                 "type": "response.content_part.done", "item_id": id, "output_index": index,
-                "content_index": 0, "part": {"type": "output_text", "text": text, "annotations": []}}));
+                "content_index": 0, "part": {"type": "output_text", "text": text, "annotations": []}}),
+            );
             let item = json!({"id": id, "type": "message", "role": "assistant", "status": "completed",
                 "content": [{"type": "output_text", "text": text, "annotations": []}]});
-            write_event(out, state, "response.output_item.done",
-                json!({"type": "response.output_item.done", "output_index": index, "item": item.clone()}));
+            write_event(
+                out,
+                state,
+                "response.output_item.done",
+                json!({"type": "response.output_item.done", "output_index": index, "item": item.clone()}),
+            );
             state.done_items.push(item);
         }
         OpenItem::Reasoning { id, index, text } => {
-            write_event(out, state, "response.reasoning_text.done", json!({
+            write_event(
+                out,
+                state,
+                "response.reasoning_text.done",
+                json!({
                 "type": "response.reasoning_text.done", "item_id": id, "output_index": index,
-                "content_index": 0, "text": text}));
-            write_event(out, state, "response.reasoning_part.done", json!({
+                "content_index": 0, "text": text}),
+            );
+            write_event(
+                out,
+                state,
+                "response.reasoning_part.done",
+                json!({
                 "type": "response.reasoning_part.done", "item_id": id, "output_index": index,
-                "content_index": 0, "part": {"type": "reasoning_text", "text": text}}));
+                "content_index": 0, "part": {"type": "reasoning_text", "text": text}}),
+            );
             let item = json!({"id": id, "type": "reasoning", "summary": [], "status": "completed",
                 "content": [{"type": "reasoning_text", "text": text}]});
-            write_event(out, state, "response.output_item.done",
-                json!({"type": "response.output_item.done", "output_index": index, "item": item.clone()}));
+            write_event(
+                out,
+                state,
+                "response.output_item.done",
+                json!({"type": "response.output_item.done", "output_index": index, "item": item.clone()}),
+            );
             state.done_items.push(item);
         }
-        OpenItem::Tool { id, index, call_id, name, args } => {
-            write_event(out, state, "response.function_call_arguments.done", json!({
+        OpenItem::Tool {
+            id,
+            index,
+            call_id,
+            name,
+            args,
+        } => {
+            write_event(
+                out,
+                state,
+                "response.function_call_arguments.done",
+                json!({
                 "type": "response.function_call_arguments.done", "item_id": id,
-                "output_index": index, "arguments": args}));
+                "output_index": index, "arguments": args}),
+            );
             let item = json!({"id": id, "type": "function_call", "call_id": call_id,
                 "name": name, "arguments": args, "status": "completed"});
-            write_event(out, state, "response.output_item.done",
-                json!({"type": "response.output_item.done", "output_index": index, "item": item.clone()}));
+            write_event(
+                out,
+                state,
+                "response.output_item.done",
+                json!({"type": "response.output_item.done", "output_index": index, "item": item.clone()}),
+            );
             state.done_items.push(item);
         }
     }
@@ -966,9 +1137,15 @@ mod tests {
         let sse = encode_all(&[
             StreamEvent::MessageStart { model: "k3".into() },
             StreamEvent::TextDelta { text: "ok".into() },
-            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+            },
             StreamEvent::UsageDelta {
-                usage: Usage { input_tokens: 88, output_tokens: 35, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 88,
+                    output_tokens: 35,
+                    ..Default::default()
+                },
             },
         ]);
         let c = completed(&sse);
@@ -985,11 +1162,21 @@ mod tests {
         let sse = encode_all(&[
             StreamEvent::MessageStart { model: "k3".into() },
             StreamEvent::UsageDelta {
-                usage: Usage { input_tokens: 1, output_tokens: 2, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
             },
-            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+            },
         ]);
-        assert_eq!(sse.matches("response.completed").count(), 2, "one event, named twice: {sse}");
+        assert_eq!(
+            sse.matches("response.completed").count(),
+            2,
+            "one event, named twice: {sse}"
+        );
         assert_eq!(completed(&sse)["response"]["usage"]["total_tokens"], 3);
     }
 
@@ -1001,7 +1188,9 @@ mod tests {
         let sse = encode_all(&[
             StreamEvent::MessageStart { model: "k3".into() },
             StreamEvent::TextDelta { text: "ok".into() },
-            StreamEvent::Done { stop_reason: StopReason::EndTurn },
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+            },
         ]);
         let c = completed(&sse);
         assert_eq!(c["response"]["status"], "completed");
@@ -1061,27 +1250,44 @@ mod tool_pairing_tests {
     fn every_tool_exchange_spelling_pairs_call_with_result() {
         let id = "exec_command:0";
         let cases: Vec<(&str, Value, Value)> = vec![
-            ("function_call", call_item("function_call", id),
-             json!({"type": "function_call_output", "call_id": id, "output": "hi"})),
-            ("custom_tool_call", call_item("custom_tool_call", id),
-             json!({"type": "custom_tool_call_output", "call_id": id, "output": "hi"})),
-            ("local_shell_call", call_item("local_shell_call", id),
-             json!({"type": "local_shell_call_output", "call_id": id, "output": "hi"})),
+            (
+                "function_call",
+                call_item("function_call", id),
+                json!({"type": "function_call_output", "call_id": id, "output": "hi"}),
+            ),
+            (
+                "custom_tool_call",
+                call_item("custom_tool_call", id),
+                json!({"type": "custom_tool_call_output", "call_id": id, "output": "hi"}),
+            ),
+            (
+                "local_shell_call",
+                call_item("local_shell_call", id),
+                json!({"type": "local_shell_call_output", "call_id": id, "output": "hi"}),
+            ),
             // A result delivered as a message with role `tool`.
-            ("message role=tool", call_item("function_call", id),
-             json!({"type": "message", "role": "tool", "tool_call_id": id, "content": "hi"})),
+            (
+                "message role=tool",
+                call_item("function_call", id),
+                json!({"type": "message", "role": "tool", "tool_call_id": id, "content": "hi"}),
+            ),
             // An unknown vocabulary, matched on shape alone.
-            ("unknown_tool_call_output", call_item("function_call", id),
-             json!({"type": "some_future_tool_output", "call_id": id, "output": "hi"})),
+            (
+                "unknown_tool_call_output",
+                call_item("function_call", id),
+                json!({"type": "some_future_tool_output", "call_id": id, "output": "hi"}),
+            ),
             // `computer_call` names its tool only by its type, and its args
             // live in `action`. Without both fallbacks the call was dropped
             // while its output survived — an orphan `tool` message, which an
             // upstream rejects just as surely as an unanswered call.
-            ("computer_call",
-             json!({"type": "computer_call", "call_id": id,
+            (
+                "computer_call",
+                json!({"type": "computer_call", "call_id": id,
                     "action": {"type": "screenshot"}}),
-             json!({"type": "computer_call_output", "call_id": id,
-                    "output": {"type": "computer_screenshot"}})),
+                json!({"type": "computer_call_output", "call_id": id,
+                    "output": {"type": "computer_screenshot"}}),
+            ),
         ];
         for (label, call, result) in cases {
             let roles = upstream_roles(json!([call, result]));
@@ -1121,7 +1327,10 @@ mod tool_pairing_tests {
             {"type": "mcp_call", "id": "m:0", "name": "search",
              "arguments": "{}", "output": "found", "server_label": "s"}
         ]));
-        assert_eq!(roles, vec!["assistant+tool_calls".to_string(), "tool".to_string()]);
+        assert_eq!(
+            roles,
+            vec!["assistant+tool_calls".to_string(), "tool".to_string()]
+        );
     }
 
     /// A `developer` (or `system`) instruction sent inline in `input` must
@@ -1141,10 +1350,24 @@ mod tool_pairing_tests {
         let req = parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
         let opts = EmitOptions::new("t");
         for (name, bytes) in [
-            ("anthropic", crate::anthropic::emit_request(&req, &opts).unwrap().0),
-            ("gemini", crate::gemini::emit_request(&req, &opts).unwrap().0),
-            ("openai_chat", crate::openai_chat::emit_request(&req, &opts).unwrap().0),
-            ("openai_responses", crate::openai_responses::emit_request(&req, &opts).unwrap().0),
+            (
+                "anthropic",
+                crate::anthropic::emit_request(&req, &opts).unwrap().0,
+            ),
+            (
+                "gemini",
+                crate::gemini::emit_request(&req, &opts).unwrap().0,
+            ),
+            (
+                "openai_chat",
+                crate::openai_chat::emit_request(&req, &opts).unwrap().0,
+            ),
+            (
+                "openai_responses",
+                crate::openai_responses::emit_request(&req, &opts)
+                    .unwrap()
+                    .0,
+            ),
         ] {
             let s = String::from_utf8(bytes).unwrap();
             assert!(
@@ -1175,7 +1398,10 @@ mod tool_pairing_tests {
         let req = parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
         let (out, _) = emit_request(&req, &EmitOptions::new("t")).unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["input"], input, "the client's input array must survive verbatim");
+        assert_eq!(
+            v["input"], input,
+            "the client's input array must survive verbatim"
+        );
         // And `instructions` is not conjured from the inline items.
         assert!(v.get("instructions").is_none());
     }
@@ -1190,7 +1416,11 @@ mod tool_pairing_tests {
         let (out, _) = emit_request(&req, &EmitOptions::new("t")).unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["instructions"], "BE-TERSE");
-        assert_eq!(v["input"].as_array().unwrap().len(), 1, "no duplicated instruction item");
+        assert_eq!(
+            v["input"].as_array().unwrap().len(),
+            1,
+            "no duplicated instruction item"
+        );
     }
 
     /// Cross-shape translation still normalizes: a chat upstream cannot act on
@@ -1201,10 +1431,12 @@ mod tool_pairing_tests {
             {"type":"message","role":"user","content":"hi"},
             {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"ENCRYPTED-BLOB"}]});
         let req = parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
-        let (out, _) =
-            crate::openai_chat::emit_request(&req, &EmitOptions::new("t")).unwrap();
+        let (out, _) = crate::openai_chat::emit_request(&req, &EmitOptions::new("t")).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(!s.contains("ENCRYPTED-BLOB"), "a chat upstream must not receive reasoning items");
+        assert!(
+            !s.contains("ENCRYPTED-BLOB"),
+            "a chat upstream must not receive reasoning items"
+        );
         assert!(s.contains("\"role\":\"user\""));
     }
 
@@ -1225,6 +1457,3 @@ mod tool_pairing_tests {
         assert_eq!(roles, vec!["user".to_string()]);
     }
 }
-
-
-

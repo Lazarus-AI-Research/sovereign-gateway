@@ -24,8 +24,8 @@ use bytes::Bytes;
 use futures::{stream, StreamExt};
 
 use yb_core::catalog::{builtin_price, ModelPrice};
-use yb_core::spend::{Period, RollupDelta, SubjectType};
 use yb_core::config::CloudflareAccessConfig;
+use yb_core::spend::{Period, RollupDelta, SubjectType};
 use yb_core::{
     new_id, now, AccessPolicy, ApiKey, Deployment, Error, Extra, NullObserver, Observer,
     RequestLogRecord, RequestLogger, Result, RouteRequest, Router, Store, TelemetryRecord,
@@ -33,8 +33,7 @@ use yb_core::{
 };
 use yb_providers::{
     append_headers, auth_headers, build_url, cloudflare_access_headers, is_model_not_found,
-    is_retryable,
-    ByteStream, ResponseBody, UpstreamClient, UpstreamRequest,
+    is_retryable, ByteStream, ResponseBody, UpstreamClient, UpstreamRequest,
 };
 use yb_wire::{ChatRequest, ContentBlock, EmitOptions, StreamEvent, Usage};
 
@@ -196,7 +195,9 @@ impl GatewayResponse {
     /// The HTTP status of either variant.
     pub fn status(&self) -> u16 {
         match self {
-            GatewayResponse::Full { status, .. } | GatewayResponse::Stream { status, .. } => *status,
+            GatewayResponse::Full { status, .. } | GatewayResponse::Stream { status, .. } => {
+                *status
+            }
         }
     }
 }
@@ -468,10 +469,16 @@ impl Gateway {
                 // and surface it.
                 guard.disarm();
                 let rctx = self.record_ctx(
-                    &ctx, surface.as_str(), &chat.model, &deployment,
-                    body.to_vec(), started, created_at,
+                    &ctx,
+                    surface.as_str(),
+                    &chat.model,
+                    &deployment,
+                    body.to_vec(),
+                    started,
+                    created_at,
                 );
-                rctx.finish(Usage::default(), status, true, Vec::new(), 0).await;
+                rctx.finish(Usage::default(), status, true, Vec::new(), 0)
+                    .await;
                 return Err(Error::Upstream {
                     provider: deployment.provider.clone(),
                     status,
@@ -489,12 +496,20 @@ impl Gateway {
             //      client stream     + upstream full    → expand body → one SSE
             guard.disarm();
             let rctx = self.record_ctx(
-                &ctx, surface.as_str(), &chat.model, &deployment,
-                body.to_vec(), started, created_at,
+                &ctx,
+                surface.as_str(),
+                &chat.model,
+                &deployment,
+                body.to_vec(),
+                started,
+                created_at,
             );
             // The Responses response object echoes the request's prompt-cache
             // fields; when the upstream doesn't echo them, fill from the request.
-            let cache_echo = (chat.prompt_cache_key.clone(), chat.prompt_cache_retention.clone());
+            let cache_echo = (
+                chat.prompt_cache_key.clone(),
+                chat.prompt_cache_retention.clone(),
+            );
             return match (stream_requested, resp.body) {
                 (false, ResponseBody::Stream(up)) => {
                     aggregate_stream(up, upstream_fmt, surface, rctx, status, cache_echo).await
@@ -505,9 +520,15 @@ impl Gateway {
                     emit_full(surface, resp, rctx, status).await
                 }
                 (true, ResponseBody::Stream(up)) => {
-                    let stream =
-                        translate_stream(up, upstream_fmt, surface, rctx, status, cache_echo,
-                                         chat.include_usage);
+                    let stream = translate_stream(
+                        up,
+                        upstream_fmt,
+                        surface,
+                        rctx,
+                        status,
+                        cache_echo,
+                        chat.include_usage,
+                    );
                     Ok(GatewayResponse::Stream {
                         status,
                         headers: sse_headers(),
@@ -596,7 +617,11 @@ impl Gateway {
     /// Apply the access ceilings the router does not model: the effective grant's
     /// `allowed_models` / `allowed_providers` allow-lists, plus a belt-and-braces
     /// re-check of the context denylists.
-    pub(crate) fn filter_access(&self, candidates: Vec<Deployment>, ctx: &RequestCtx) -> Vec<Deployment> {
+    pub(crate) fn filter_access(
+        &self,
+        candidates: Vec<Deployment>,
+        ctx: &RequestCtx,
+    ) -> Vec<Deployment> {
         candidates
             .into_iter()
             .filter(|d| {
@@ -647,7 +672,12 @@ impl Gateway {
 /// as routing signal; never billed.
 fn estimate_tokens(chat: &ChatRequest) -> u32 {
     let mut chars = 0usize;
-    for block in chat.system.iter().flatten().chain(chat.messages.iter().flat_map(|m| &m.content)) {
+    for block in chat
+        .system
+        .iter()
+        .flatten()
+        .chain(chat.messages.iter().flat_map(|m| &m.content))
+    {
         if let ContentBlock::Text { text } = block {
             chars += text.len();
         }
@@ -839,9 +869,7 @@ const UPSTREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 /// `upstream.next()` with the idle guard applied: a stall becomes a transport
 /// error item.
-async fn next_or_stall(
-    upstream: &mut ByteStream,
-) -> Option<std::result::Result<Bytes, Error>> {
+async fn next_or_stall(upstream: &mut ByteStream) -> Option<std::result::Result<Bytes, Error>> {
     match tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, upstream.next()).await {
         Ok(item) => item,
         Err(_) => Some(Err(Error::Upstream {
@@ -898,7 +926,8 @@ async fn emit_full(
     // The reqlog captures the IR (normalized ChatResponse JSON), not the
     // client-native bytes: one uniform schema across all surfaces.
     let ir_json = serde_json::to_vec(&resp).unwrap_or_default();
-    rctx.finish(resp.usage, status, false, ir_json, resp_len).await;
+    rctx.finish(resp.usage, status, false, ir_json, resp_len)
+        .await;
     Ok(GatewayResponse::Full {
         status,
         headers: json_headers(surface),

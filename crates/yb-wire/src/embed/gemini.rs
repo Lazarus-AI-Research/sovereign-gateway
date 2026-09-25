@@ -48,7 +48,9 @@ pub fn parse_request(body: &[u8]) -> Result<EmbedRequest> {
         return Err(WireError::missing("content (or requests)"));
     }
     if inputs.is_empty() {
-        return Err(WireError::InvalidRequest("requests must not be empty".into()));
+        return Err(WireError::InvalidRequest(
+            "requests must not be empty".into(),
+        ));
     }
 
     Ok(EmbedRequest {
@@ -72,7 +74,9 @@ fn content_to_input(content: Option<&Value>) -> Result<EmbedInput> {
     let mut out = Vec::new();
     for p in parts {
         if let Some(text) = opt_str(p, "text") {
-            out.push(EmbedPart::Text { text: text.to_string() });
+            out.push(EmbedPart::Text {
+                text: text.to_string(),
+            });
         } else if p.get("inlineData").is_some()
             || p.get("inline_data").is_some()
             || p.get("fileData").is_some()
@@ -84,7 +88,9 @@ fn content_to_input(content: Option<&Value>) -> Result<EmbedInput> {
         }
     }
     if out.is_empty() {
-        return Err(WireError::InvalidRequest("content has no text parts".into()));
+        return Err(WireError::InvalidRequest(
+            "content has no text parts".into(),
+        ));
     }
     Ok(EmbedInput { parts: out })
 }
@@ -93,14 +99,22 @@ fn content_to_input(content: Option<&Value>) -> Result<EmbedInput> {
 /// under `embedContentConfig`.
 fn task_type_of(v: &Value) -> Option<String> {
     let raw = opt_str(v, "taskType")
-        .or_else(|| v.get("embedContentConfig").and_then(|c| opt_str(c, "taskType")))
-        .or_else(|| v.get("embedContentConfig").and_then(|c| opt_str(c, "task_type")))?;
+        .or_else(|| {
+            v.get("embedContentConfig")
+                .and_then(|c| opt_str(c, "taskType"))
+        })
+        .or_else(|| {
+            v.get("embedContentConfig")
+                .and_then(|c| opt_str(c, "task_type"))
+        })?;
     gemini_to_input_type(raw).map(str::to_string)
 }
 
 fn dims_of(v: &Value) -> Option<u32> {
-    opt_u32(v, "outputDimensionality")
-        .or_else(|| v.get("embedContentConfig").and_then(|c| opt_u32(c, "outputDimensionality")))
+    opt_u32(v, "outputDimensionality").or_else(|| {
+        v.get("embedContentConfig")
+            .and_then(|c| opt_u32(c, "outputDimensionality"))
+    })
 }
 
 /// Emit an IR request as a `:batchEmbedContents` body plus headers. Any image
@@ -166,13 +180,19 @@ pub fn parse_response(body: &[u8]) -> Result<EmbedResponse> {
     Ok(EmbedResponse {
         model: opt_str(&v, "model").unwrap_or_default().to_string(),
         embeddings,
-        usage: EmbedUsage { input_tokens, image_units: 0 },
+        usage: EmbedUsage {
+            input_tokens,
+            image_units: 0,
+        },
     })
 }
 
 fn values_of(e: &Value) -> Result<Vec<f32>> {
     let values = opt_arr(e, "values").ok_or_else(|| WireError::missing("embedding.values"))?;
-    Ok(values.iter().map(|n| n.as_f64().unwrap_or(0.0) as f32).collect())
+    Ok(values
+        .iter()
+        .map(|n| n.as_f64().unwrap_or(0.0) as f32)
+        .collect())
 }
 
 /// Emit an IR response in the shape the client called with: single

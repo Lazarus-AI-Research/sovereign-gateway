@@ -55,7 +55,10 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
                     continue;
                 }
                 Some(other) => {
-                    return Err(WireError::invalid("messages[].role", format!("unknown {other}")))
+                    return Err(WireError::invalid(
+                        "messages[].role",
+                        format!("unknown {other}"),
+                    ))
                 }
                 None => return Err(WireError::missing("messages[].role")),
             };
@@ -153,11 +156,19 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
         .force_reasoning_effort
         .clone()
         .or_else(|| req.reasoning.as_ref().and_then(|r| r.effort.clone()));
-    if let Some(budget) = req.reasoning.as_ref().and_then(|r| r.budget_tokens).or_else(|| {
-        // Map an OpenAI-style effort onto an approximate Anthropic budget.
-        effort.as_deref().map(effort_to_budget)
-    }) {
-        body.insert("thinking".into(), json!({"type": "enabled", "budget_tokens": budget}));
+    if let Some(budget) = req
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.budget_tokens)
+        .or_else(|| {
+            // Map an OpenAI-style effort onto an approximate Anthropic budget.
+            effort.as_deref().map(effort_to_budget)
+        })
+    {
+        body.insert(
+            "thinking".into(),
+            json!({"type": "enabled", "budget_tokens": budget}),
+        );
     }
 
     if !req.metadata.is_empty() {
@@ -174,7 +185,10 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     let bytes = serde_json::to_vec(&Value::Object(body))?;
     let headers = vec![
         ("content-type".to_string(), "application/json".to_string()),
-        ("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
+        (
+            "anthropic-version".to_string(),
+            ANTHROPIC_VERSION.to_string(),
+        ),
     ];
     Ok((bytes, headers))
 }
@@ -284,7 +298,11 @@ fn parse_block(b: &Value) -> Result<ContentBlock> {
         }),
         Some("tool_result") => Ok(ContentBlock::ToolResult {
             tool_use_id: opt_str(b, "tool_use_id").unwrap_or_default().to_string(),
-            content: b.get("content").map(parse_content).transpose()?.unwrap_or_default(),
+            content: b
+                .get("content")
+                .map(parse_content)
+                .transpose()?
+                .unwrap_or_default(),
             is_error: opt_bool(b, "is_error"),
         }),
         Some("thinking") => Ok(ContentBlock::Thinking {
@@ -312,7 +330,11 @@ fn parse_block(b: &Value) -> Result<ContentBlock> {
 fn emit_block(b: &ContentBlock) -> Value {
     match b {
         ContentBlock::Text { text } => json!({"type": "text", "text": text}),
-        ContentBlock::Image { media_type, data, url } => {
+        ContentBlock::Image {
+            media_type,
+            data,
+            url,
+        } => {
             if let Some(url) = url {
                 json!({"type": "image", "source": {"type": "url", "url": url}})
             } else {
@@ -326,7 +348,11 @@ fn emit_block(b: &ContentBlock) -> Value {
         ContentBlock::ToolUse { id, name, input } => {
             json!({"type": "tool_use", "id": id, "name": name, "input": input})
         }
-        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
             let mut o = Map::new();
             o.insert("type".into(), json!("tool_result"));
             o.insert("tool_use_id".into(), json!(tool_use_id));
@@ -356,7 +382,10 @@ fn emit_block(b: &ContentBlock) -> Value {
 /// Tool-result content renders as a plain string when it is all text, else as a
 /// block array — matching how the Anthropic API accepts both shapes.
 fn emit_result_content(content: &[ContentBlock]) -> Value {
-    if content.iter().all(|b| matches!(b, ContentBlock::Text { .. })) {
+    if content
+        .iter()
+        .all(|b| matches!(b, ContentBlock::Text { .. }))
+    {
         let mut s = String::new();
         for b in content {
             if let ContentBlock::Text { text } = b {
@@ -391,7 +420,10 @@ fn emit_message(m: &Message) -> Option<Value> {
 }
 
 fn emit_system(blocks: &[ContentBlock]) -> Value {
-    if blocks.iter().all(|b| matches!(b, ContentBlock::Text { .. })) {
+    if blocks
+        .iter()
+        .all(|b| matches!(b, ContentBlock::Text { .. }))
+    {
         let mut s = String::new();
         for b in blocks {
             if let ContentBlock::Text { text } = b {
@@ -475,7 +507,9 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
                 model: opt_str(msg, "model").unwrap_or_default().to_string(),
             }];
             if let Some(u) = msg.get("usage").filter(|u| !u.is_null()) {
-                out.push(StreamEvent::UsageDelta { usage: parse_usage(Some(u)) });
+                out.push(StreamEvent::UsageDelta {
+                    usage: parse_usage(Some(u)),
+                });
             }
             out
         }
@@ -500,7 +534,9 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
                     text: opt_str(delta, "thinking").unwrap_or_default().to_string(),
                 }],
                 Some("input_json_delta") => vec![StreamEvent::ToolUseDelta {
-                    partial_json: opt_str(delta, "partial_json").unwrap_or_default().to_string(),
+                    partial_json: opt_str(delta, "partial_json")
+                        .unwrap_or_default()
+                        .to_string(),
                 }],
                 _ => vec![],
             }
@@ -509,7 +545,11 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
             let delta = v.get("delta").unwrap_or(&Value::Null);
             state.stop_reason = Some(parse_stop_reason(opt_str(delta, "stop_reason")));
             v.get("usage")
-                .map(|u| vec![StreamEvent::UsageDelta { usage: parse_usage(Some(u)) }])
+                .map(|u| {
+                    vec![StreamEvent::UsageDelta {
+                        usage: parse_usage(Some(u)),
+                    }]
+                })
                 .unwrap_or_default()
         }
         Some("message_stop") => vec![StreamEvent::Done {
@@ -704,19 +744,32 @@ mod extension_field_tests {
 
         let (bytes, _) = super::emit_request(&ir, &EmitOptions::default()).unwrap();
         let out: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(out.get("context_management").is_some(), "ant->ant keeps context_management");
-        assert!(out.get("output_config").is_some(), "ant->ant keeps output_config");
+        assert!(
+            out.get("context_management").is_some(),
+            "ant->ant keeps context_management"
+        );
+        assert!(
+            out.get("output_config").is_some(),
+            "ant->ant keeps output_config"
+        );
         // The unmodeled field is gone — there is no `extra` escape hatch.
-        assert!(out.get("some_future_field").is_none(), "unmodeled fields are dropped");
+        assert!(
+            out.get("some_future_field").is_none(),
+            "unmodeled fields are dropped"
+        );
     }
 
     #[test]
     fn anthropic_to_responses_never_leaks_anthropic_features() {
         let ir = super::parse_request(&anthropic_body()).unwrap();
-        let (bytes, _) = crate::openai_responses::emit_request(&ir, &EmitOptions::default()).unwrap();
+        let (bytes, _) =
+            crate::openai_responses::emit_request(&ir, &EmitOptions::default()).unwrap();
         let out: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         for k in ["context_management", "output_config", "some_future_field"] {
-            assert!(out.get(k).is_none(), "Responses body must not carry Anthropic-only `{k}`");
+            assert!(
+                out.get(k).is_none(),
+                "Responses body must not carry Anthropic-only `{k}`"
+            );
         }
     }
 }

@@ -23,17 +23,13 @@ pub use error::{Error, Result};
 pub use ids::{micros_to_usd, new_id, now, usd_to_micros, Id, Micros, Timestamp};
 pub use model::{
     AccessPolicy, ApiKey, ExternalKey, IssuedKey, KeyScope, ModelAlias, ResolvedCredential, Role,
-    Session,
-    Team, TeamMembership, TelemetryRecord, User,
+    Session, Team, TeamMembership, TelemetryRecord, User,
 };
-pub use principal::{KeyAuth, Principal};
 pub use observe::{NullObserver, Observer};
+pub use principal::{KeyAuth, Principal};
 pub use reqlog::{NullLogger, RequestLogRecord, RequestLogger};
 pub use routing::{
-    Decision, Deployment, DeploymentRecord, EmbedFormat, Extra, HealthCheck, HealthRecord, ModelRecord,
-    ProviderRecord,
-    NewDeployment, RouteRequest,
-    Router, UpstreamFormat,
-    WireFormat,
+    Decision, Deployment, DeploymentRecord, EmbedFormat, Extra, HealthCheck, HealthRecord,
+    ModelRecord, NewDeployment, ProviderRecord, RouteRequest, Router, UpstreamFormat, WireFormat,
 };
 pub use store::{LimitColumns, Store};

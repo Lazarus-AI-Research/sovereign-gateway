@@ -33,7 +33,9 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
     // top-level `stream` bool (mirroring how it injects `model`).
     req.stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
-    let sys = v.get("systemInstruction").or_else(|| v.get("system_instruction"));
+    let sys = v
+        .get("systemInstruction")
+        .or_else(|| v.get("system_instruction"));
     if let Some(sys) = sys {
         let blocks = parse_parts(sys.get("parts"));
         if !blocks.is_empty() {
@@ -71,7 +73,10 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
         }
     }
 
-    if let Some(cfg) = v.get("toolConfig").and_then(|t| t.get("functionCallingConfig")) {
+    if let Some(cfg) = v
+        .get("toolConfig")
+        .and_then(|t| t.get("functionCallingConfig"))
+    {
         req.tool_choice = Some(parse_tool_choice(cfg));
     }
 
@@ -168,7 +173,11 @@ fn emit_part(b: &ContentBlock) -> Option<Value> {
         // so it is skipped rather than mistranslated.
         ContentBlock::Native { .. } => None,
         ContentBlock::Text { text } => Some(json!({"text": text})),
-        ContentBlock::Image { media_type, data, url } => match (data, url) {
+        ContentBlock::Image {
+            media_type,
+            data,
+            url,
+        } => match (data, url) {
             (Some(data), _) => Some(json!({"inline_data": {
                 "mime_type": media_type.clone().unwrap_or_else(|| "image/png".into()),
                 "data": data,
@@ -179,12 +188,14 @@ fn emit_part(b: &ContentBlock) -> Option<Value> {
         ContentBlock::ToolUse { name, input, .. } => {
             Some(json!({"functionCall": {"name": name, "args": input}}))
         }
-        ContentBlock::ToolResult { tool_use_id, content, .. } => {
-            Some(json!({"functionResponse": {
-                "name": tool_use_id,
-                "response": response_object(content),
-            }}))
-        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } => Some(json!({"functionResponse": {
+            "name": tool_use_id,
+            "response": response_object(content),
+        }})),
         // Gemini has no separate thinking part on input; drop it.
         ContentBlock::Thinking { .. } => None,
     }
@@ -216,7 +227,9 @@ pub fn parse_response(bytes: &[u8]) -> Result<ChatResponse> {
         .and_then(|c| c.get("content"))
         .map(|c| parse_parts(c.get("parts")))
         .unwrap_or_default();
-    let has_tool = content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+    let has_tool = content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
     let finish = candidate.and_then(|c| opt_str(c, "finishReason"));
 
     Ok(ChatResponse {
@@ -233,7 +246,10 @@ pub fn parse_response(bytes: &[u8]) -> Result<ChatResponse> {
 /// Emit an IR response as a Gemini `generateContent` response body.
 pub fn emit_response(resp: &ChatResponse) -> Result<Vec<u8>> {
     let parts: Vec<Value> = resp.content.iter().filter_map(emit_part).collect();
-    let has_tool = resp.content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+    let has_tool = resp
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
     let finish = stop_to_gemini_finish(&resp.stop_reason, has_tool);
     let u = &resp.usage;
     let body = json!({
@@ -290,7 +306,10 @@ fn parse_parts(v: Option<&Value>) -> Vec<ContentBlock> {
                 name,
                 input: fc.get("args").cloned().unwrap_or(json!({})),
             });
-        } else if let Some(fr) = p.get("functionResponse").or_else(|| p.get("function_response")) {
+        } else if let Some(fr) = p
+            .get("functionResponse")
+            .or_else(|| p.get("function_response"))
+        {
             let name = opt_str(fr, "name").unwrap_or_default().to_string();
             let text = match fr.get("response") {
                 Some(Value::String(s)) => s.clone(),
@@ -401,7 +420,9 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
         if let Some(parts) = parts {
             for p in parts {
                 if let Some(text) = opt_str(p, "text") {
-                    out.push(StreamEvent::TextDelta { text: text.to_string() });
+                    out.push(StreamEvent::TextDelta {
+                        text: text.to_string(),
+                    });
                 } else if let Some(fc) = p.get("functionCall").or_else(|| p.get("function_call")) {
                     state.tool_open = true;
                     out.push(StreamEvent::ToolUseStart {
@@ -409,13 +430,17 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
                         name: opt_str(fc, "name").unwrap_or_default().to_string(),
                     });
                     let args = fc.get("args").cloned().unwrap_or(json!({}));
-                    out.push(StreamEvent::ToolUseDelta { partial_json: args.to_string() });
+                    out.push(StreamEvent::ToolUseDelta {
+                        partial_json: args.to_string(),
+                    });
                 }
             }
         }
         if let Some(reason) = opt_str(candidate, "finishReason") {
             if let Some(u) = v.get("usageMetadata").filter(|u| !u.is_null()) {
-                out.push(StreamEvent::UsageDelta { usage: parse_usage(Some(u)) });
+                out.push(StreamEvent::UsageDelta {
+                    usage: parse_usage(Some(u)),
+                });
             }
             out.push(StreamEvent::Done {
                 stop_reason: gemini_finish_to_stop(Some(reason), state.tool_open),
@@ -441,13 +466,15 @@ impl EmitState {
     /// Emit the pending tool call, if any, as one complete `functionCall` part.
     fn flush_tool(&mut self, out: &mut String) {
         if let Some((name, args)) = self.pending_tool.take() {
-            let args: Value =
-                serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
-            write_chunk(out, &json!({
-                "candidates": [{"content": {"role": "model",
-                    "parts": [{"functionCall": {"name": name, "args": args}}]}, "index": 0}],
-                "modelVersion": self.model,
-            }));
+            let args: Value = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
+            write_chunk(
+                out,
+                &json!({
+                    "candidates": [{"content": {"role": "model",
+                        "parts": [{"functionCall": {"name": name, "args": args}}]}, "index": 0}],
+                    "modelVersion": self.model,
+                }),
+            );
         }
     }
 }
@@ -459,10 +486,13 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
         match ev {
             StreamEvent::MessageStart { model } => state.model = model.clone(),
             StreamEvent::TextDelta { text } => {
-                write_chunk(&mut out, &json!({
-                    "candidates": [{"content": {"role": "model", "parts": [{"text": text}]}, "index": 0}],
-                    "modelVersion": state.model,
-                }));
+                write_chunk(
+                    &mut out,
+                    &json!({
+                        "candidates": [{"content": {"role": "model", "parts": [{"text": text}]}, "index": 0}],
+                        "modelVersion": state.model,
+                    }),
+                );
             }
             StreamEvent::ThinkingDelta { .. } => {}
             StreamEvent::ToolUseStart { name, .. } => {
@@ -483,16 +513,19 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
                 state.flush_tool(&mut out);
                 let u = state.usage.unwrap_or_default();
                 let has_tool = matches!(stop_reason, StopReason::ToolUse);
-                write_chunk(&mut out, &json!({
-                    "candidates": [{"content": {"role": "model", "parts": []},
-                        "finishReason": stop_to_gemini_finish(stop_reason, has_tool), "index": 0}],
-                    "usageMetadata": {
-                        "promptTokenCount": u.input_tokens,
-                        "candidatesTokenCount": u.output_tokens,
-                        "totalTokenCount": u.input_tokens + u.output_tokens,
-                    },
-                    "modelVersion": state.model,
-                }));
+                write_chunk(
+                    &mut out,
+                    &json!({
+                        "candidates": [{"content": {"role": "model", "parts": []},
+                            "finishReason": stop_to_gemini_finish(stop_reason, has_tool), "index": 0}],
+                        "usageMetadata": {
+                            "promptTokenCount": u.input_tokens,
+                            "candidatesTokenCount": u.output_tokens,
+                            "totalTokenCount": u.input_tokens + u.output_tokens,
+                        },
+                        "modelVersion": state.model,
+                    }),
+                );
             }
         }
     }

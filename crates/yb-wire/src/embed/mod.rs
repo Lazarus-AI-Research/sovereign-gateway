@@ -45,7 +45,9 @@ pub struct EmbedInput {
 
 impl EmbedInput {
     pub fn text(s: impl Into<String>) -> Self {
-        EmbedInput { parts: vec![EmbedPart::Text { text: s.into() }] }
+        EmbedInput {
+            parts: vec![EmbedPart::Text { text: s.into() }],
+        }
     }
 
     /// The single text of an all-text input, or `None` if it has images or
@@ -58,7 +60,9 @@ impl EmbedInput {
     }
 
     pub fn has_image(&self) -> bool {
-        self.parts.iter().any(|p| matches!(p, EmbedPart::Image { .. }))
+        self.parts
+            .iter()
+            .any(|p| matches!(p, EmbedPart::Image { .. }))
     }
 }
 
@@ -122,7 +126,9 @@ pub struct EmbedEmitOptions {
 
 impl EmbedEmitOptions {
     pub fn new(target_model: impl Into<String>) -> Self {
-        EmbedEmitOptions { target_model: target_model.into() }
+        EmbedEmitOptions {
+            target_model: target_model.into(),
+        }
     }
 }
 
@@ -151,8 +157,10 @@ pub fn base64_to_f32s(s: &str) -> Result<Vec<f32>> {
         ));
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 

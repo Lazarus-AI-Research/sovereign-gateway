@@ -44,8 +44,7 @@ impl MockClient {
     /// Sets `content-type: application/json`. Equivalent to [`MockClient::full`]
     /// with that header added.
     pub fn json(body: impl Into<Vec<u8>>) -> Self {
-        Self::new(200, MockBody::Full(body.into()))
-            .with_header("content-type", "application/json")
+        Self::new(200, MockBody::Full(body.into())).with_header("content-type", "application/json")
     }
 
     /// A client returning a streamed `200 OK` SSE response.
@@ -58,8 +57,7 @@ impl MockClient {
         S: Into<Bytes>,
     {
         let chunks = events.into_iter().map(Into::into).collect();
-        Self::new(200, MockBody::Stream(chunks))
-            .with_header("content-type", "text/event-stream")
+        Self::new(200, MockBody::Stream(chunks)).with_header("content-type", "text/event-stream")
     }
 
     /// The fully general constructor: a `status` and a [`MockBody`].
@@ -109,8 +107,7 @@ impl MockClient {
         match &self.body {
             MockBody::Full(bytes) => ResponseBody::Full(bytes.clone()),
             MockBody::Stream(chunks) => {
-                let owned: Vec<yb_core::Result<Bytes>> =
-                    chunks.iter().cloned().map(Ok).collect();
+                let owned: Vec<yb_core::Result<Bytes>> = chunks.iter().cloned().map(Ok).collect();
                 ResponseBody::Stream(Box::pin(stream::iter(owned)))
             }
         }
@@ -120,10 +117,7 @@ impl MockClient {
 #[async_trait::async_trait]
 impl UpstreamClient for MockClient {
     async fn send(&self, req: UpstreamRequest) -> yb_core::Result<UpstreamResponse> {
-        self.requests
-            .lock()
-            .expect("mock mutex poisoned")
-            .push(req);
+        self.requests.lock().expect("mock mutex poisoned").push(req);
         Ok(UpstreamResponse {
             status: self.status,
             headers: self.headers.clone(),
