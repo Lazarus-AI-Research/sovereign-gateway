@@ -653,9 +653,9 @@ async fn enforce_budgets(state: &AppState, auth: &KeyAuth) -> yb_core::Result<()
 // ---- credential + header helpers -----------------------------------------
 
 /// Extract the virtual-key credential from `Authorization: Bearer <token>`, the
-/// Anthropic-style `x-api-key` header, or `x-gateway-key` (in that order). The
-/// `x-api-key` form lets native Anthropic clients (and SDKs like rust-genai)
-/// point at this surface unchanged.
+/// Anthropic-style `x-api-key` header, Gemini's `x-goog-api-key`, or
+/// `x-gateway-key` (in that order). The vendor forms let native Anthropic and
+/// Gemini clients (and SDKs like rust-genai) point at this surface unchanged.
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = header_str(headers, "authorization") {
         let lower = v.to_ascii_lowercase();
@@ -665,6 +665,9 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         }
     }
     if let Some(v) = header_str(headers, "x-api-key") {
+        return Some(v.trim().to_string());
+    }
+    if let Some(v) = header_str(headers, "x-goog-api-key") {
         return Some(v.trim().to_string());
     }
     header_str(headers, "x-gateway-key").map(|s| s.trim().to_string())
