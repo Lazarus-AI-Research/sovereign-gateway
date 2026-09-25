@@ -116,7 +116,29 @@ pub fn build_router(state: AppState) -> Router {
     // limit that applies is theirs rather than one we invented.
     router
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
+        .layer(axum::middleware::from_fn(log_request))
         .with_state(state)
+}
+
+/// At the debug level every request is a line — method, path, status and the
+/// time to the response's head, never a body. Health and metrics, which are
+/// polled, are left out.
+async fn log_request(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let path = request.uri().path().to_string();
+    if !tracing::enabled!(tracing::Level::DEBUG) || path == "/health" || path == "/metrics" {
+        return next.run(request).await;
+    }
+    let method = request.method().clone();
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    tracing::debug!(
+        method = %method,
+        path = %path,
+        status = response.status().as_u16(),
+        duration_ms = started.elapsed().as_millis() as u64,
+        "request"
+    );
+    response
 }
 
 /// Fallback: 404 (JSON) for unmatched API paths, otherwise the SPA shell so
