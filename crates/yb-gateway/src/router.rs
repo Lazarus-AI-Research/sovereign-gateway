@@ -288,6 +288,16 @@ impl DeploymentRouter {
 }
 
 impl Router for DeploymentRouter {
+    fn serving(&self, format: yb_core::UpstreamFormat, upstream_model: &str) -> Vec<Deployment> {
+        let snap = self.snapshot.read().unwrap().clone();
+        snap.models
+            .values()
+            .flat_map(|entry| entry.deployments.iter())
+            .filter(|d| d.upstream_format == format && d.upstream_model == upstream_model)
+            .cloned()
+            .collect()
+    }
+
     fn resolve(&self, req: &RouteRequest) -> Result<Decision> {
         let snap = self.snapshot.read().unwrap().clone();
         let mut out = Vec::new();

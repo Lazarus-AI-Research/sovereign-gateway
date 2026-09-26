@@ -34,6 +34,28 @@ pub fn route_media_request(body: &[u8], content_type: &str) -> Result<MediaReque
     })
 }
 
+/// The upstream model a video's id names. An engine that makes videos as
+/// jobs names each one `video_` followed by the base64url of
+/// `model/job/signature`, so a later request about the video is routed to
+/// the deployment that made it without the gateway keeping any state; the
+/// engine checks the signature. The model may itself hold a slash; the job
+/// and the signature never do.
+pub fn video_model(id: &str) -> Result<String> {
+    use base64::Engine as _;
+    let invalid = || WireError::invalid("video", "not a video this gateway routes");
+    let encoded = id.strip_prefix("video_").ok_or_else(invalid)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| invalid())?;
+    let raw = String::from_utf8(raw).map_err(|_| invalid())?;
+    let (rest, signature) = raw.rsplit_once('/').ok_or_else(invalid)?;
+    let (model, job) = rest.rsplit_once('/').ok_or_else(invalid)?;
+    if model.is_empty() || job.is_empty() || signature.is_empty() {
+        return Err(invalid());
+    }
+    Ok(model.to_string())
+}
+
 /// What routing needs from a media request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaRequest {
@@ -197,6 +219,28 @@ mod tests {
         assert_eq!(sent["prompt"], "a red bicycle");
         assert_eq!(sent["response_format"], "b64_json");
         assert_eq!(sent["size"], "1024x1024");
+    }
+
+    #[test]
+    fn a_video_id_names_its_model() {
+        // "assistant-video/job_1/sig" and "Wan-AI/Wan2.2/job_1/sig".
+        assert_eq!(
+            video_model("video_YXNzaXN0YW50LXZpZGVvL2pvYl8xL3NpZw").unwrap(),
+            "assistant-video"
+        );
+        assert_eq!(
+            video_model("video_V2FuLUFJL1dhbjIuMi9qb2JfMS9zaWc").unwrap(),
+            "Wan-AI/Wan2.2"
+        );
+        // Unprefixed, not base64url, no job, no model.
+        for id in [
+            "YXNzaXN0YW50LXZpZGVvL2pvYl8xL3NpZw",
+            "video_!!",
+            "video_bm8tam9iL3NpZw",
+            "video_L2pvYi9zaWc",
+        ] {
+            assert!(video_model(id).is_err(), "{id}");
+        }
     }
 
     #[test]

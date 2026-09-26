@@ -21,8 +21,9 @@ use yb_core::spend::{Budget, Period, RollupDelta, SpendRow, SubjectType};
 use yb_core::store::LimitColumns;
 use yb_core::{now, Micros, NullLogger, Result, Store, Timestamp, WireFormat};
 
+use yb_gateway::media::VideoLookup;
 use yb_gateway::{DeploymentRouter, Gateway, GatewayResponse, RequestCtx};
-use yb_providers::{MockClient, UpstreamClient};
+use yb_providers::{HttpMethod, MockClient, UpstreamClient};
 
 /// A minimal `Store` that captures telemetry rows and spend rollups in memory
 /// and stubs everything else.
@@ -670,6 +671,11 @@ fn media_router() -> DeploymentRouter {
                 "whisper",
                 yb_core::MediaFormat::OpenaiTranscription,
             ),
+            deployment(
+                "assistant-video",
+                "assistant-video",
+                yb_core::MediaFormat::OpenaiVideos,
+            ),
         ],
         HashMap::new(),
         HashMap::new(),
@@ -733,6 +739,174 @@ async fn speech_is_forwarded_and_recorded() {
     assert_eq!(telemetry[0].surface, "openai_speech");
     assert_eq!(telemetry[0].requested_model, "assistant-speech");
     assert!(!telemetry[0].is_error);
+}
+
+/// Making a video is a turn forwarded like any media request; asking after
+/// it, fetching it and deleting it go to the deployment its id names, with
+/// the method each takes, and are not turns.
+#[tokio::test]
+async fn a_video_is_made_then_asked_after_by_its_id() {
+    std::env::set_var("YB_TEST_AGENT_TOKEN", "agent-secret");
+    let mock = Arc::new(
+        MockClient::full(br#"{"id":"video_x","status":"queued"}"#.to_vec())
+            .with_header("content-type", "application/json"),
+    );
+    let client: Arc<dyn UpstreamClient> = mock.clone();
+    let store = Arc::new(RecordingStore::default());
+    let gateway = Gateway::new(
+        client,
+        Arc::new(media_router()),
+        store.clone(),
+        Arc::new(NullLogger),
+    );
+    gateway
+        .handle_media(
+            yb_core::MediaFormat::OpenaiVideos,
+            br#"{"model":"assistant-video","prompt":"a kite"}"#,
+            "application/json",
+            RequestCtx::new(),
+        )
+        .await
+        .unwrap();
+    let sent = mock.last_request().unwrap();
+    assert_eq!(
+        sent.url,
+        "http://agent:9100/deployments/assistant-video/v1/videos"
+    );
+    assert_eq!(store.telemetry().len(), 1);
+    assert_eq!(store.telemetry()[0].surface, "openai_videos");
+
+    // "assistant-video/job_1/sig", as the engine names and signs the video.
+    let id = "video_YXNzaXN0YW50LXZpZGVvL2pvYl8xL3NpZw";
+    for (lookup, url, method) in [
+        (VideoLookup::Status, format!("videos/{id}"), HttpMethod::Get),
+        (
+            VideoLookup::Content,
+            format!("videos/{id}/content"),
+            HttpMethod::Get,
+        ),
+        (
+            VideoLookup::Delete,
+            format!("videos/{id}"),
+            HttpMethod::Delete,
+        ),
+    ] {
+        let resp = gateway
+            .handle_video(id, lookup, RequestCtx::new())
+            .await
+            .unwrap();
+        let GatewayResponse::Full { status, .. } = resp else {
+            panic!("expected a buffered response")
+        };
+        assert_eq!(status, 200);
+        let sent = mock.last_request().unwrap();
+        assert_eq!(
+            sent.url,
+            format!("http://agent:9100/deployments/assistant-video/v1/{url}")
+        );
+        assert_eq!(sent.method, method);
+        assert!(sent.headers.contains(&(
+            "authorization".to_string(),
+            "Bearer agent-secret".to_string()
+        )));
+    }
+    assert_eq!(store.telemetry().len(), 1, "only the making is a turn");
+
+    // An id that names no video model, or no model at all, is no video.
+    for id in [
+        "video_YXNzaXN0YW50LXNwZWVjaC9qb2JfMS9zaWc",
+        "video_!!",
+        "job_1",
+    ] {
+        let err = gateway
+            .handle_video(id, VideoLookup::Status, RequestCtx::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.http_status(), 404, "{id}: {err}");
+    }
+}
+
+/// An engine that knows only the videos made on its second deployment.
+struct SecondEngine(Mutex<Vec<String>>);
+
+#[async_trait]
+impl UpstreamClient for SecondEngine {
+    async fn send(
+        &self,
+        req: yb_providers::UpstreamRequest,
+    ) -> Result<yb_providers::UpstreamResponse> {
+        self.0.lock().unwrap().push(req.url.clone());
+        let status = if req.url.contains("engine-one") {
+            404
+        } else {
+            200
+        };
+        Ok(yb_providers::UpstreamResponse {
+            status,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: yb_providers::ResponseBody::Full(b"{}".to_vec()),
+        })
+    }
+}
+
+/// A video is found by the upstream model its id names, whatever public
+/// name serves it, on whichever deployment of that model made it; a key
+/// denied the model finds nothing.
+#[tokio::test]
+async fn a_video_is_found_on_the_deployment_that_made_it() {
+    let deployment = |base: &str| DeploymentConfig {
+        provider: "host-agent".into(),
+        upstream_model: "wan".into(),
+        api_base: Some(format!("http://{base}/v1")),
+        api_key: None,
+        upstream_format: yb_core::MediaFormat::OpenaiVideos.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+        extra: Default::default(),
+    };
+    let router = DeploymentRouter::from_models(
+        vec![ModelConfig {
+            model_name: "video".into(),
+            aliases: vec![],
+            deployments: vec![deployment("engine-one"), deployment("engine-two")],
+        }],
+        HashMap::new(),
+        HashMap::new(),
+        Strategy::Simple,
+    );
+    let engine = Arc::new(SecondEngine(Mutex::new(Vec::new())));
+    let client: Arc<dyn UpstreamClient> = engine.clone();
+    let gateway = Gateway::new(
+        client,
+        Arc::new(router),
+        Arc::new(RecordingStore::default()),
+        Arc::new(NullLogger),
+    );
+    // "wan/job_1/sig".
+    let id = "video_d2FuL2pvYl8xL3NpZw";
+    let resp = gateway
+        .handle_video(id, VideoLookup::Status, RequestCtx::new())
+        .await
+        .unwrap();
+    let GatewayResponse::Full { status, .. } = resp else {
+        panic!("expected a buffered response")
+    };
+    assert_eq!(status, 200);
+    let asked = engine.0.lock().unwrap().clone();
+    assert!(
+        asked.last().unwrap().starts_with("http://engine-two/"),
+        "{asked:?}"
+    );
+
+    let mut denied = RequestCtx::new();
+    denied.access.denied_model_ids = vec!["cfg-model:video".into()];
+    let err = gateway
+        .handle_video(id, VideoLookup::Status, denied)
+        .await
+        .unwrap_err();
+    assert_eq!(err.http_status(), 404, "{err}");
 }
 
 /// A model that serves another endpoint refuses the request plainly.
@@ -804,4 +978,77 @@ async fn a_client_that_stops_at_the_end_leaves_a_complete_turn() {
     assert_eq!(telemetry[0].status, 200);
     assert!(!telemetry[0].is_error);
     assert_eq!(telemetry[0].output_tokens, 1);
+}
+
+/// An engine whose first deployment cannot be reached, and whose second
+/// answers with the given status.
+struct FirstUnreachable(u16);
+
+#[async_trait]
+impl UpstreamClient for FirstUnreachable {
+    async fn send(
+        &self,
+        req: yb_providers::UpstreamRequest,
+    ) -> Result<yb_providers::UpstreamResponse> {
+        if req.url.contains("engine-one") {
+            return Err(yb_core::Error::Upstream {
+                provider: "engine-one".into(),
+                status: 503,
+                message: "connection refused".into(),
+            });
+        }
+        Ok(yb_providers::UpstreamResponse {
+            status: self.0,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: yb_providers::ResponseBody::Full(b"{}".to_vec()),
+        })
+    }
+}
+
+/// An engine that cannot be reached is passed over for one that knows the
+/// video; when the other does not know it, the unreachable one may be the
+/// maker, and its error is the answer.
+#[tokio::test]
+async fn an_unreachable_video_engine_is_passed_over() {
+    let deployment = |base: &str| DeploymentConfig {
+        provider: "host-agent".into(),
+        upstream_model: "wan".into(),
+        api_base: Some(format!("http://{base}/v1")),
+        api_key: None,
+        upstream_format: yb_core::MediaFormat::OpenaiVideos.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+        extra: Default::default(),
+    };
+    // "wan/job_1/sig".
+    let id = "video_d2FuL2pvYl8xL3NpZw";
+    for (second, want) in [(200, Ok(200)), (404, Err(503))] {
+        let router = DeploymentRouter::from_models(
+            vec![ModelConfig {
+                model_name: "video".into(),
+                aliases: vec![],
+                deployments: vec![deployment("engine-one"), deployment("engine-two")],
+            }],
+            HashMap::new(),
+            HashMap::new(),
+            Strategy::Simple,
+        );
+        let gateway = Gateway::new(
+            Arc::new(FirstUnreachable(second)),
+            Arc::new(router),
+            Arc::new(RecordingStore::default()),
+            Arc::new(NullLogger),
+        );
+        let got = gateway
+            .handle_video(id, VideoLookup::Status, RequestCtx::new())
+            .await
+            .map(|resp| match resp {
+                GatewayResponse::Full { status, .. } => status,
+                _ => 0,
+            })
+            .map_err(|e| e.http_status());
+        assert_eq!(got, want, "the second engine answering {second}");
+    }
 }

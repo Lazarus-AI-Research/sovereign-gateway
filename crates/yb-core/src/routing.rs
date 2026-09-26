@@ -58,8 +58,9 @@ impl EmbedFormat {
 }
 
 /// The protocol a **media** surface or upstream speaks: OpenAI's image
-/// generation, speech and transcription endpoints. Nothing is translated: the
-/// gateway reads the model to route and forwards the request as it came.
+/// generation, speech, transcription and video endpoints. Nothing is
+/// translated: the gateway reads the model to route and forwards the request
+/// as it came.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaFormat {
@@ -69,6 +70,9 @@ pub enum MediaFormat {
     OpenaiSpeech,
     /// `POST /v1/audio/transcriptions`, multipart form in, JSON out.
     OpenaiTranscription,
+    /// `POST /v1/videos`, JSON in and out: a video is made as a job, asked
+    /// after, fetched and deleted by its id under the same path.
+    OpenaiVideos,
 }
 
 impl MediaFormat {
@@ -77,6 +81,7 @@ impl MediaFormat {
             MediaFormat::OpenaiImages => "openai_images",
             MediaFormat::OpenaiSpeech => "openai_speech",
             MediaFormat::OpenaiTranscription => "openai_transcription",
+            MediaFormat::OpenaiVideos => "openai_videos",
         }
     }
 
@@ -86,6 +91,7 @@ impl MediaFormat {
             MediaFormat::OpenaiImages => "images/generations",
             MediaFormat::OpenaiSpeech => "audio/speech",
             MediaFormat::OpenaiTranscription => "audio/transcriptions",
+            MediaFormat::OpenaiVideos => "videos",
         }
     }
 }
@@ -409,4 +415,12 @@ pub struct Decision {
 /// filters out everything.
 pub trait Router: Send + Sync {
     fn resolve(&self, req: &RouteRequest) -> Result<Decision>;
+
+    /// Every deployment that speaks `format` to an upstream model of this
+    /// name, whatever public model it serves: how a request about work a
+    /// deployment already did finds it again. None where the router cannot
+    /// say.
+    fn serving(&self, _format: UpstreamFormat, _upstream_model: &str) -> Vec<Deployment> {
+        Vec::new()
+    }
 }

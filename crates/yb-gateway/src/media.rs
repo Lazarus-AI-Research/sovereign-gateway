@@ -8,10 +8,10 @@
 
 use yb_core::{Error, MediaFormat, Result, RouteRequest, UpstreamFormat};
 use yb_providers::{
-    build_media_url, is_model_not_found, is_retryable, media_auth_headers, ResponseBody,
-    UpstreamRequest,
+    build_media_url, is_model_not_found, is_retryable, media_auth_headers, HttpMethod,
+    ResponseBody, UpstreamRequest,
 };
-use yb_wire::{route_media_request, Usage};
+use yb_wire::{route_media_request, video_model, Usage};
 
 use crate::service::{read_body_message, Gateway, GatewayResponse, RequestCtx};
 use crate::wire::wire_err;
@@ -167,6 +167,111 @@ impl Gateway {
         };
         guard.fail(e.http_status()).await;
         Err(e)
+    }
+}
+
+/// What a request about a video already made asks: how it is going, its
+/// file, or that it be cancelled and forgotten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoLookup {
+    Status,
+    Content,
+    Delete,
+}
+
+impl Gateway {
+    /// Forward a request about a video to the deployment that made it, which
+    /// the video's id names by its upstream model. A model served by several
+    /// deployments is asked of each in turn until one knows the video; one
+    /// that cannot be reached is passed over, and its error returned when no
+    /// other knew the video, since it may be the one that made it. Only making
+    /// a video is a turn: asking after it every few seconds would fill the
+    /// request log with polls.
+    pub async fn handle_video(
+        &self,
+        id: &str,
+        lookup: VideoLookup,
+        ctx: RequestCtx,
+    ) -> Result<GatewayResponse> {
+        let no_such_video = || Error::NotFound("no such video".into());
+        let model = video_model(id).map_err(|_| no_such_video())?;
+        let serving = self
+            .router
+            .serving(MediaFormat::OpenaiVideos.into(), &model);
+        let mut answer = None;
+        let mut unreachable = None;
+        for deployment in self.filter_access(serving, &ctx) {
+            let response = match self.ask_about_video(&deployment, id, lookup).await {
+                Ok(response) => response,
+                Err(e) => {
+                    unreachable = Some(e);
+                    continue;
+                }
+            };
+            let GatewayResponse::Full { status, .. } = &response else {
+                return Ok(response);
+            };
+            if *status != 404 {
+                return Ok(response);
+            }
+            answer = Some(response);
+        }
+        match (unreachable, answer) {
+            (Some(e), _) => Err(e),
+            (None, Some(response)) => Ok(response),
+            (None, None) => Err(no_such_video()),
+        }
+    }
+
+    async fn ask_about_video(
+        &self,
+        deployment: &yb_core::Deployment,
+        id: &str,
+        lookup: VideoLookup,
+    ) -> Result<GatewayResponse> {
+        let mut url = format!(
+            "{}/{id}",
+            build_media_url(MediaFormat::OpenaiVideos, deployment.api_base.as_deref())
+        );
+        if lookup == VideoLookup::Content {
+            url.push_str("/content");
+        }
+        let mut headers = media_auth_headers(deployment.api_key.as_deref().unwrap_or_default());
+        yb_providers::append_headers(
+            &mut headers,
+            self.extra_headers(&deployment.extra, &deployment.model_name),
+        );
+        let upstream = UpstreamRequest {
+            url,
+            method: if lookup == VideoLookup::Delete {
+                HttpMethod::Delete
+            } else {
+                HttpMethod::Get
+            },
+            headers,
+            body: Vec::new(),
+            stream: false,
+        };
+        let response = self.client.send(upstream).await?;
+        let status = response.status;
+        let response_type = response
+            .header("content-type")
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        // A request that is not streamed is answered in full, a video's bytes
+        // included.
+        let ResponseBody::Full(body) = response.body else {
+            return Err(Error::Upstream {
+                provider: deployment.provider.clone(),
+                status: 502,
+                message: "the engine streamed a video lookup".into(),
+            });
+        };
+        Ok(GatewayResponse::Full {
+            status,
+            headers: vec![("content-type".to_string(), response_type)],
+            body,
+        })
     }
 }
 

@@ -38,7 +38,7 @@ pub use ir::{
     ChatRequest, ChatResponse, ContentBlock, Message, Reasoning, Role, StopReason, StreamEvent,
     Tool, ToolChoice, Usage,
 };
-pub use media::{route_media_request, MediaRequest};
+pub use media::{route_media_request, video_model, MediaRequest};
 
 /// An emitted upstream request: the serialized body plus the format-specific
 /// headers (`content-type`, `anthropic-version`, …) the caller should send.
