@@ -69,6 +69,9 @@ pub enum MediaFormat {
     OpenaiSpeech,
     /// `POST /v1/audio/transcriptions`, multipart form in, JSON out.
     OpenaiTranscription,
+    /// `POST /v1/videos`, JSON in and out: a video is made as a job, asked
+    /// after, fetched and deleted by its id under the same path.
+    OpenaiVideos,
 }
 
 impl MediaFormat {
@@ -77,6 +80,7 @@ impl MediaFormat {
             MediaFormat::OpenaiImages => "openai_images",
             MediaFormat::OpenaiSpeech => "openai_speech",
             MediaFormat::OpenaiTranscription => "openai_transcription",
+            MediaFormat::OpenaiVideos => "openai_videos",
         }
     }
 
@@ -86,6 +90,7 @@ impl MediaFormat {
             MediaFormat::OpenaiImages => "images/generations",
             MediaFormat::OpenaiSpeech => "audio/speech",
             MediaFormat::OpenaiTranscription => "audio/transcriptions",
+            MediaFormat::OpenaiVideos => "videos",
         }
     }
 }

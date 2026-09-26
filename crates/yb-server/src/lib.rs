@@ -38,6 +38,7 @@ use yb_core::spend::{BudgetAction, SubjectType};
 use yb_core::{
     new_id, now, AccessPolicy, EmbedFormat, Error, MediaFormat, UpstreamFormat, WireFormat,
 };
+use yb_gateway::media::VideoLookup;
 use yb_gateway::{GatewayResponse, RequestCtx, TokenMeter};
 
 pub use state::AppState;
@@ -70,6 +71,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/images/generations", post(openai_images))
         .route("/v1/audio/speech", post(openai_speech))
         .route("/v1/audio/transcriptions", post(openai_transcription))
+        .route("/v1/videos", post(openai_videos))
+        .route("/v1/videos/:id", get(video_status).delete(video_delete))
+        .route("/v1/videos/:id/content", get(video_content))
         // Gemini: GET lists models, POST does inference (one wildcard, two
         // methods — avoids a static-vs-catch-all route conflict).
         .route("/v1beta/*path", get(gemini_models).post(gemini))
@@ -87,6 +91,12 @@ pub fn build_router(state: AppState) -> Router {
             "/openai/v1/audio/transcriptions",
             post(openai_transcription),
         )
+        .route("/openai/v1/videos", post(openai_videos))
+        .route(
+            "/openai/v1/videos/:id",
+            get(video_status).delete(video_delete),
+        )
+        .route("/openai/v1/videos/:id/content", get(video_content))
         .route("/voyage/v1/multimodalembeddings", post(voyage_embeddings))
         .route("/cohere/v2/embed", post(cohere_embed))
         .route("/openai/v1/models", get(models_openai))
@@ -273,6 +283,7 @@ fn mode_of(format: UpstreamFormat) -> &'static str {
         UpstreamFormat::Media(MediaFormat::OpenaiImages) => "image_generation",
         UpstreamFormat::Media(MediaFormat::OpenaiSpeech) => "audio_speech",
         UpstreamFormat::Media(MediaFormat::OpenaiTranscription) => "audio_transcription",
+        UpstreamFormat::Media(MediaFormat::OpenaiVideos) => "video_generation",
     }
 }
 
@@ -435,6 +446,39 @@ async fn openai_transcription(
     .await
 }
 
+/// `POST /v1/videos` — OpenAI video generation: the video is made as a job,
+/// and the answer names it at once.
+async fn openai_videos(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    run_inference(state, MediaFormat::OpenaiVideos.into(), headers, body).await
+}
+
+/// `GET /v1/videos/{id}` — how a video is going.
+async fn video_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    run_call(state, headers, Call::Video(id, VideoLookup::Status)).await
+}
+
+/// `GET /v1/videos/{id}/content` — the finished video's file.
+async fn video_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    run_call(state, headers, Call::Video(id, VideoLookup::Content)).await
+}
+
+/// `DELETE /v1/videos/{id}` — cancel a video and forget it.
+async fn video_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    run_call(state, headers, Call::Video(id, VideoLookup::Delete)).await
+}
+
 /// `POST /v2/embed` — Cohere-dialect embeddings.
 async fn cohere_embed(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     run_inference(state, EmbedFormat::CohereEmbed.into(), headers, body).await
@@ -520,6 +564,17 @@ async fn run_inference(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    run_call(state, headers, Call::Turn(surface, body)).await
+}
+
+/// What an authenticated caller asks for: a turn on a surface, or something
+/// about a video one made earlier.
+enum Call {
+    Turn(UpstreamFormat, Bytes),
+    Video(String, VideoLookup),
+}
+
+async fn run_call(state: AppState, headers: HeaderMap, call: Call) -> Response {
     // 1. Authenticate the virtual key.
     let Some(token) = bearer_token(&headers) else {
         return error_response(&Error::Unauthorized("missing bearer credential".into()));
@@ -608,10 +663,12 @@ async fn run_inference(
     // Best-effort last-used bookkeeping; never fails the request.
     let _ = state.store.mark_api_key_used(&keyauth.api_key.id).await;
 
-    let result = match surface {
-        UpstreamFormat::Chat(f) => state.gateway.handle(f, &body, ctx).await,
-        UpstreamFormat::Embed(f) => state.gateway.handle_embed(f, &body, ctx).await,
-        UpstreamFormat::Media(f) => {
+    let result = match call {
+        Call::Turn(UpstreamFormat::Chat(f), body) => state.gateway.handle(f, &body, ctx).await,
+        Call::Turn(UpstreamFormat::Embed(f), body) => {
+            state.gateway.handle_embed(f, &body, ctx).await
+        }
+        Call::Turn(UpstreamFormat::Media(f), body) => {
             let content_type =
                 header_str(&headers, "content-type").unwrap_or_else(|| "application/json".into());
             state
@@ -619,6 +676,7 @@ async fn run_inference(
                 .handle_media(f, &body, &content_type, ctx)
                 .await
         }
+        Call::Video(id, lookup) => state.gateway.handle_video(&id, lookup, ctx).await,
     };
     match result {
         Ok(resp) => gateway_response_into_axum(resp),

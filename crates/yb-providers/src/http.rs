@@ -81,6 +81,7 @@ impl UpstreamClient for HttpClient {
         let mut builder = match req.method {
             crate::HttpMethod::Post => self.inner.post(&req.url).body(req.body),
             crate::HttpMethod::Get => self.inner.get(&req.url),
+            crate::HttpMethod::Delete => self.inner.delete(&req.url),
         };
         for (name, value) in &req.headers {
             builder = builder.header(name, value);

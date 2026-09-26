@@ -8,10 +8,10 @@
 
 use yb_core::{Error, MediaFormat, Result, RouteRequest, UpstreamFormat};
 use yb_providers::{
-    build_media_url, is_model_not_found, is_retryable, media_auth_headers, ResponseBody,
-    UpstreamRequest,
+    build_media_url, is_model_not_found, is_retryable, media_auth_headers, HttpMethod,
+    ResponseBody, UpstreamRequest,
 };
-use yb_wire::{route_media_request, Usage};
+use yb_wire::{route_media_request, video_model, Usage};
 
 use crate::service::{read_body_message, Gateway, GatewayResponse, RequestCtx};
 use crate::wire::wire_err;
@@ -167,6 +167,78 @@ impl Gateway {
         };
         guard.fail(e.http_status()).await;
         Err(e)
+    }
+}
+
+/// What a request about a video already made asks: how it is going, its
+/// file, or that it be cancelled and forgotten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoLookup {
+    Status,
+    Content,
+    Delete,
+}
+
+impl Gateway {
+    /// Forward a request about a video to the deployment that made it, which
+    /// the video's id names. Only making a video is a turn: asking after it
+    /// every few seconds would fill the request log with polls.
+    pub async fn handle_video(
+        &self,
+        id: &str,
+        lookup: VideoLookup,
+        ctx: RequestCtx,
+    ) -> Result<GatewayResponse> {
+        let model = video_model(id).map_err(|_| Error::NotFound("no such video".into()))?;
+        let decision = self
+            .router
+            .resolve(&build_media_route_request(&model, &ctx))?;
+        let deployment = self
+            .filter_access(decision.candidates, &ctx)
+            .into_iter()
+            .find(|d| {
+                d.upstream_format == UpstreamFormat::Media(MediaFormat::OpenaiVideos)
+                    && d.upstream_model == model
+            })
+            .ok_or_else(|| Error::NotFound("no such video".into()))?;
+        let mut url = format!(
+            "{}/{id}",
+            build_media_url(MediaFormat::OpenaiVideos, deployment.api_base.as_deref())
+        );
+        if lookup == VideoLookup::Content {
+            url.push_str("/content");
+        }
+        let mut headers = media_auth_headers(deployment.api_key.as_deref().unwrap_or_default());
+        yb_providers::append_headers(
+            &mut headers,
+            self.extra_headers(&deployment.extra, &deployment.model_name),
+        );
+        let upstream = UpstreamRequest {
+            url,
+            method: if lookup == VideoLookup::Delete {
+                HttpMethod::Delete
+            } else {
+                HttpMethod::Get
+            },
+            headers,
+            body: Vec::new(),
+            stream: false,
+        };
+        let response = self.client.send(upstream).await?;
+        let status = response.status;
+        let response_type = response
+            .header("content-type")
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let body = match response.body {
+            ResponseBody::Full(b) => b,
+            ResponseBody::Stream(_) => read_body_message(response.body).await.into_bytes(),
+        };
+        Ok(GatewayResponse::Full {
+            status,
+            headers: vec![("content-type".to_string(), response_type)],
+            body,
+        })
     }
 }
 

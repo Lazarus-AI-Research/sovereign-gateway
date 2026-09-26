@@ -21,8 +21,9 @@ use yb_core::spend::{Budget, Period, RollupDelta, SpendRow, SubjectType};
 use yb_core::store::LimitColumns;
 use yb_core::{now, Micros, NullLogger, Result, Store, Timestamp, WireFormat};
 
+use yb_gateway::media::VideoLookup;
 use yb_gateway::{DeploymentRouter, Gateway, GatewayResponse, RequestCtx};
-use yb_providers::{MockClient, UpstreamClient};
+use yb_providers::{HttpMethod, MockClient, UpstreamClient};
 
 /// A minimal `Store` that captures telemetry rows and spend rollups in memory
 /// and stubs everything else.
@@ -670,6 +671,11 @@ fn media_router() -> DeploymentRouter {
                 "whisper",
                 yb_core::MediaFormat::OpenaiTranscription,
             ),
+            deployment(
+                "assistant-video",
+                "assistant-video",
+                yb_core::MediaFormat::OpenaiVideos,
+            ),
         ],
         HashMap::new(),
         HashMap::new(),
@@ -733,6 +739,87 @@ async fn speech_is_forwarded_and_recorded() {
     assert_eq!(telemetry[0].surface, "openai_speech");
     assert_eq!(telemetry[0].requested_model, "assistant-speech");
     assert!(!telemetry[0].is_error);
+}
+
+/// Making a video is a turn forwarded like any media request; asking after
+/// it, fetching it and deleting it go to the deployment its id names, with
+/// the method each takes, and are not turns.
+#[tokio::test]
+async fn a_video_is_made_then_asked_after_by_its_id() {
+    std::env::set_var("YB_TEST_AGENT_TOKEN", "agent-secret");
+    let mock = Arc::new(
+        MockClient::full(br#"{"id":"video_x","status":"queued"}"#.to_vec())
+            .with_header("content-type", "application/json"),
+    );
+    let client: Arc<dyn UpstreamClient> = mock.clone();
+    let store = Arc::new(RecordingStore::default());
+    let gateway = Gateway::new(
+        client,
+        Arc::new(media_router()),
+        store.clone(),
+        Arc::new(NullLogger),
+    );
+    gateway
+        .handle_media(
+            yb_core::MediaFormat::OpenaiVideos,
+            br#"{"model":"assistant-video","prompt":"a kite"}"#,
+            "application/json",
+            RequestCtx::new(),
+        )
+        .await
+        .unwrap();
+    let sent = mock.last_request().unwrap();
+    assert_eq!(
+        sent.url,
+        "http://agent:9100/deployments/assistant-video/v1/videos"
+    );
+    assert_eq!(store.telemetry().len(), 1);
+    assert_eq!(store.telemetry()[0].surface, "openai_videos");
+
+    // "assistant-video/job_1", as the engine names the video.
+    let id = "video_YXNzaXN0YW50LXZpZGVvL2pvYl8x";
+    for (lookup, url, method) in [
+        (VideoLookup::Status, format!("videos/{id}"), HttpMethod::Get),
+        (
+            VideoLookup::Content,
+            format!("videos/{id}/content"),
+            HttpMethod::Get,
+        ),
+        (
+            VideoLookup::Delete,
+            format!("videos/{id}"),
+            HttpMethod::Delete,
+        ),
+    ] {
+        let resp = gateway
+            .handle_video(id, lookup, RequestCtx::new())
+            .await
+            .unwrap();
+        let GatewayResponse::Full { status, .. } = resp else {
+            panic!("expected a buffered response")
+        };
+        assert_eq!(status, 200);
+        let sent = mock.last_request().unwrap();
+        assert_eq!(
+            sent.url,
+            format!("http://agent:9100/deployments/assistant-video/v1/{url}")
+        );
+        assert_eq!(sent.method, method);
+        assert!(sent.headers.contains(&(
+            "authorization".to_string(),
+            "Bearer agent-secret".to_string()
+        )));
+    }
+    assert_eq!(store.telemetry().len(), 1, "only the making is a turn");
+
+    // An id that names no video model, or no model at all, is no video.
+    for id in ["video_YXNzaXN0YW50LXNwZWVjaC9qb2JfMQ", "video_!!", "job_1"] {
+        let err = gateway
+            .handle_video(id, VideoLookup::Status, RequestCtx::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.http_status(), 404, "{id}: {err}");
+    }
 }
 
 /// A model that serves another endpoint refuses the request plainly.

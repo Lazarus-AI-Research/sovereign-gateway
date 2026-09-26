@@ -34,6 +34,24 @@ pub fn route_media_request(body: &[u8], content_type: &str) -> Result<MediaReque
     })
 }
 
+/// The model a video's id names. An engine that makes videos as jobs names
+/// each one `video_` followed by the base64url of `model/job`, so a later
+/// request about the video is routed to the deployment that made it without
+/// the gateway keeping any state.
+pub fn video_model(id: &str) -> Result<String> {
+    use base64::Engine as _;
+    let invalid = || WireError::invalid("video", "not a video this gateway routes");
+    let encoded = id.strip_prefix("video_").ok_or_else(invalid)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| invalid())?;
+    let raw = String::from_utf8(raw).map_err(|_| invalid())?;
+    match raw.split_once('/') {
+        Some((model, job)) if !model.is_empty() && !job.is_empty() => Ok(model.to_string()),
+        _ => Err(invalid()),
+    }
+}
+
 /// What routing needs from a media request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaRequest {
@@ -197,6 +215,22 @@ mod tests {
         assert_eq!(sent["prompt"], "a red bicycle");
         assert_eq!(sent["response_format"], "b64_json");
         assert_eq!(sent["size"], "1024x1024");
+    }
+
+    #[test]
+    fn a_video_id_names_its_model() {
+        assert_eq!(
+            video_model("video_YXNzaXN0YW50LXZpZGVvL2pvYl8x").unwrap(),
+            "assistant-video"
+        );
+        for id in [
+            "YXNzaXN0YW50LXZpZGVvL2pvYl8x",
+            "video_!!",
+            "video_bm8tam9i",
+            "video_L2pvYg",
+        ] {
+            assert!(video_model(id).is_err(), "{id}");
+        }
     }
 
     #[test]
