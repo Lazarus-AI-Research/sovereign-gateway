@@ -10,6 +10,7 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod ids;
+pub mod logging;
 pub mod model;
 pub mod observe;
 pub mod principal;
@@ -23,6 +24,7 @@ pub mod store;
 pub use capture::{CapturePolicy, Redaction};
 pub use error::{Error, Result};
 pub use ids::{micros_to_usd, new_id, now, usd_to_micros, Id, Micros, Timestamp};
+pub use logging::{FixedLogging, LogControl, LogLevel};
 pub use model::{
     AccessPolicy, ApiKey, ExternalKey, IssuedKey, KeyScope, ModelAlias, ResolvedCredential, Role,
     Session, Team, TeamMembership, TelemetryRecord, User,

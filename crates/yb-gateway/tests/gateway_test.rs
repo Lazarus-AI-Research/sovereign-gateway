@@ -216,6 +216,12 @@ impl Store for RecordingStore {
     async fn set_capture_policy(&self, _policy: &yb_core::CapturePolicy) -> Result<()> {
         Ok(())
     }
+    async fn log_level(&self) -> Result<Option<yb_core::LogLevel>> {
+        Ok(None)
+    }
+    async fn set_log_level(&self, _level: yb_core::LogLevel) -> Result<()> {
+        Ok(())
+    }
     async fn usage(
         &self,
         _from: Timestamp,

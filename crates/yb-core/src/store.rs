@@ -107,6 +107,9 @@ pub trait Store: Send + Sync {
     /// The capture policy; the default (off) until one is set.
     async fn capture_policy(&self) -> crate::Result<crate::CapturePolicy>;
     async fn set_capture_policy(&self, policy: &crate::CapturePolicy) -> crate::Result<()>;
+    /// The log level an operator set; none until one is.
+    async fn log_level(&self) -> crate::Result<Option<crate::LogLevel>>;
+    async fn set_log_level(&self, level: crate::LogLevel) -> crate::Result<()>;
     /// Per-day usage for turns recorded in `[from, to)`.
     async fn usage(&self, from: Timestamp, to: Timestamp) -> crate::Result<Vec<UsageRow>>;
 

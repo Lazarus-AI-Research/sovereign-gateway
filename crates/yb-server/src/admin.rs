@@ -111,6 +111,10 @@ pub fn router() -> Router<AppState> {
             get(crate::capture::get_policy).put(crate::capture::put_policy),
         )
         .route("/capture/export", get(crate::capture::export))
+        .route(
+            "/log-level",
+            get(crate::logging::get_level).put(crate::logging::put_level),
+        )
 }
 
 // ---- principal extraction ------------------------------------------------

@@ -1111,3 +1111,15 @@ async fn the_capture_policy_starts_off_and_keeps_what_is_set() {
         assert_eq!(store.capture_policy().await.unwrap(), policy);
     }
 }
+
+/// No level is kept until an operator sets one, and the last one set is read
+/// back.
+#[tokio::test]
+async fn the_log_level_is_unset_until_one_is_kept() {
+    let (store, _db) = fresh_store().await;
+    assert_eq!(store.log_level().await.unwrap(), None);
+    for level in [yb_core::LogLevel::Debug, yb_core::LogLevel::Warn] {
+        store.set_log_level(level).await.unwrap();
+        assert_eq!(store.log_level().await.unwrap(), Some(level));
+    }
+}
