@@ -1084,3 +1084,30 @@ async fn control_key_is_ensured_and_rotated() {
         .is_some());
     assert_eq!(store.count_users().await.unwrap(), 1);
 }
+
+/// Capture is off until an operator sets a policy, and the policy set is the
+/// one read back, across the one row the table holds.
+#[tokio::test]
+async fn the_capture_policy_starts_off_and_keeps_what_is_set() {
+    let (store, _db) = fresh_store().await;
+    assert_eq!(
+        store.capture_policy().await.unwrap(),
+        yb_core::CapturePolicy::default()
+    );
+    assert!(!store.capture_policy().await.unwrap().enabled);
+    for policy in [
+        yb_core::CapturePolicy {
+            enabled: true,
+            redaction: yb_core::Redaction::MetadataOnly,
+            retention_days: 7,
+        },
+        yb_core::CapturePolicy {
+            enabled: false,
+            redaction: yb_core::Redaction::None,
+            retention_days: 0,
+        },
+    ] {
+        store.set_capture_policy(&policy).await.unwrap();
+        assert_eq!(store.capture_policy().await.unwrap(), policy);
+    }
+}

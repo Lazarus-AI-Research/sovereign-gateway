@@ -120,6 +120,7 @@ async fn setup() -> (AppState, String) {
         sso: None,
         budgets_enabled: false,
         ratelimit_enabled: false,
+        request_log: Arc::new(NullLogger),
     };
 
     (state, issued.token)
@@ -401,6 +402,7 @@ async fn setup_auth_ts(
         sso,
         budgets_enabled: false,
         ratelimit_enabled: false,
+        request_log: Arc::new(NullLogger),
     }
 }
 
@@ -1778,4 +1780,50 @@ fn a_traceparent_names_the_trace_and_the_callers_span() {
     ] {
         assert_eq!(parse_traceparent(bad), None, "{bad}");
     }
+}
+
+/// A captured chat becomes one training example: the messages as sent, the
+/// model's answer last, and where it came from; a turn kept as metadata
+/// only, or one that is not a chat, gives none.
+#[test]
+fn a_captured_chat_becomes_a_training_example() {
+    let turn = yb_core::CapturedTurn {
+        ts: now(),
+        request_id: "req-1".into(),
+        surface: "openai_chat".into(),
+        requested_model: "assistant-large".into(),
+        api_key_id: Some("key-1".into()),
+        user_id: None,
+        tags: Some(r#"{"space":"s1"}"#.into()),
+        redaction: "patterns".into(),
+        request_body: serde_json::to_vec(&json!({
+            "model": "assistant-large",
+            "messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi [EMAIL]"}]
+        }))
+        .unwrap(),
+        response_body: serde_json::to_vec(&json!({
+            "id": "r", "model": "assistant-large",
+            "content": [{"type": "text", "text": "Hello."}],
+            "stop_reason": "end_turn", "usage": {}
+        }))
+        .unwrap(),
+    };
+    let example = yb_server::capture::training_example(&turn).expect("a chat is an example");
+    let messages = example["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1]["content"], "Hi [EMAIL]");
+    assert_eq!(
+        messages[2],
+        json!({"role": "assistant", "content": "Hello."})
+    );
+    assert_eq!(example["metadata"]["tags"]["space"], "s1");
+    assert_eq!(example["metadata"]["redaction"], "patterns");
+
+    let mut metadata_only = turn.clone();
+    metadata_only.request_body.clear();
+    metadata_only.response_body.clear();
+    assert!(yb_server::capture::training_example(&metadata_only).is_none());
+    let mut speech = turn;
+    speech.surface = "openai_speech".into();
+    assert!(yb_server::capture::training_example(&speech).is_none());
 }

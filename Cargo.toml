@@ -6,6 +6,7 @@ members = [
     "crates/yb-store",
     "crates/yb-providers",
     "crates/yb-reqlog",
+    "crates/yb-redact",
     "crates/yb-otel",
     "crates/yb-gateway",
     "crates/yb-server",
@@ -26,6 +27,7 @@ yb-wire = { path = "crates/yb-wire" }
 yb-store = { path = "crates/yb-store" }
 yb-providers = { path = "crates/yb-providers" }
 yb-reqlog = { path = "crates/yb-reqlog" }
+yb-redact = { path = "crates/yb-redact" }
 yb-otel = { path = "crates/yb-otel" }
 yb-gateway = { path = "crates/yb-gateway" }
 yb-server = { path = "crates/yb-server" }

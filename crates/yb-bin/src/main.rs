@@ -342,6 +342,8 @@ async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> 
     // --- 4. upstream client + request log + telemetry + gateway --------------
     let client = build_upstream_client(cfg.upstream.mode);
     let logger: Arc<dyn RequestLogger> = build_reqlog(&cfg.reqlog)?;
+    // Capture follows the policy an operator last set, off until one does.
+    logger.apply_policy(&store.capture_policy().await?);
     let observer: Arc<dyn Observer> = if cfg.telemetry.enabled {
         tracing::info!(
             otlp = cfg
@@ -372,7 +374,7 @@ async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> 
             client,
             router.clone(),
             store.clone(),
-            logger,
+            logger.clone(),
             observer.clone(),
         )
         .with_cloudflare_access(cfg.upstream.cloudflare_access.clone()),
@@ -417,6 +419,7 @@ async fn run_serve(config_path: &str) -> Result<(), Box<dyn std::error::Error>> 
         sso,
         budgets_enabled: cfg.features.budgets_enabled,
         ratelimit_enabled: cfg.features.ratelimit_enabled,
+        request_log: logger.clone(),
     };
 
     let app = build_router(state);

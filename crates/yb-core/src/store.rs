@@ -104,6 +104,9 @@ pub trait Store: Send + Sync {
     async fn upsert_budget(&self, budget: &Budget) -> crate::Result<()>;
     async fn delete_budget(&self, id: &str) -> crate::Result<()>;
     async fn spend_rows(&self) -> crate::Result<Vec<SpendRow>>;
+    /// The capture policy; the default (off) until one is set.
+    async fn capture_policy(&self) -> crate::Result<crate::CapturePolicy>;
+    async fn set_capture_policy(&self, policy: &crate::CapturePolicy) -> crate::Result<()>;
     /// Per-day usage for turns recorded in `[from, to)`.
     async fn usage(&self, from: Timestamp, to: Timestamp) -> crate::Result<Vec<UsageRow>>;
 

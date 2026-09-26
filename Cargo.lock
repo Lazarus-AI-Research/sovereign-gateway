@@ -5488,6 +5488,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "yb-redact"
+version = "0.1.0"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "yb-reqlog"
 version = "0.1.0"
 dependencies = [
@@ -5499,6 +5506,7 @@ dependencies = [
  "tokio",
  "tracing",
  "yb-core",
+ "yb-redact",
 ]
 
 [[package]]
