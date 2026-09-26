@@ -150,19 +150,25 @@ fn card(found: &str) -> Vec<(usize, usize)> {
     // A card's window can end inside a phone number that follows it; the
     // whole phone number goes with the card rather than leaving its rest.
     for span in spans.iter_mut() {
-        let (from, to) = *span;
-        let inside = groups
-            .iter()
-            .map(|&(group, _)| group)
-            .filter(|&group| from < group && group < to);
-        for group in inside {
-            if let Some(found_phone) = phone().find_at(found, group) {
-                if found_phone.start() == group {
-                    span.1 = span.1.max(found_phone.end());
+        // Read afresh on every group: an extension can bring the next phone
+        // number's first group inside the span.
+        for &(group, _) in &groups {
+            if span.0 < group && group < span.1 {
+                if let Some(found_phone) = phone().find_at(found, group) {
+                    if found_phone.start() == group {
+                        span.1 = span.1.max(found_phone.end());
+                    }
                 }
             }
         }
+        // And a phone number before the card whose last group a window took.
+        for found_phone in phone().find_iter(found) {
+            if found_phone.start() < span.0 && span.0 < found_phone.end() {
+                span.0 = found_phone.start();
+            }
+        }
     }
+    spans.sort_unstable();
     spans.dedup_by(|later, earlier| {
         let joined = later.0 <= earlier.1;
         if joined {
@@ -510,6 +516,27 @@ mod tests {
             !beside_phone.contains("555") && !beside_phone.contains("0134"),
             "{beside_phone}"
         );
+    }
+
+    #[test]
+    fn no_digit_of_a_phone_number_beside_a_card_is_left() {
+        for area in 100..1000 {
+            for text in [
+                format!("card 4111 1111 1111 1111 {area} 555 0134"),
+                format!("card 4111-1111-1111-1111 {area}-555-0134"),
+            ] {
+                let redacted = redact(&text);
+                assert!(
+                    !redacted.contains("0134") && !redacted.contains("555"),
+                    "{text} -> {redacted}"
+                );
+            }
+        }
+        for subscriber in 0..10000 {
+            let text = format!("call 415 555 {subscriber:04} 4111 1111 1111 1111");
+            let redacted = redact(&text);
+            assert!(!redacted.contains(" 555 "), "{text} -> {redacted}");
+        }
     }
 
     #[test]
