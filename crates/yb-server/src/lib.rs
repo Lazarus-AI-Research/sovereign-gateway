@@ -250,7 +250,7 @@ async fn model_names(state: &AppState, access: &AccessPolicy) -> Vec<String> {
 struct ListedModel {
     name: String,
     /// What the model answers: `chat`, `embedding`, `image_generation`,
-    /// `audio_speech` or `audio_transcription`.
+    /// `video_generation`, `audio_speech` or `audio_transcription`.
     mode: &'static str,
     vision: bool,
 }
@@ -617,8 +617,10 @@ async fn run_call(state: AppState, headers: HeaderMap, call: Call) -> Response {
         None
     };
 
-    // 3. Budget enforcement (hard, blocking budgets only).
-    if state.budgets_enabled {
+    // 3. Budget enforcement (hard, blocking budgets only). A video already
+    // made was paid for when it was asked for; asking after it, fetching it
+    // or cancelling it is not held back by a budget spent since.
+    if state.budgets_enabled && matches!(call, Call::Turn(..)) {
         if let Err(e) = enforce_budgets(&state, &keyauth).await {
             return error_response(&e);
         }

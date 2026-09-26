@@ -776,8 +776,8 @@ async fn a_video_is_made_then_asked_after_by_its_id() {
     assert_eq!(store.telemetry().len(), 1);
     assert_eq!(store.telemetry()[0].surface, "openai_videos");
 
-    // "assistant-video/job_1", as the engine names the video.
-    let id = "video_YXNzaXN0YW50LXZpZGVvL2pvYl8x";
+    // "assistant-video/job_1/sig", as the engine names and signs the video.
+    let id = "video_YXNzaXN0YW50LXZpZGVvL2pvYl8xL3NpZw";
     for (lookup, url, method) in [
         (VideoLookup::Status, format!("videos/{id}"), HttpMethod::Get),
         (
@@ -813,13 +813,100 @@ async fn a_video_is_made_then_asked_after_by_its_id() {
     assert_eq!(store.telemetry().len(), 1, "only the making is a turn");
 
     // An id that names no video model, or no model at all, is no video.
-    for id in ["video_YXNzaXN0YW50LXNwZWVjaC9qb2JfMQ", "video_!!", "job_1"] {
+    for id in [
+        "video_YXNzaXN0YW50LXNwZWVjaC9qb2JfMS9zaWc",
+        "video_!!",
+        "job_1",
+    ] {
         let err = gateway
             .handle_video(id, VideoLookup::Status, RequestCtx::new())
             .await
             .unwrap_err();
         assert_eq!(err.http_status(), 404, "{id}: {err}");
     }
+}
+
+/// An engine that knows only the videos made on its second deployment.
+struct SecondEngine(Mutex<Vec<String>>);
+
+#[async_trait]
+impl UpstreamClient for SecondEngine {
+    async fn send(
+        &self,
+        req: yb_providers::UpstreamRequest,
+    ) -> Result<yb_providers::UpstreamResponse> {
+        self.0.lock().unwrap().push(req.url.clone());
+        let status = if req.url.contains("engine-one") {
+            404
+        } else {
+            200
+        };
+        Ok(yb_providers::UpstreamResponse {
+            status,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: yb_providers::ResponseBody::Full(b"{}".to_vec()),
+        })
+    }
+}
+
+/// A video is found by the upstream model its id names, whatever public
+/// name serves it, on whichever deployment of that model made it; a key
+/// denied the model finds nothing.
+#[tokio::test]
+async fn a_video_is_found_on_the_deployment_that_made_it() {
+    let deployment = |base: &str| DeploymentConfig {
+        provider: "host-agent".into(),
+        upstream_model: "wan".into(),
+        api_base: Some(format!("http://{base}/v1")),
+        api_key: None,
+        upstream_format: yb_core::MediaFormat::OpenaiVideos.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+        extra: Default::default(),
+    };
+    let router = DeploymentRouter::from_models(
+        vec![ModelConfig {
+            model_name: "video".into(),
+            aliases: vec![],
+            deployments: vec![deployment("engine-one"), deployment("engine-two")],
+        }],
+        HashMap::new(),
+        HashMap::new(),
+        Strategy::Simple,
+    );
+    let engine = Arc::new(SecondEngine(Mutex::new(Vec::new())));
+    let client: Arc<dyn UpstreamClient> = engine.clone();
+    let gateway = Gateway::new(
+        client,
+        Arc::new(router),
+        Arc::new(RecordingStore::default()),
+        Arc::new(NullLogger),
+    );
+    // "wan/job_1/sig".
+    let id = "video_d2FuL2pvYl8xL3NpZw";
+    let resp = gateway
+        .handle_video(id, VideoLookup::Status, RequestCtx::new())
+        .await
+        .unwrap();
+    let GatewayResponse::Full { status, .. } = resp else {
+        panic!("expected a buffered response")
+    };
+    assert_eq!(status, 200);
+    let asked = engine.0.lock().unwrap().clone();
+    assert!(
+        asked.last().unwrap().starts_with("http://engine-two/"),
+        "{asked:?}"
+    );
+
+    let mut denied = RequestCtx::new();
+    denied.access.denied_model_ids = vec!["cfg-model:video".into()];
+    let err = gateway
+        .handle_video(id, VideoLookup::Status, denied)
+        .await
+        .unwrap_err();
+    assert_eq!(err.http_status(), 404, "{err}");
 }
 
 /// A model that serves another endpoint refuses the request plainly.

@@ -181,26 +181,41 @@ pub enum VideoLookup {
 
 impl Gateway {
     /// Forward a request about a video to the deployment that made it, which
-    /// the video's id names. Only making a video is a turn: asking after it
-    /// every few seconds would fill the request log with polls.
+    /// the video's id names by its upstream model. A model served by several
+    /// deployments is asked of each in turn until one knows the video. Only
+    /// making a video is a turn: asking after it every few seconds would fill
+    /// the request log with polls.
     pub async fn handle_video(
         &self,
         id: &str,
         lookup: VideoLookup,
         ctx: RequestCtx,
     ) -> Result<GatewayResponse> {
-        let model = video_model(id).map_err(|_| Error::NotFound("no such video".into()))?;
-        let decision = self
+        let no_such_video = || Error::NotFound("no such video".into());
+        let model = video_model(id).map_err(|_| no_such_video())?;
+        let serving = self
             .router
-            .resolve(&build_media_route_request(&model, &ctx))?;
-        let deployment = self
-            .filter_access(decision.candidates, &ctx)
-            .into_iter()
-            .find(|d| {
-                d.upstream_format == UpstreamFormat::Media(MediaFormat::OpenaiVideos)
-                    && d.upstream_model == model
-            })
-            .ok_or_else(|| Error::NotFound("no such video".into()))?;
+            .serving(MediaFormat::OpenaiVideos.into(), &model);
+        let mut answer = None;
+        for deployment in self.filter_access(serving, &ctx) {
+            let response = self.ask_about_video(&deployment, id, lookup).await?;
+            let GatewayResponse::Full { status, .. } = &response else {
+                return Ok(response);
+            };
+            if *status != 404 {
+                return Ok(response);
+            }
+            answer = Some(response);
+        }
+        answer.ok_or_else(no_such_video)
+    }
+
+    async fn ask_about_video(
+        &self,
+        deployment: &yb_core::Deployment,
+        id: &str,
+        lookup: VideoLookup,
+    ) -> Result<GatewayResponse> {
         let mut url = format!(
             "{}/{id}",
             build_media_url(MediaFormat::OpenaiVideos, deployment.api_base.as_deref())
@@ -230,9 +245,14 @@ impl Gateway {
             .header("content-type")
             .unwrap_or("application/octet-stream")
             .to_string();
-        let body = match response.body {
-            ResponseBody::Full(b) => b,
-            ResponseBody::Stream(_) => read_body_message(response.body).await.into_bytes(),
+        // A request that is not streamed is answered in full, a video's bytes
+        // included.
+        let ResponseBody::Full(body) = response.body else {
+            return Err(Error::Upstream {
+                provider: deployment.provider.clone(),
+                status: 502,
+                message: "the engine streamed a video lookup".into(),
+            });
         };
         Ok(GatewayResponse::Full {
             status,

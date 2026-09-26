@@ -58,8 +58,9 @@ impl EmbedFormat {
 }
 
 /// The protocol a **media** surface or upstream speaks: OpenAI's image
-/// generation, speech and transcription endpoints. Nothing is translated: the
-/// gateway reads the model to route and forwards the request as it came.
+/// generation, speech, transcription and video endpoints. Nothing is
+/// translated: the gateway reads the model to route and forwards the request
+/// as it came.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaFormat {
@@ -414,4 +415,12 @@ pub struct Decision {
 /// filters out everything.
 pub trait Router: Send + Sync {
     fn resolve(&self, req: &RouteRequest) -> Result<Decision>;
+
+    /// Every deployment that speaks `format` to an upstream model of this
+    /// name, whatever public model it serves: how a request about work a
+    /// deployment already did finds it again. None where the router cannot
+    /// say.
+    fn serving(&self, _format: UpstreamFormat, _upstream_model: &str) -> Vec<Deployment> {
+        Vec::new()
+    }
 }
