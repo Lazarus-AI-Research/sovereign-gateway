@@ -182,9 +182,11 @@ pub enum VideoLookup {
 impl Gateway {
     /// Forward a request about a video to the deployment that made it, which
     /// the video's id names by its upstream model. A model served by several
-    /// deployments is asked of each in turn until one knows the video. Only
-    /// making a video is a turn: asking after it every few seconds would fill
-    /// the request log with polls.
+    /// deployments is asked of each in turn until one knows the video; one
+    /// that cannot be reached is passed over, and its error returned when no
+    /// other knew the video, since it may be the one that made it. Only making
+    /// a video is a turn: asking after it every few seconds would fill the
+    /// request log with polls.
     pub async fn handle_video(
         &self,
         id: &str,
@@ -197,8 +199,15 @@ impl Gateway {
             .router
             .serving(MediaFormat::OpenaiVideos.into(), &model);
         let mut answer = None;
+        let mut unreachable = None;
         for deployment in self.filter_access(serving, &ctx) {
-            let response = self.ask_about_video(&deployment, id, lookup).await?;
+            let response = match self.ask_about_video(&deployment, id, lookup).await {
+                Ok(response) => response,
+                Err(e) => {
+                    unreachable = Some(e);
+                    continue;
+                }
+            };
             let GatewayResponse::Full { status, .. } = &response else {
                 return Ok(response);
             };
@@ -207,7 +216,11 @@ impl Gateway {
             }
             answer = Some(response);
         }
-        answer.ok_or_else(no_such_video)
+        match (unreachable, answer) {
+            (Some(e), _) => Err(e),
+            (None, Some(response)) => Ok(response),
+            (None, None) => Err(no_such_video()),
+        }
     }
 
     async fn ask_about_video(
