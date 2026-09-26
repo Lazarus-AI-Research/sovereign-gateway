@@ -26,6 +26,14 @@ pub trait Redactor: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PatternRedactor;
 
+const PHONE: &str =
+    r"(?:\+\d{1,3}[ .-]?)?(?:\(\d{2,4}\)[ .-]?|\b\d{2,4}[ .-])\d{3,4}[ .-]\d{3,4}\b";
+
+fn phone() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(PHONE).expect("the phone pattern compiles"))
+}
+
 struct Rule {
     marker: &'static str,
     pattern: Regex,
@@ -74,18 +82,16 @@ fn rules() -> &'static [Rule] {
                 r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
                 always,
             ),
-            rule("[CARD]", r"\b\d+(?:[ -]\d+)*\b", card),
+            // Before cards: its two-digit middle group is never part of one,
+            // so a card beside it cannot take its first group.
             rule("[NATIONAL_ID]", r"\b\d{3}-\d{2}-\d{4}\b", always),
+            rule("[CARD]", r"\b\d+(?:[ -]\d+)*\b", card),
             rule(
                 "[NATIONAL_ID]",
                 r"\b[A-CEGHJ-PR-TW-Z]{2}\s?\d{2}\s?\d{2}\s?\d{2}\s?[A-D]\b",
                 always,
             ),
-            rule(
-                "[PHONE]",
-                r"(?:\+\d{1,3}[ .-]?)?(?:\(\d{2,4}\)[ .-]?|\b\d{2,4}[ .-])\d{3,4}[ .-]\d{3,4}\b",
-                always,
-            ),
+            rule("[PHONE]", PHONE, always),
         ]
     })
 }
@@ -122,12 +128,15 @@ fn card(found: &str) -> Vec<(usize, usize)> {
             if digits > 19 {
                 break;
             }
-            let shaped = if first == last {
-                (13..=19).contains(&length)
-            } else {
-                groups[first..=last]
-                    .iter()
-                    .all(|(from, to)| (3..=6).contains(&(to - from)))
+            let lengths: Vec<usize> = groups[first..=last]
+                .iter()
+                .map(|(from, to)| to - from)
+                .collect();
+            let shaped = match lengths.as_slice() {
+                [one] => (13..=19).contains(one),
+                [4, 6, 4] | [4, 6, 5] => true,
+                [4, 4, 4, last] | [4, 4, 4, 4, last] => (1..=4).contains(last),
+                _ => false,
             };
             let (from, to) = (groups[first].0, groups[last].1);
             if shaped && digits >= 13 && luhn(&found[from..to]) {
@@ -138,6 +147,29 @@ fn card(found: &str) -> Vec<(usize, usize)> {
             }
         }
     }
+    // A card's window can end inside a phone number that follows it; the
+    // whole phone number goes with the card rather than leaving its rest.
+    for span in spans.iter_mut() {
+        let (from, to) = *span;
+        let inside = groups
+            .iter()
+            .map(|&(group, _)| group)
+            .filter(|&group| from < group && group < to);
+        for group in inside {
+            if let Some(found_phone) = phone().find_at(found, group) {
+                if found_phone.start() == group {
+                    span.1 = span.1.max(found_phone.end());
+                }
+            }
+        }
+    }
+    spans.dedup_by(|later, earlier| {
+        let joined = later.0 <= earlier.1;
+        if joined {
+            earlier.1 = earlier.1.max(later.1);
+        }
+        joined
+    });
     spans
 }
 
@@ -252,11 +284,14 @@ fn redact_json(redactor: &dyn Redactor, body: &[u8]) -> Option<Option<Vec<u8>>> 
     Some(serde_json::to_vec(&value).ok())
 }
 
+/// A whole number of 13 to 19 digits whose first is a card network's (2 to
+/// 6); millisecond timestamps start with 1.
 fn card_shaped(number: &serde_json::Number) -> bool {
-    let digits = number.to_string();
+    let text = number.to_string();
+    let digits = text.strip_prefix('-').unwrap_or(&text);
     (13..=19).contains(&digits.len())
         && digits.bytes().all(|b| b.is_ascii_digit())
-        && matches!(digits.as_bytes()[0], b'3'..=b'6')
+        && matches!(digits.as_bytes()[0], b'2'..=b'6')
 }
 
 /// Parses only when no object in the JSON gives a key twice.
@@ -428,7 +463,8 @@ mod tests {
 
     #[test]
     fn a_card_is_redacted_whole_with_what_follows_it_kept() {
-        assert_eq!(redact("card 4111 1111 1111 1111 123"), "card [CARD] 123");
+        // A security code after a card goes with it: it is as private.
+        assert_eq!(redact("card 4111 1111 1111 1111 123"), "card [CARD]");
         assert_eq!(
             redact("card 4111 1111 1111 1111 12/26"),
             "card [CARD] 12/26"
@@ -461,6 +497,28 @@ mod tests {
                 "{text} -> {redacted}"
             );
         }
+    }
+
+    #[test]
+    fn a_card_never_takes_part_of_the_number_after_it() {
+        assert_eq!(
+            redact("card 4111 1111 1111 1111 101-45-6789"),
+            "card [CARD] [NATIONAL_ID]"
+        );
+        let beside_phone = redact("card 4111 1111 1111 1111 101 555 0134");
+        assert!(
+            !beside_phone.contains("555") && !beside_phone.contains("0134"),
+            "{beside_phone}"
+        );
+    }
+
+    #[test]
+    fn cards_sent_as_numbers_from_every_network_are_redacted() {
+        let redacted = body(
+            serde_json::json!({"mastercard": 2223000048400011u64, "negative": -4111111111111111i64}),
+        );
+        assert_eq!(redacted["mastercard"], "[CARD]");
+        assert_eq!(redacted["negative"], "-[CARD]");
     }
 
     #[test]

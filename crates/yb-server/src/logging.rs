@@ -58,10 +58,13 @@ pub(crate) async fn put_level(
         state.logging.apply(level)?;
         if let Err(e) = state.store.set_log_level(level).await {
             // Not kept, so not run either.
-            let _ = match before {
+            let undone = match before {
                 Some(before) => state.logging.apply(before),
                 None => state.logging.reset(),
             };
+            if let Err(undo) = undone {
+                tracing::warn!(error = %undo, "a log level that could not be kept is still applied");
+            }
             return Err(e);
         }
         Ok(())
