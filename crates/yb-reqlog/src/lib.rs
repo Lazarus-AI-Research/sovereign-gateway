@@ -644,13 +644,20 @@ impl Worker {
             let path = self.shards_dir.join(format!("{}.parquet", shard_stamp()));
             let partial = path.with_extension("parquet.partial");
             let partial_sql = partial.to_string_lossy().replace('\'', "''");
-            self.conn
+            let sealed_shard = self
+                .conn
                 .execute_batch(&format!(
                     "COPY (SELECT * FROM turns) TO '{partial_sql}' (FORMAT parquet, COMPRESSION zstd)"
                 ))
-                .map_err(map_db)?;
-            std::fs::rename(&partial, &path)
-                .map_err(|e| Error::Storage(format!("reqlog: seal shard: {e}")))?;
+                .map_err(map_db)
+                .and_then(|()| {
+                    std::fs::rename(&partial, &path)
+                        .map_err(|e| Error::Storage(format!("reqlog: seal shard: {e}")))
+                });
+            if let Err(e) = sealed_shard {
+                self.remove_partial_shards();
+                return Err(e);
+            }
             sealed = Some(path);
         }
 
@@ -705,7 +712,25 @@ impl Worker {
 
     /// Remove `*.parquet` shards whose mtime is older than the retention window.
     /// Best-effort: filesystem errors are ignored (logged at debug).
+    /// A shard left half written by a failed copy is never read, and would
+    /// otherwise outlive the retention period; the worker is its only
+    /// writer, so any left between rotations is abandoned.
+    fn remove_partial_shards(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.shards_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("partial") {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!(error = %e, path = %path.display(), "reqlog: removing a partial shard failed");
+                }
+            }
+        }
+    }
+
     fn prune(&self) {
+        self.remove_partial_shards();
         let retention_days = self.retention_days.load(Ordering::Relaxed);
         if retention_days == 0 {
             return;
@@ -1100,6 +1125,28 @@ mod tests {
         turn.request_id = "reused".into();
         logger.log(turn);
         assert_eq!(logger.export(&CaptureFilter::default()).unwrap().len(), 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A shard a failed copy left half written is removed at the next
+    /// rotation, whatever its age.
+    #[test]
+    fn a_half_written_shard_is_removed_at_the_next_rotation() {
+        let dir = scratch_dir();
+        let logger = capturing(
+            DuckLogger::new(ReqlogConfig {
+                dir: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let partial = dir.join("shards").join("crashed.parquet.partial");
+        std::fs::write(&partial, b"half").unwrap();
+        assert_eq!(logger.export(&CaptureFilter::default()).unwrap().len(), 0);
+        logger.log(record(1));
+        logger.force_rotate().unwrap();
+        assert!(!partial.exists());
+        assert_eq!(logger.export(&CaptureFilter::default()).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

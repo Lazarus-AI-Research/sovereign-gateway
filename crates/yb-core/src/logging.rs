@@ -36,6 +36,11 @@ impl LogLevel {
 /// Changes the level of the running process's logging.
 pub trait LogControl: Send + Sync {
     fn apply(&self, level: LogLevel) -> crate::Result<()>;
+
+    /// Back to the level the process started with, before any was set.
+    fn reset(&self) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 /// For a process whose logging is fixed, and for tests.

@@ -101,18 +101,36 @@ fn arg_or_default(args: &[String], idx: usize) -> String {
 /// A level an operator sets at runtime replaces it.
 fn init_tracing() -> Arc<dyn LogControl> {
     use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let builder = fmt().with_env_filter(filter).with_filter_reloading();
+    let initial = std::env::var(EnvFilter::DEFAULT_ENV)
+        .ok()
+        .filter(|directives| EnvFilter::try_new(directives).is_ok())
+        .unwrap_or_else(|| "info".to_string());
+    let builder = fmt()
+        .with_env_filter(EnvFilter::new(&initial))
+        .with_filter_reloading();
     let handle = builder.reload_handle();
     builder.init();
-    Arc::new(ReloadableLogging(Box::new(move |filter| {
-        handle.reload(filter).map_err(|e| e.to_string())
-    })))
+    Arc::new(ReloadableLogging {
+        initial,
+        reload: Box::new(move |filter| handle.reload(filter).map_err(|e| e.to_string())),
+    })
 }
 
 type Reload = Box<dyn Fn(tracing_subscriber::EnvFilter) -> Result<(), String> + Send + Sync>;
 
-struct ReloadableLogging(Reload);
+struct ReloadableLogging {
+    /// The filter the process started with, which a reset returns to.
+    initial: String,
+    reload: Reload,
+}
+
+impl ReloadableLogging {
+    fn load(&self, directives: &str) -> yb_core::Result<()> {
+        let filter = tracing_subscriber::EnvFilter::try_new(directives)
+            .map_err(|e| yb_core::Error::Internal(e.to_string()))?;
+        (self.reload)(filter).map_err(yb_core::Error::Internal)
+    }
+}
 
 impl LogControl for ReloadableLogging {
     /// Debug is for the gateway's own crates; the libraries under them stay at
@@ -125,9 +143,11 @@ impl LogControl for ReloadableLogging {
                 .to_string(),
             other => other.as_str().to_string(),
         };
-        let filter = tracing_subscriber::EnvFilter::try_new(directives)
-            .map_err(|e| yb_core::Error::Internal(e.to_string()))?;
-        (self.0)(filter).map_err(yb_core::Error::Internal)
+        self.load(&directives)
+    }
+
+    fn reset(&self) -> yb_core::Result<()> {
+        self.load(&self.initial)
     }
 }
 

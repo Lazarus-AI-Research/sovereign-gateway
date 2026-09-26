@@ -54,8 +54,17 @@ pub(crate) async fn put_level(
     let level = body.level;
     let change = tokio::spawn(async move {
         let _settings = state.settings.lock().await;
+        let before = state.store.log_level().await?;
         state.logging.apply(level)?;
-        state.store.set_log_level(level).await
+        if let Err(e) = state.store.set_log_level(level).await {
+            // Not kept, so not run either.
+            let _ = match before {
+                Some(before) => state.logging.apply(before),
+                None => state.logging.reset(),
+            };
+            return Err(e);
+        }
+        Ok(())
     });
     match change.await {
         Ok(Ok(())) => Json(body).into_response(),

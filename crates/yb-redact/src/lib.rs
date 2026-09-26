@@ -29,14 +29,14 @@ pub struct PatternRedactor;
 struct Rule {
     marker: &'static str,
     pattern: Regex,
-    /// Which part of a match is the value: all of it, a part, or none, for
-    /// shapes that are also common in ordinary text (a long number is not
-    /// always a card).
-    accept: fn(&str) -> Option<(usize, usize)>,
+    /// Which parts of a match are values, in order and apart: all of it, some
+    /// of it, or none, for shapes that are also common in ordinary text (a
+    /// long number is not always a card).
+    accept: fn(&str) -> Vec<(usize, usize)>,
 }
 
-fn always(found: &str) -> Option<(usize, usize)> {
-    Some((0, found.len()))
+fn always(found: &str) -> Vec<(usize, usize)> {
+    vec![(0, found.len())]
 }
 
 fn rules() -> &'static [Rule] {
@@ -74,7 +74,7 @@ fn rules() -> &'static [Rule] {
                 r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
                 always,
             ),
-            rule("[CARD]", r"\b(?:\d[ -]?){12,18}\d\b", card),
+            rule("[CARD]", r"\b\d+(?:[ -]\d+)*\b", card),
             rule("[NATIONAL_ID]", r"\b\d{3}-\d{2}-\d{4}\b", always),
             rule(
                 "[NATIONAL_ID]",
@@ -90,37 +90,55 @@ fn rules() -> &'static [Rule] {
     })
 }
 
-/// The card number in a run of digit groups, which can carry more around the
-/// card: a number before it, a security code or an expiry after it. Only whole
-/// groups are tried, longest first, so a long number that merely holds a
-/// valid card's digits somewhere inside it is not cut apart.
-fn card(found: &str) -> Option<(usize, usize)> {
-    let starts: Vec<usize> = std::iter::once(0)
-        .chain(
-            found
-                .char_indices()
-                .filter(|&(_, c)| c == ' ' || c == '-')
-                .map(|(i, _)| i + 1),
-        )
-        .collect();
-    let ends: Vec<usize> = found
+/// The card numbers in a run of digit groups, which can carry more around a
+/// card: numbers before it, a security code or an expiry after it. A card is
+/// one group of 13 to 19 digits, or several groups of 3 to 6 (4-4-4-4,
+/// 4-6-5 and the like), so grids of single digits are not read as cards.
+/// Every window of whole groups that passes Luhn is taken, and overlapping
+/// ones are joined: a number that happens to pass beside a card costs its
+/// digits rather than letting part of the card through.
+fn card(found: &str) -> Vec<(usize, usize)> {
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut start = None;
+    for (i, c) in found
         .char_indices()
-        .filter(|&(_, c)| c == ' ' || c == '-')
-        .map(|(i, _)| i)
-        .chain(std::iter::once(found.len()))
-        .collect();
-    let mut windows: Vec<(usize, usize)> = starts
-        .iter()
-        .flat_map(|&start| {
-            ends.iter()
-                .filter(move |&&end| end > start)
-                .map(move |&end| (start, end))
-        })
-        .collect();
-    windows.sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
-    windows
-        .into_iter()
-        .find(|&(start, end)| luhn(&found[start..end]))
+        .chain(std::iter::once((found.len(), ' ')))
+    {
+        match (c.is_ascii_digit(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(from)) => {
+                groups.push((from, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for first in 0..groups.len() {
+        let mut digits = 0;
+        for last in first..groups.len() {
+            let length = groups[last].1 - groups[last].0;
+            digits += length;
+            if digits > 19 {
+                break;
+            }
+            let shaped = if first == last {
+                (13..=19).contains(&length)
+            } else {
+                groups[first..=last]
+                    .iter()
+                    .all(|(from, to)| (3..=6).contains(&(to - from)))
+            };
+            let (from, to) = (groups[first].0, groups[last].1);
+            if shaped && digits >= 13 && luhn(&found[from..to]) {
+                match spans.last_mut() {
+                    Some(span) if from <= span.1 => span.1 = span.1.max(to),
+                    _ => spans.push((from, to)),
+                }
+            }
+        }
+    }
+    spans
 }
 
 /// Payment card numbers carry a Luhn check digit; most long numbers do not.
@@ -158,11 +176,17 @@ impl Redactor for PatternRedactor {
             }
             let replaced = rule
                 .pattern
-                .replace_all(&out, |found: &Captures| match (rule.accept)(&found[0]) {
-                    Some((start, end)) => {
-                        format!("{}{}{}", &found[0][..start], rule.marker, &found[0][end..])
+                .replace_all(&out, |found: &Captures| {
+                    let text = &found[0];
+                    let mut replaced = String::with_capacity(text.len());
+                    let mut kept = 0;
+                    for (start, end) in (rule.accept)(text) {
+                        replaced.push_str(&text[kept..start]);
+                        replaced.push_str(rule.marker);
+                        kept = end;
                     }
-                    None => found[0].to_string(),
+                    replaced.push_str(&text[kept..]);
+                    replaced
                 })
                 .into_owned();
             out = Cow::Owned(replaced);
@@ -219,10 +243,74 @@ fn redact_json(redactor: &dyn Redactor, body: &[u8]) -> Option<Option<Vec<u8>>> 
     if !(value.is_object() || value.is_array()) {
         return None;
     }
-    if !redact_value(redactor, &mut value) {
+    // A key given twice parses to its last value only; the body as it came
+    // would keep the earlier ones unread, so it is written back instead.
+    let duplicated = serde_json::from_slice::<UniqueKeys>(body).is_err();
+    if !redact_value(redactor, &mut value) && !duplicated {
         return Some(None);
     }
     Some(serde_json::to_vec(&value).ok())
+}
+
+fn card_shaped(number: &serde_json::Number) -> bool {
+    let digits = number.to_string();
+    (13..=19).contains(&digits.len())
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && matches!(digits.as_bytes()[0], b'3'..=b'6')
+}
+
+/// Parses only when no object in the JSON gives a key twice.
+struct UniqueKeys;
+
+impl<'de> serde::Deserialize<'de> for UniqueKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueKeysVisitor)
+    }
+}
+
+struct UniqueKeysVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UniqueKeysVisitor {
+    type Value = UniqueKeys;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("JSON without a repeated key")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<UniqueKeys, A::Error> {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key) {
+                return Err(serde::de::Error::custom("a key is repeated"));
+            }
+            map.next_value::<UniqueKeys>()?;
+        }
+        Ok(UniqueKeys)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<UniqueKeys, A::Error> {
+        while seq.next_element::<UniqueKeys>()?.is_some() {}
+        Ok(UniqueKeys)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_unit<E>(self) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
 }
 
 /// Whether anything in the value was redacted. A number that holds
@@ -237,7 +325,9 @@ fn redact_value(redactor: &dyn Redactor, value: &mut serde_json::Value) -> bool 
             }
             _ => false,
         },
-        serde_json::Value::Number(number) => {
+        // Only a whole number shaped like a card, which a tool call's
+        // arguments can carry; timestamps and counts are left as numbers.
+        serde_json::Value::Number(number) if card_shaped(number) => {
             let digits = number.to_string();
             match redactor.redact(&digits) {
                 Cow::Owned(redacted) if redacted != digits => {
@@ -353,6 +443,45 @@ mod tests {
         assert_eq!(redact("order 12 4111111111111111"), "order 12 [CARD]");
         // A 19-digit id is a card only when all of it passes Luhn.
         assert_eq!(redact("id 1234567890123456789"), "id 1234567890123456789");
+    }
+
+    #[test]
+    fn a_grouped_card_after_other_grouped_numbers_is_found() {
+        for (text, card) in [
+            ("ref 12345 3782 822463 10005", "3782 822463 10005"),
+            ("acct 99887 4111-1111-1111-1111", "4111-1111-1111-1111"),
+            (
+                "invoice 2026 0925 4111 1111 1111 1111",
+                "4111 1111 1111 1111",
+            ),
+        ] {
+            let redacted = redact(text);
+            assert!(
+                redacted.contains("[CARD]") && !redacted.contains(card),
+                "{text} -> {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn grids_timestamps_and_counts_are_not_cards() {
+        assert_eq!(
+            redact("1 0 1 1 0 1 0 0 1 1 1 0 1 0 1 1 0 1 1"),
+            "1 0 1 1 0 1 0 0 1 1 1 0 1 0 1 1 0 1 1"
+        );
+        let kept = br#"{"created_ms":1727300000009,"count":4111}"#;
+        assert_eq!(redact_body(&PatternRedactor, kept), kept);
+    }
+
+    #[test]
+    fn a_repeated_key_cannot_hide_a_value() {
+        for repeated in [
+            &br#"{"note":"ada@example.com","note":"x"}"#[..],
+            &b"data: {\"d\":\"ada@example.com\",\"d\":\"x\"}"[..],
+        ] {
+            let stored = String::from_utf8(redact_body(&PatternRedactor, repeated)).unwrap();
+            assert!(!stored.contains("ada@example.com"), "{stored}");
+        }
     }
 
     #[test]
