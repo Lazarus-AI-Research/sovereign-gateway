@@ -7,9 +7,11 @@
 //! such as API keys, tokens and private keys. Each is replaced by a marker
 //! naming what was there, so a dataset keeps its shape without the value.
 //!
-//! Redaction runs on captured bodies as JSON text. Every marker is plain
-//! ASCII without quotes or backslashes, so a redacted body is still valid
-//! JSON.
+//! A captured body is redacted through [`redact_body`]: a JSON body (or each
+//! JSON event of a stream) is decoded, every string in it is redacted as the
+//! text it stands for, and the body is written back. Redacting the encoded
+//! text instead would read an escape such as `\n` as part of the word after
+//! it, and a pattern could miss the value or cut through the escape.
 
 use regex::{Captures, Regex};
 use std::borrow::Cow;
@@ -27,13 +29,14 @@ pub struct PatternRedactor;
 struct Rule {
     marker: &'static str,
     pattern: Regex,
-    /// A further check a match must pass, for shapes that are also common
-    /// in ordinary text (a long number is not always a card).
-    accept: fn(&str) -> bool,
+    /// How much of a match is the value: its whole length, a shorter
+    /// prefix, or none of it, for shapes that are also common in ordinary
+    /// text (a long number is not always a card).
+    accept: fn(&str) -> Option<usize>,
 }
 
-fn always(_: &str) -> bool {
-    true
+fn always(found: &str) -> Option<usize> {
+    Some(found.len())
 }
 
 fn rules() -> &'static [Rule] {
@@ -71,7 +74,7 @@ fn rules() -> &'static [Rule] {
                 r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
                 always,
             ),
-            rule("[CARD]", r"\b(?:\d[ -]?){12,18}\d\b", luhn),
+            rule("[CARD]", r"\b(?:\d[ -]?){12,18}\d\b", card),
             rule("[NATIONAL_ID]", r"\b\d{3}-\d{2}-\d{4}\b", always),
             rule(
                 "[NATIONAL_ID]",
@@ -85,6 +88,19 @@ fn rules() -> &'static [Rule] {
             ),
         ]
     })
+}
+
+/// The longest prefix of a run of digits that is a card number: a run can
+/// carry more after the card, such as its security code.
+fn card(found: &str) -> Option<usize> {
+    found
+        .char_indices()
+        .filter(|(_, c)| c.is_ascii_digit())
+        .map(|(i, _)| i + 1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .find(|&end| luhn(&found[..end]))
 }
 
 /// Payment card numbers carry a Luhn check digit; most long numbers do not.
@@ -122,17 +138,65 @@ impl Redactor for PatternRedactor {
             }
             let replaced = rule
                 .pattern
-                .replace_all(&out, |found: &Captures| {
-                    if (rule.accept)(&found[0]) {
-                        rule.marker.to_string()
-                    } else {
-                        found[0].to_string()
-                    }
+                .replace_all(&out, |found: &Captures| match (rule.accept)(&found[0]) {
+                    Some(end) => format!("{}{}", rule.marker, &found[0][end..]),
+                    None => found[0].to_string(),
                 })
                 .into_owned();
             out = Cow::Owned(replaced);
         }
         out
+    }
+}
+
+/// A captured body with its personal data taken out. A JSON body keeps its
+/// shape with every string redacted; a stream is taken line by line, each
+/// `data:` event as JSON where it is; anything else is redacted as text.
+pub fn redact_body(redactor: &dyn Redactor, body: &[u8]) -> Vec<u8> {
+    if let Some(redacted) = redact_json(redactor, body) {
+        return redacted;
+    }
+    let text = String::from_utf8_lossy(body);
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|line| {
+            let (prefix, rest) = match line.strip_prefix("data:") {
+                Some(rest) => ("data:", rest),
+                None => ("", line),
+            };
+            let leading = &rest[..rest.len() - rest.trim_start().len()];
+            match redact_json(redactor, rest.trim_start().as_bytes()) {
+                Some(json) => format!("{prefix}{leading}{}", String::from_utf8_lossy(&json)),
+                None => format!("{prefix}{}", redactor.redact(rest)),
+            }
+        })
+        .collect();
+    lines.join("\n").into_bytes()
+}
+
+fn redact_json(redactor: &dyn Redactor, body: &[u8]) -> Option<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if !(value.is_object() || value.is_array()) {
+        return None;
+    }
+    redact_strings(redactor, &mut value);
+    serde_json::to_vec(&value).ok()
+}
+
+fn redact_strings(redactor: &dyn Redactor, value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Cow::Owned(redacted) = redactor.redact(text) {
+                *text = redacted;
+            }
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_strings(redactor, item)),
+        serde_json::Value::Object(fields) => fields
+            .values_mut()
+            .for_each(|field| redact_strings(redactor, field)),
+        _ => {}
     }
 }
 
@@ -184,44 +248,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_redacted_json_body_is_still_json() {
-        let body = r#"{"messages":[{"role":"user","content":"I am ada@example.com, card 4111-1111-1111-1111"}]}"#;
-        let redacted = redact(body);
-        assert!(redacted.contains("[EMAIL]") && redacted.contains("[CARD]"));
-        let value: serde_json_check::Value = serde_json_check::from_str(&redacted);
-        assert!(value.ok);
+    fn body(value: serde_json::Value) -> serde_json::Value {
+        let bytes = redact_body(&PatternRedactor, &serde_json::to_vec(&value).unwrap());
+        serde_json::from_slice(&bytes).expect("a redacted body is still JSON")
     }
 
-    // A tiny JSON validity check without a serde dependency.
-    mod serde_json_check {
-        pub struct Value {
-            pub ok: bool,
-        }
-        pub fn from_str(s: &str) -> Value {
-            let mut depth = 0i32;
-            let mut in_string = false;
-            let mut escaped = false;
-            for c in s.chars() {
-                if in_string {
-                    match (escaped, c) {
-                        (true, _) => escaped = false,
-                        (false, '\\') => escaped = true,
-                        (false, '"') => in_string = false,
-                        _ => {}
-                    }
-                    continue;
-                }
-                match c {
-                    '"' => in_string = true,
-                    '{' | '[' => depth += 1,
-                    '}' | ']' => depth -= 1,
-                    _ => {}
-                }
-            }
-            Value {
-                ok: depth == 0 && !in_string,
-            }
-        }
+    #[test]
+    fn values_after_an_escape_are_redacted_and_the_body_stays_json() {
+        let redacted = body(serde_json::json!({"messages": [{"role": "user", "content":
+            "my key:\nsk-abcdefghijklmnop1234\nssn:\n123-45-6789\nmail:\nada@example.com\ncall:\n415 555 0134\ntok:\teyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N"}]}));
+        assert_eq!(
+            redacted["messages"][0]["content"],
+            "my key:\n[SECRET]\nssn:\n[NATIONAL_ID]\nmail:\n[EMAIL]\ncall:\n[PHONE]\ntok:\t[SECRET]"
+        );
+    }
+
+    #[test]
+    fn a_card_is_redacted_whole_with_what_follows_it_kept() {
+        assert_eq!(redact("card 4111 1111 1111 1111 123"), "card [CARD] 123");
+        assert_eq!(
+            redact("card 4111 1111 1111 1111 12/26"),
+            "card [CARD] 12/26"
+        );
+        assert_eq!(redact("card:\n4111 1111 1111 1111"), "card:\n[CARD]");
+    }
+
+    #[test]
+    fn a_stream_is_redacted_event_by_event() {
+        let stream = b"data: {\"delta\":\"write to\\nada@example.com\"}\n\ndata: [DONE]\n";
+        let redacted = String::from_utf8(redact_body(&PatternRedactor, stream)).unwrap();
+        assert_eq!(
+            redacted,
+            "data: {\"delta\":\"write to\\n[EMAIL]\"}\n\ndata: [DONE]\n"
+        );
     }
 }

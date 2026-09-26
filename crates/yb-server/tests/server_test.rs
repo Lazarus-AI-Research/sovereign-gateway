@@ -122,6 +122,7 @@ async fn setup() -> (AppState, String) {
         ratelimit_enabled: false,
         request_log: Arc::new(NullLogger),
         logging: Arc::new(yb_core::FixedLogging),
+        settings: Default::default(),
     };
 
     (state, issued.token)
@@ -405,6 +406,7 @@ async fn setup_auth_ts(
         ratelimit_enabled: false,
         request_log: Arc::new(NullLogger),
         logging: Arc::new(yb_core::FixedLogging),
+        settings: Default::default(),
     }
 }
 
@@ -1853,7 +1855,7 @@ async fn the_log_level_is_applied_at_once_and_kept() {
     let app = build_router(state);
     let (status, got) = get_json(&app, "/admin/v1/log-level", &cookie).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(got["level"], "info", "info until one is set");
+    assert!(got["level"].is_null(), "none until one is set");
 
     let put = |body: Value| {
         Request::builder()
@@ -1885,4 +1887,47 @@ async fn the_log_level_is_applied_at_once_and_kept() {
         1,
         "a refused level is not applied"
     );
+}
+
+/// A trailing comma costs no tags; a key with `:` in it, which an export's
+/// `tag=name:value` could never name, is refused.
+#[test]
+fn tags_parse_past_an_empty_segment_and_refuse_a_colon_in_a_key() {
+    assert_eq!(
+        yb_server::parse_tags("space=s1,conversation=c2,").as_deref(),
+        Some(r#"{"conversation":"c2","space":"s1"}"#)
+    );
+    assert_eq!(yb_server::parse_tags("ns:space=x"), None);
+    assert_eq!(
+        yb_server::parse_tags("space=a:b").as_deref(),
+        Some(r#"{"space":"a:b"}"#)
+    );
+}
+
+/// Capture cannot be turned on without a request log to keep it in; the
+/// policy reported says it is unavailable.
+#[tokio::test]
+async fn capture_is_refused_without_a_request_log() {
+    let (state, _) = setup().await;
+    let cookie = admin_cookie(state.store.as_ref()).await;
+    let app = build_router(state);
+    let (status, got) = get_json(&app, "/admin/v1/capture", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got["available"], false);
+    assert_eq!(got["enabled"], false);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/v1/capture")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"enabled":true,"redaction":"patterns","retention_days":7}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }

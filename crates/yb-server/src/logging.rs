@@ -14,6 +14,12 @@ pub(crate) struct Level {
     level: LogLevel,
 }
 
+/// No level until an operator sets one: the environment's filter applies.
+#[derive(Serialize)]
+struct Kept {
+    level: Option<LogLevel>,
+}
+
 fn refused(principal: &Principal) -> Option<Response> {
     (!principal.is_admin()).then(|| {
         error_response(&Error::Forbidden(
@@ -22,16 +28,14 @@ fn refused(principal: &Principal) -> Option<Response> {
     })
 }
 
-/// `GET /log-level` — the level in force; info until one is set.
+/// `GET /log-level` — the level an operator set; null while `RUST_LOG` (or
+/// info) applies.
 pub(crate) async fn get_level(principal: Principal, State(state): State<AppState>) -> Response {
     if let Some(refusal) = refused(&principal) {
         return refusal;
     }
     match state.store.log_level().await {
-        Ok(level) => Json(Level {
-            level: level.unwrap_or_default(),
-        })
-        .into_response(),
+        Ok(level) => Json(Kept { level }).into_response(),
         Err(e) => error_response(&e),
     }
 }
@@ -45,6 +49,7 @@ pub(crate) async fn put_level(
     if let Some(refusal) = refused(&principal) {
         return refusal;
     }
+    let _settings = state.settings.lock().await;
     if let Err(e) = state.store.set_log_level(body.level).await {
         return error_response(&e);
     }

@@ -22,15 +22,20 @@ fn refused(principal: &Principal) -> Option<Response> {
     })
 }
 
-/// `GET /capture` — the policy in force.
+/// `GET /capture` — the policy in force, and whether capture is available
+/// at all (it needs the request log).
 pub(crate) async fn get_policy(principal: Principal, State(state): State<AppState>) -> Response {
     if let Some(refusal) = refused(&principal) {
         return refusal;
     }
-    match state.store.capture_policy().await {
-        Ok(policy) => Json(policy).into_response(),
-        Err(e) => error_response(&e),
-    }
+    let policy = state.request_log.policy();
+    Json(json!({
+        "enabled": policy.enabled,
+        "redaction": policy.redaction,
+        "retention_days": policy.retention_days,
+        "available": state.request_log.captures(),
+    }))
+    .into_response()
 }
 
 /// `PUT /capture` — a new policy, kept and applied at once.
@@ -42,6 +47,14 @@ pub(crate) async fn put_policy(
     if let Some(refusal) = refused(&principal) {
         return refusal;
     }
+    if policy.enabled && !state.request_log.captures() {
+        return error_response(&Error::Conflict(
+            "capture needs the request log: set [reqlog] enabled = true".into(),
+        ));
+    }
+    // Kept and applied under one lock, so two changes cannot leave the
+    // process running one and the database holding the other.
+    let _settings = state.settings.lock().await;
     if let Err(e) = state.store.set_capture_policy(&policy).await {
         return error_response(&e);
     }

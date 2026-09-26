@@ -374,8 +374,11 @@ async fn run_serve(
     // --- 4. upstream client + request log + telemetry + gateway --------------
     let client = build_upstream_client(cfg.upstream.mode);
     let logger: Arc<dyn RequestLogger> = build_reqlog(&cfg.reqlog)?;
-    // Capture follows the policy an operator last set, off until one does.
-    logger.apply_policy(&store.capture_policy().await?);
+    // Capture follows the policy an operator last set; until one does it is
+    // off, with the retention the configuration gives.
+    if let Some(policy) = store.capture_policy().await? {
+        logger.apply_policy(&policy);
+    }
     // As does the log level; the environment's until one is set.
     if let Some(level) = store.log_level().await? {
         logging.apply(level)?;
@@ -458,6 +461,7 @@ async fn run_serve(
         ratelimit_enabled: cfg.features.ratelimit_enabled,
         request_log: logger.clone(),
         logging,
+        settings: Default::default(),
     };
 
     let app = build_router(state);

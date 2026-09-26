@@ -42,7 +42,7 @@ use yb_core::{
     CaptureFilter, CapturePolicy, CapturedTurn, Error, Redaction, RequestLogRecord, RequestLogger,
     Result,
 };
-use yb_redact::{PatternRedactor, Redactor};
+use yb_redact::PatternRedactor;
 
 /// Tunables for the DuckDB logging sink.
 #[derive(Debug, Clone)]
@@ -140,10 +140,9 @@ enum Msg {
     Flush(Ack),
     Rotate(Ack),
     Count(mpsc::Sender<std::result::Result<u64, String>>),
-    Export(
-        Box<CaptureFilter>,
-        mpsc::Sender<std::result::Result<Vec<CapturedTurn>, String>>,
-    ),
+    /// Flushed, the worker hands back a connection of its own for the
+    /// export to read through, so a long export never holds up logging.
+    Export(mpsc::Sender<std::result::Result<(Connection, PathBuf), String>>),
     Shutdown(Ack),
 }
 
@@ -192,7 +191,11 @@ impl DuckLogger {
                 tx,
                 dropped,
                 worker: Mutex::new(Some(handle)),
-                policy: std::sync::RwLock::new(CapturePolicy::default()),
+                policy: std::sync::RwLock::new(CapturePolicy {
+                    enabled: false,
+                    retention_days: retention_days.load(Ordering::Relaxed),
+                    ..CapturePolicy::default()
+                }),
                 retention_days,
             }),
             Ok(Err(detail)) => {
@@ -278,6 +281,14 @@ impl RequestLogger for DuckLogger {
         }
     }
 
+    fn policy(&self) -> CapturePolicy {
+        *self.policy.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn captures(&self) -> bool {
+        true
+    }
+
     fn apply_policy(&self, policy: &CapturePolicy) {
         *self.policy.write().unwrap_or_else(|e| e.into_inner()) = *policy;
         self.retention_days
@@ -287,13 +298,104 @@ impl RequestLogger for DuckLogger {
     fn export(&self, filter: &CaptureFilter) -> Result<Vec<CapturedTurn>> {
         let (ack_tx, ack_rx) = mpsc::channel();
         self.tx
-            .send(Msg::Export(Box::new(filter.clone()), ack_tx))
+            .send(Msg::Export(ack_tx))
             .map_err(|_| Error::Internal("reqlog: worker is gone".into()))?;
-        ack_rx
+        let (conn, shards_dir) = ack_rx
             .recv()
             .map_err(|_| Error::Internal("reqlog: worker is gone".into()))?
-            .map_err(Error::Storage)
+            .map_err(Error::Storage)?;
+        export_turns(&conn, &shards_dir, filter)
     }
+}
+
+/// The captured turns the filter takes, from the write-ahead table and every
+/// shard, oldest first. A shard written before a column existed reads it as
+/// null, and a turn a rotation left in both places is taken once. Tags are
+/// matched here rather than in SQL: they are a small JSON object per turn.
+fn export_turns(
+    conn: &Connection,
+    shards_dir: &Path,
+    filter: &CaptureFilter,
+) -> Result<Vec<CapturedTurn>> {
+    let columns = "ts, request_id, surface, requested_model, api_key_id, user_id, tags, redaction, request_body, response_body, is_error";
+    let has_shards = std::fs::read_dir(shards_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("parquet"))
+        })
+        .unwrap_or(false);
+    let mut source = format!("SELECT {columns} FROM turns");
+    if has_shards {
+        let pattern = shards_dir.join("*.parquet");
+        let pattern = pattern.to_string_lossy().replace('\'', "''");
+        source.push_str(&format!(
+            " UNION ALL BY NAME SELECT * FROM read_parquet('{pattern}', union_by_name = true)"
+        ));
+    }
+    let mut conditions = vec!["NOT is_error".to_string()];
+    let mut values: Vec<String> = Vec::new();
+    let format = |t: &yb_core::Timestamp| t.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    if let Some(from) = &filter.from {
+        conditions.push("ts >= CAST(? AS TIMESTAMP)".into());
+        values.push(format(from));
+    }
+    if let Some(to) = &filter.to {
+        conditions.push("ts < CAST(? AS TIMESTAMP)".into());
+        values.push(format(to));
+    }
+    for (column, wanted) in [
+        ("requested_model", &filter.models),
+        ("api_key_id", &filter.api_key_ids),
+    ] {
+        if !wanted.is_empty() {
+            conditions.push(format!(
+                "{column} IN ({})",
+                vec!["?"; wanted.len()].join(", ")
+            ));
+            values.extend(wanted.iter().cloned());
+        }
+    }
+    if let Some(redaction) = &filter.redaction {
+        conditions.push("redaction = ?".into());
+        values.push(redaction.clone());
+    }
+    let query = format!(
+        "SELECT CAST(ts AS VARCHAR), request_id, surface, requested_model, api_key_id, user_id, tags, \
+         COALESCE(redaction, 'none'), request_body, response_body FROM ({source}) WHERE {} QUALIFY row_number() OVER (PARTITION BY request_id ORDER BY ts) = 1 ORDER BY ts",
+        conditions.join(" AND ")
+    );
+    let mut statement = conn.prepare(&query).map_err(map_db)?;
+    let rows = statement
+        .query_map(duckdb::params_from_iter(values.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                CapturedTurn {
+                    ts: yb_core::now(),
+                    request_id: row.get(1)?,
+                    surface: row.get(2)?,
+                    requested_model: row.get(3)?,
+                    api_key_id: row.get(4)?,
+                    user_id: row.get(5)?,
+                    tags: row.get(6)?,
+                    redaction: row.get(7)?,
+                    request_body: row.get::<_, Option<Vec<u8>>>(8)?.unwrap_or_default(),
+                    response_body: row.get::<_, Option<Vec<u8>>>(9)?.unwrap_or_default(),
+                },
+            ))
+        })
+        .map_err(map_db)?;
+    let mut turns = Vec::new();
+    for row in rows {
+        let (ts, mut turn) = row.map_err(map_db)?;
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S%.f") {
+            turn.ts = parsed.and_utc();
+        }
+        if tags_match(turn.tags.as_deref(), &filter.tags) {
+            turns.push(turn);
+        }
+    }
+    Ok(turns)
 }
 
 /// The policy's redaction, applied to both bodies before a record is queued.
@@ -307,11 +409,7 @@ fn redact(record: &mut RequestLogRecord, redaction: Redaction) {
         }
         Redaction::Patterns => {
             for body in [&mut record.request_body, &mut record.response_body] {
-                let text = String::from_utf8_lossy(body);
-                let redacted = PatternRedactor.redact(&text);
-                if redacted != text {
-                    *body = redacted.into_owned().into_bytes();
-                }
+                *body = yb_redact::redact_body(&PatternRedactor, body);
             }
         }
     }
@@ -401,8 +499,11 @@ impl Worker {
                     let r = self.flush().and_then(|()| self.count());
                     let _ = ack.send(r.map_err(|e| e.to_string()));
                 }
-                Ok(Msg::Export(filter, ack)) => {
-                    let r = self.flush().and_then(|()| self.export(&filter));
+                Ok(Msg::Export(ack)) => {
+                    let r = self.flush().and_then(|()| {
+                        let conn = self.conn.try_clone().map_err(map_db)?;
+                        Ok((conn, self.shards_dir.clone()))
+                    });
                     let _ = ack.send(r.map_err(|e| e.to_string()));
                 }
                 Ok(Msg::Shutdown(ack)) => {
@@ -419,91 +520,6 @@ impl Worker {
                 }
             }
         }
-    }
-
-    /// The captured turns the filter takes, from the buffer and every shard,
-    /// oldest first. Tags are matched here rather than in SQL: they are a
-    /// small JSON object per turn.
-    fn export(&self, filter: &CaptureFilter) -> Result<Vec<CapturedTurn>> {
-        let columns = "ts, request_id, surface, requested_model, api_key_id, user_id, tags, redaction, request_body, response_body, is_error";
-        let has_shards = std::fs::read_dir(&self.shards_dir)
-            .map(|entries| {
-                entries.flatten().any(|entry| {
-                    entry.path().extension().and_then(|e| e.to_str()) == Some("parquet")
-                })
-            })
-            .unwrap_or(false);
-        let mut source = format!("SELECT {columns} FROM turns");
-        if has_shards {
-            let pattern = self.shards_dir.join("*.parquet");
-            let pattern = pattern.to_string_lossy().replace('\'', "''");
-            source.push_str(&format!(
-                " UNION ALL BY NAME SELECT {columns} FROM read_parquet('{pattern}', union_by_name = true)"
-            ));
-        }
-        let mut conditions = vec!["NOT is_error".to_string()];
-        let mut values: Vec<String> = Vec::new();
-        let format = |t: &yb_core::Timestamp| t.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-        if let Some(from) = &filter.from {
-            conditions.push("ts >= CAST(? AS TIMESTAMP)".into());
-            values.push(format(from));
-        }
-        if let Some(to) = &filter.to {
-            conditions.push("ts < CAST(? AS TIMESTAMP)".into());
-            values.push(format(to));
-        }
-        for (column, wanted) in [
-            ("requested_model", &filter.models),
-            ("api_key_id", &filter.api_key_ids),
-        ] {
-            if !wanted.is_empty() {
-                conditions.push(format!(
-                    "{column} IN ({})",
-                    vec!["?"; wanted.len()].join(", ")
-                ));
-                values.extend(wanted.iter().cloned());
-            }
-        }
-        if let Some(redaction) = &filter.redaction {
-            conditions.push("redaction = ?".into());
-            values.push(redaction.clone());
-        }
-        let query = format!(
-            "SELECT CAST(ts AS VARCHAR), request_id, surface, requested_model, api_key_id, user_id, tags, \
-             COALESCE(redaction, 'none'), request_body, response_body FROM ({source}) WHERE {} ORDER BY ts",
-            conditions.join(" AND ")
-        );
-        let mut statement = self.conn.prepare(&query).map_err(map_db)?;
-        let rows = statement
-            .query_map(duckdb::params_from_iter(values.iter()), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    CapturedTurn {
-                        ts: yb_core::now(),
-                        request_id: row.get(1)?,
-                        surface: row.get(2)?,
-                        requested_model: row.get(3)?,
-                        api_key_id: row.get(4)?,
-                        user_id: row.get(5)?,
-                        tags: row.get(6)?,
-                        redaction: row.get(7)?,
-                        request_body: row.get::<_, Option<Vec<u8>>>(8)?.unwrap_or_default(),
-                        response_body: row.get::<_, Option<Vec<u8>>>(9)?.unwrap_or_default(),
-                    },
-                ))
-            })
-            .map_err(map_db)?;
-        let mut turns = Vec::new();
-        for row in rows {
-            let (ts, mut turn) = row.map_err(map_db)?;
-            if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S%.f") {
-                turn.ts = parsed.and_utc();
-            }
-            if tags_match(turn.tags.as_deref(), &filter.tags) {
-                turns.push(turn);
-            }
-        }
-        Ok(turns)
     }
 
     /// Flush, logging (but not propagating) any error — used on the timer and
@@ -999,6 +1015,57 @@ mod tests {
             .unwrap();
         assert_eq!(in_space.len(), 1);
         assert_eq!(in_space[0].api_key_id.as_deref(), Some("key-a"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A shard written before capture reads its new columns as null, so an
+    /// installation that logged requests before upgrading can still export.
+    #[test]
+    fn a_shard_from_before_capture_is_exported_beside_new_ones() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(dir.join("shards")).unwrap();
+        let old = duckdb::Connection::open_in_memory().unwrap();
+        let shard = dir.join("shards").join("old.parquet");
+        old.execute_batch(&format!(
+            "CREATE TABLE turns AS SELECT TIMESTAMP '2026-01-01 00:00:00' AS ts, 'old-1' AS request_id, \
+             'anthropic' AS surface, 'claude' AS requested_model, false AS is_error, \
+             'hello'::BLOB AS request_body, 'hi'::BLOB AS response_body; \
+             COPY turns TO '{}' (FORMAT parquet)",
+            shard.display()
+        ))
+        .unwrap();
+        let logger = DuckLogger::new(ReqlogConfig {
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        let only_old = logger.export(&CaptureFilter::default()).unwrap();
+        assert_eq!(only_old.len(), 1, "an old shard alone exports");
+        assert_eq!(only_old[0].request_id, "old-1");
+        let logger = capturing(logger);
+        logger.log(record(1));
+        logger.force_rotate().unwrap();
+        logger.log(record(2));
+        let all = logger.export(&CaptureFilter::default()).unwrap();
+        assert_eq!(all.len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Until an operator sets a policy, capture is off and the retention is
+    /// the configuration's: an upgrade never shortens it.
+    #[test]
+    fn the_configured_retention_holds_until_a_policy_is_set() {
+        let dir = scratch_dir();
+        let logger = DuckLogger::new(ReqlogConfig {
+            dir: dir.clone(),
+            retention_days: 365,
+            ..Default::default()
+        })
+        .unwrap();
+        let policy = logger.policy();
+        assert!(!policy.enabled);
+        assert_eq!(policy.retention_days, 365);
+        assert!(logger.captures());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -210,8 +210,8 @@ impl Store for RecordingStore {
     async fn spend_rows(&self) -> Result<Vec<SpendRow>> {
         Ok(vec![])
     }
-    async fn capture_policy(&self) -> Result<yb_core::CapturePolicy> {
-        Ok(Default::default())
+    async fn capture_policy(&self) -> Result<Option<yb_core::CapturePolicy>> {
+        Ok(None)
     }
     async fn set_capture_policy(&self, _policy: &yb_core::CapturePolicy) -> Result<()> {
         Ok(())
