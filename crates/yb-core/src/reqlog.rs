@@ -76,6 +76,20 @@ pub trait RequestLogger: Send + Sync {
     /// Whether and how turns are captured from now on.
     fn apply_policy(&self, _policy: &crate::CapturePolicy) {}
 
+    /// The policy in force; off for a logger that keeps nothing.
+    fn policy(&self) -> crate::CapturePolicy {
+        crate::CapturePolicy {
+            enabled: false,
+            ..Default::default()
+        }
+    }
+
+    /// Whether this logger can capture at all; one that discards everything
+    /// cannot be turned on.
+    fn captures(&self) -> bool {
+        false
+    }
+
     /// The successful captured turns the filter takes, oldest first.
     fn export(&self, _filter: &CaptureFilter) -> crate::Result<Vec<CapturedTurn>> {
         Ok(Vec::new())

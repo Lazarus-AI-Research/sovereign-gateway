@@ -959,7 +959,7 @@ impl Store for SqliteStore {
             .collect()
     }
 
-    async fn capture_policy(&self) -> Result<yb_core::CapturePolicy> {
+    async fn capture_policy(&self) -> Result<Option<yb_core::CapturePolicy>> {
         let row = sqlx::query(
             "SELECT enabled, redaction, retention_days FROM capture_policy WHERE id = 1",
         )
@@ -967,18 +967,18 @@ impl Store for SqliteStore {
         .await
         .map_err(storage_err)?;
         let Some(row) = row else {
-            return Ok(yb_core::CapturePolicy::default());
+            return Ok(None);
         };
         let redaction: String = row.try_get("redaction").map_err(storage_err)?;
         let retention: i64 = row
             .try_get::<i64, _>("retention_days")
             .or_else(|_| row.try_get::<i32, _>("retention_days").map(i64::from))
             .map_err(storage_err)?;
-        Ok(yb_core::CapturePolicy {
+        Ok(Some(yb_core::CapturePolicy {
             enabled: row.try_get::<bool, _>("enabled").map_err(storage_err)?,
             redaction: yb_core::Redaction::parse(&redaction).unwrap_or_default(),
             retention_days: retention.max(0) as u32,
-        })
+        }))
     }
 
     async fn log_level(&self) -> Result<Option<yb_core::LogLevel>> {

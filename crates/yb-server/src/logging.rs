@@ -14,6 +14,12 @@ pub(crate) struct Level {
     level: LogLevel,
 }
 
+/// No level until an operator sets one: the environment's filter applies.
+#[derive(Serialize)]
+struct Kept {
+    level: Option<LogLevel>,
+}
+
 fn refused(principal: &Principal) -> Option<Response> {
     (!principal.is_admin()).then(|| {
         error_response(&Error::Forbidden(
@@ -22,16 +28,14 @@ fn refused(principal: &Principal) -> Option<Response> {
     })
 }
 
-/// `GET /log-level` — the level in force; info until one is set.
+/// `GET /log-level` — the level an operator set; null while `RUST_LOG` (or
+/// info) applies.
 pub(crate) async fn get_level(principal: Principal, State(state): State<AppState>) -> Response {
     if let Some(refusal) = refused(&principal) {
         return refusal;
     }
     match state.store.log_level().await {
-        Ok(level) => Json(Level {
-            level: level.unwrap_or_default(),
-        })
-        .into_response(),
+        Ok(level) => Json(Kept { level }).into_response(),
         Err(e) => error_response(&e),
     }
 }
@@ -45,11 +49,29 @@ pub(crate) async fn put_level(
     if let Some(refusal) = refused(&principal) {
         return refusal;
     }
-    if let Err(e) = state.store.set_log_level(body.level).await {
-        return error_response(&e);
+    // Applied before it is kept, so a level the process cannot take is never
+    // stored; under one lock and on a task of its own, as capture is.
+    let level = body.level;
+    let change = tokio::spawn(async move {
+        let _settings = state.settings.lock().await;
+        let before = state.store.log_level().await?;
+        state.logging.apply(level)?;
+        if let Err(e) = state.store.set_log_level(level).await {
+            // Not kept, so not run either.
+            let undone = match before {
+                Some(before) => state.logging.apply(before),
+                None => state.logging.reset(),
+            };
+            if let Err(undo) = undone {
+                tracing::warn!(error = %undo, "a log level that could not be kept is still applied");
+            }
+            return Err(e);
+        }
+        Ok(())
+    });
+    match change.await {
+        Ok(Ok(())) => Json(body).into_response(),
+        Ok(Err(e)) => error_response(&e),
+        Err(e) => error_response(&Error::Internal(e.to_string())),
     }
-    if let Err(e) = state.logging.apply(body.level) {
-        return error_response(&e);
-    }
-    Json(body).into_response()
 }

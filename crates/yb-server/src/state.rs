@@ -51,6 +51,8 @@ pub struct AppState {
     pub request_log: Arc<dyn RequestLogger>,
     /// Changes how much the running process logs.
     pub logging: Arc<dyn LogControl>,
+    /// Held while a runtime setting is kept and applied, so the two agree.
+    pub settings: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {

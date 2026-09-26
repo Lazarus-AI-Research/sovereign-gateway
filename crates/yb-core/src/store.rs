@@ -104,8 +104,8 @@ pub trait Store: Send + Sync {
     async fn upsert_budget(&self, budget: &Budget) -> crate::Result<()>;
     async fn delete_budget(&self, id: &str) -> crate::Result<()>;
     async fn spend_rows(&self) -> crate::Result<Vec<SpendRow>>;
-    /// The capture policy; the default (off) until one is set.
-    async fn capture_policy(&self) -> crate::Result<crate::CapturePolicy>;
+    /// The capture policy an operator set; none until one is.
+    async fn capture_policy(&self) -> crate::Result<Option<crate::CapturePolicy>>;
     async fn set_capture_policy(&self, policy: &crate::CapturePolicy) -> crate::Result<()>;
     /// The log level an operator set; none until one is.
     async fn log_level(&self) -> crate::Result<Option<crate::LogLevel>>;

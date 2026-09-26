@@ -7,9 +7,11 @@
 //! such as API keys, tokens and private keys. Each is replaced by a marker
 //! naming what was there, so a dataset keeps its shape without the value.
 //!
-//! Redaction runs on captured bodies as JSON text. Every marker is plain
-//! ASCII without quotes or backslashes, so a redacted body is still valid
-//! JSON.
+//! A captured body is redacted through [`redact_body`]: a JSON body (or each
+//! JSON event of a stream) is decoded, every string in it is redacted as the
+//! text it stands for, and the body is written back. Redacting the encoded
+//! text instead would read an escape such as `\n` as part of the word after
+//! it, and a pattern could miss the value or cut through the escape.
 
 use regex::{Captures, Regex};
 use std::borrow::Cow;
@@ -24,16 +26,25 @@ pub trait Redactor: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PatternRedactor;
 
+const PHONE: &str =
+    r"(?:\+\d{1,3}[ .-]?)?(?:\(\d{2,4}\)[ .-]?|\b\d{2,4}[ .-])\d{3,4}[ .-]\d{3,4}\b";
+
+fn phone() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(PHONE).expect("the phone pattern compiles"))
+}
+
 struct Rule {
     marker: &'static str,
     pattern: Regex,
-    /// A further check a match must pass, for shapes that are also common
-    /// in ordinary text (a long number is not always a card).
-    accept: fn(&str) -> bool,
+    /// Which parts of a match are values, in order and apart: all of it, some
+    /// of it, or none, for shapes that are also common in ordinary text (a
+    /// long number is not always a card).
+    accept: fn(&str) -> Vec<(usize, usize)>,
 }
 
-fn always(_: &str) -> bool {
-    true
+fn always(found: &str) -> Vec<(usize, usize)> {
+    vec![(0, found.len())]
 }
 
 fn rules() -> &'static [Rule] {
@@ -71,20 +82,101 @@ fn rules() -> &'static [Rule] {
                 r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
                 always,
             ),
-            rule("[CARD]", r"\b(?:\d[ -]?){12,18}\d\b", luhn),
+            // Before cards: its two-digit middle group is never part of one,
+            // so a card beside it cannot take its first group.
             rule("[NATIONAL_ID]", r"\b\d{3}-\d{2}-\d{4}\b", always),
+            rule("[CARD]", r"\b\d+(?:[ -]\d+)*\b", card),
             rule(
                 "[NATIONAL_ID]",
                 r"\b[A-CEGHJ-PR-TW-Z]{2}\s?\d{2}\s?\d{2}\s?\d{2}\s?[A-D]\b",
                 always,
             ),
-            rule(
-                "[PHONE]",
-                r"(?:\+\d{1,3}[ .-]?)?(?:\(\d{2,4}\)[ .-]?|\b\d{2,4}[ .-])\d{3,4}[ .-]\d{3,4}\b",
-                always,
-            ),
+            rule("[PHONE]", PHONE, always),
         ]
     })
+}
+
+/// The card numbers in a run of digit groups, which can carry more around a
+/// card: numbers before it, a security code or an expiry after it. A card is
+/// one group of 13 to 19 digits, or several groups of 3 to 6 (4-4-4-4,
+/// 4-6-5 and the like), so grids of single digits are not read as cards.
+/// Every window of whole groups that passes Luhn is taken, and overlapping
+/// ones are joined: a number that happens to pass beside a card costs its
+/// digits rather than letting part of the card through.
+fn card(found: &str) -> Vec<(usize, usize)> {
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut start = None;
+    for (i, c) in found
+        .char_indices()
+        .chain(std::iter::once((found.len(), ' ')))
+    {
+        match (c.is_ascii_digit(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(from)) => {
+                groups.push((from, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for first in 0..groups.len() {
+        let mut digits = 0;
+        for last in first..groups.len() {
+            let length = groups[last].1 - groups[last].0;
+            digits += length;
+            if digits > 19 {
+                break;
+            }
+            let lengths: Vec<usize> = groups[first..=last]
+                .iter()
+                .map(|(from, to)| to - from)
+                .collect();
+            let shaped = match lengths.as_slice() {
+                [one] => (13..=19).contains(one),
+                [4, 6, 4] | [4, 6, 5] => true,
+                [4, 4, 4, last] | [4, 4, 4, 4, last] => (1..=4).contains(last),
+                _ => false,
+            };
+            let (from, to) = (groups[first].0, groups[last].1);
+            if shaped && digits >= 13 && luhn(&found[from..to]) {
+                match spans.last_mut() {
+                    Some(span) if from <= span.1 => span.1 = span.1.max(to),
+                    _ => spans.push((from, to)),
+                }
+            }
+        }
+    }
+    // A card's window can end inside a phone number that follows it; the
+    // whole phone number goes with the card rather than leaving its rest.
+    for span in spans.iter_mut() {
+        // Read afresh on every group: an extension can bring the next phone
+        // number's first group inside the span.
+        for &(group, _) in &groups {
+            if span.0 < group && group < span.1 {
+                if let Some(found_phone) = phone().find_at(found, group) {
+                    if found_phone.start() == group {
+                        span.1 = span.1.max(found_phone.end());
+                    }
+                }
+            }
+        }
+        // And a phone number before the card whose last group a window took.
+        for found_phone in phone().find_iter(found) {
+            if found_phone.start() < span.0 && span.0 < found_phone.end() {
+                span.0 = found_phone.start();
+            }
+        }
+    }
+    spans.sort_unstable();
+    spans.dedup_by(|later, earlier| {
+        let joined = later.0 <= earlier.1;
+        if joined {
+            earlier.1 = earlier.1.max(later.1);
+        }
+        joined
+    });
+    spans
 }
 
 /// Payment card numbers carry a Luhn check digit; most long numbers do not.
@@ -123,16 +215,192 @@ impl Redactor for PatternRedactor {
             let replaced = rule
                 .pattern
                 .replace_all(&out, |found: &Captures| {
-                    if (rule.accept)(&found[0]) {
-                        rule.marker.to_string()
-                    } else {
-                        found[0].to_string()
+                    let text = &found[0];
+                    let mut replaced = String::with_capacity(text.len());
+                    let mut kept = 0;
+                    for (start, end) in (rule.accept)(text) {
+                        replaced.push_str(&text[kept..start]);
+                        replaced.push_str(rule.marker);
+                        kept = end;
                     }
+                    replaced.push_str(&text[kept..]);
+                    replaced
                 })
                 .into_owned();
             out = Cow::Owned(replaced);
         }
         out
+    }
+}
+
+/// A captured body with its personal data taken out, or the body as it came
+/// when there was none. A JSON body keeps its shape with every string, key
+/// and number redacted; a stream is taken line by line, each `data:` event as
+/// JSON where it is; other text is redacted as text. A body that is not text
+/// (an audio upload) cannot be read for personal data and is not kept.
+pub fn redact_body(redactor: &dyn Redactor, body: &[u8]) -> Vec<u8> {
+    if let Some(redacted) = redact_json(redactor, body) {
+        return redacted.unwrap_or_else(|| body.to_vec());
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Vec::new();
+    };
+    let mut changed = false;
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|line| {
+            let (line, carriage) = match line.strip_suffix('\r') {
+                Some(line) => (line, "\r"),
+                None => (line, ""),
+            };
+            let (prefix, rest) = match line.strip_prefix("data:") {
+                Some(rest) => ("data:", rest),
+                None => ("", line),
+            };
+            let leading = &rest[..rest.len() - rest.trim_start().len()];
+            let redacted = match redact_json(redactor, rest.trim_start().as_bytes()) {
+                Some(Some(json)) => format!("{leading}{}", String::from_utf8_lossy(&json)),
+                Some(None) => rest.to_string(),
+                None => redactor.redact(rest).into_owned(),
+            };
+            changed |= redacted != rest;
+            format!("{prefix}{redacted}{carriage}")
+        })
+        .collect();
+    if changed {
+        lines.join("\n").into_bytes()
+    } else {
+        body.to_vec()
+    }
+}
+
+/// None when the body is not a JSON object or array; Some(None) when it is
+/// and holds nothing to redact.
+fn redact_json(redactor: &dyn Redactor, body: &[u8]) -> Option<Option<Vec<u8>>> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if !(value.is_object() || value.is_array()) {
+        return None;
+    }
+    // A key given twice parses to its last value only; the body as it came
+    // would keep the earlier ones unread, so it is written back instead.
+    let duplicated = serde_json::from_slice::<UniqueKeys>(body).is_err();
+    if !redact_value(redactor, &mut value) && !duplicated {
+        return Some(None);
+    }
+    Some(serde_json::to_vec(&value).ok())
+}
+
+/// A whole number of 13 to 19 digits whose first is a card network's (2 to
+/// 6); millisecond timestamps start with 1.
+fn card_shaped(number: &serde_json::Number) -> bool {
+    let text = number.to_string();
+    let digits = text.strip_prefix('-').unwrap_or(&text);
+    (13..=19).contains(&digits.len())
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && matches!(digits.as_bytes()[0], b'2'..=b'6')
+}
+
+/// Parses only when no object in the JSON gives a key twice.
+struct UniqueKeys;
+
+impl<'de> serde::Deserialize<'de> for UniqueKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueKeysVisitor)
+    }
+}
+
+struct UniqueKeysVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UniqueKeysVisitor {
+    type Value = UniqueKeys;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("JSON without a repeated key")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<UniqueKeys, A::Error> {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key) {
+                return Err(serde::de::Error::custom("a key is repeated"));
+            }
+            map.next_value::<UniqueKeys>()?;
+        }
+        Ok(UniqueKeys)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<UniqueKeys, A::Error> {
+        while seq.next_element::<UniqueKeys>()?.is_some() {}
+        Ok(UniqueKeys)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_unit<E>(self) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+}
+
+/// Whether anything in the value was redacted. A number that holds
+/// personal data, such as a card in a tool call's arguments, becomes the
+/// marker as a string.
+fn redact_value(redactor: &dyn Redactor, value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => match redactor.redact(text) {
+            Cow::Owned(redacted) if redacted != *text => {
+                *text = redacted;
+                true
+            }
+            _ => false,
+        },
+        // Only a whole number shaped like a card, which a tool call's
+        // arguments can carry; timestamps and counts are left as numbers.
+        serde_json::Value::Number(number) if card_shaped(number) => {
+            let digits = number.to_string();
+            match redactor.redact(&digits) {
+                Cow::Owned(redacted) if redacted != digits => {
+                    *value = serde_json::Value::String(redacted);
+                    true
+                }
+                _ => false,
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
+            redact_value(redactor, item) | changed
+        }),
+        serde_json::Value::Object(fields) => {
+            let mut changed = false;
+            let redacted: serde_json::Map<String, serde_json::Value> = std::mem::take(fields)
+                .into_iter()
+                .map(|(key, mut field)| {
+                    changed |= redact_value(redactor, &mut field);
+                    let key = match redactor.redact(&key) {
+                        Cow::Owned(redacted) if redacted != key => {
+                            changed = true;
+                            redacted
+                        }
+                        _ => key,
+                    };
+                    (key, field)
+                })
+                .collect();
+            *fields = redacted;
+            changed
+        }
+        _ => false,
     }
 }
 
@@ -184,44 +452,163 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_redacted_json_body_is_still_json() {
-        let body = r#"{"messages":[{"role":"user","content":"I am ada@example.com, card 4111-1111-1111-1111"}]}"#;
-        let redacted = redact(body);
-        assert!(redacted.contains("[EMAIL]") && redacted.contains("[CARD]"));
-        let value: serde_json_check::Value = serde_json_check::from_str(&redacted);
-        assert!(value.ok);
+    fn body(value: serde_json::Value) -> serde_json::Value {
+        let bytes = redact_body(&PatternRedactor, &serde_json::to_vec(&value).unwrap());
+        serde_json::from_slice(&bytes).expect("a redacted body is still JSON")
     }
 
-    // A tiny JSON validity check without a serde dependency.
-    mod serde_json_check {
-        pub struct Value {
-            pub ok: bool,
+    #[test]
+    fn values_after_an_escape_are_redacted_and_the_body_stays_json() {
+        let redacted = body(serde_json::json!({"messages": [{"role": "user", "content":
+            "my key:\nsk-abcdefghijklmnop1234\nssn:\n123-45-6789\nmail:\nada@example.com\ncall:\n415 555 0134\ntok:\teyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N"}]}));
+        assert_eq!(
+            redacted["messages"][0]["content"],
+            "my key:\n[SECRET]\nssn:\n[NATIONAL_ID]\nmail:\n[EMAIL]\ncall:\n[PHONE]\ntok:\t[SECRET]"
+        );
+    }
+
+    #[test]
+    fn a_card_is_redacted_whole_with_what_follows_it_kept() {
+        // A security code after a card goes with it: it is as private.
+        assert_eq!(redact("card 4111 1111 1111 1111 123"), "card [CARD]");
+        assert_eq!(
+            redact("card 4111 1111 1111 1111 12/26"),
+            "card [CARD] 12/26"
+        );
+        assert_eq!(redact("card:\n4111 1111 1111 1111"), "card:\n[CARD]");
+    }
+
+    #[test]
+    fn a_card_after_other_numbers_is_found_and_long_ids_are_left_whole() {
+        assert_eq!(redact("x 5 4111111111111111 y"), "x 5 [CARD] y");
+        assert_eq!(redact("x 3-4012888888881881 y"), "x 3-[CARD] y");
+        assert_eq!(redact("order 12 4111111111111111"), "order 12 [CARD]");
+        // A 19-digit id is a card only when all of it passes Luhn.
+        assert_eq!(redact("id 1234567890123456789"), "id 1234567890123456789");
+    }
+
+    #[test]
+    fn a_grouped_card_after_other_grouped_numbers_is_found() {
+        for (text, card) in [
+            ("ref 12345 3782 822463 10005", "3782 822463 10005"),
+            ("acct 99887 4111-1111-1111-1111", "4111-1111-1111-1111"),
+            (
+                "invoice 2026 0925 4111 1111 1111 1111",
+                "4111 1111 1111 1111",
+            ),
+        ] {
+            let redacted = redact(text);
+            assert!(
+                redacted.contains("[CARD]") && !redacted.contains(card),
+                "{text} -> {redacted}"
+            );
         }
-        pub fn from_str(s: &str) -> Value {
-            let mut depth = 0i32;
-            let mut in_string = false;
-            let mut escaped = false;
-            for c in s.chars() {
-                if in_string {
-                    match (escaped, c) {
-                        (true, _) => escaped = false,
-                        (false, '\\') => escaped = true,
-                        (false, '"') => in_string = false,
-                        _ => {}
-                    }
-                    continue;
-                }
-                match c {
-                    '"' => in_string = true,
-                    '{' | '[' => depth += 1,
-                    '}' | ']' => depth -= 1,
-                    _ => {}
-                }
-            }
-            Value {
-                ok: depth == 0 && !in_string,
+    }
+
+    #[test]
+    fn a_card_never_takes_part_of_the_number_after_it() {
+        assert_eq!(
+            redact("card 4111 1111 1111 1111 101-45-6789"),
+            "card [CARD] [NATIONAL_ID]"
+        );
+        let beside_phone = redact("card 4111 1111 1111 1111 101 555 0134");
+        assert!(
+            !beside_phone.contains("555") && !beside_phone.contains("0134"),
+            "{beside_phone}"
+        );
+    }
+
+    #[test]
+    fn no_digit_of_a_phone_number_beside_a_card_is_left() {
+        for area in 100..1000 {
+            for text in [
+                format!("card 4111 1111 1111 1111 {area} 555 0134"),
+                format!("card 4111-1111-1111-1111 {area}-555-0134"),
+            ] {
+                let redacted = redact(&text);
+                assert!(
+                    !redacted.contains("0134") && !redacted.contains("555"),
+                    "{text} -> {redacted}"
+                );
             }
         }
+        for subscriber in 0..10000 {
+            let text = format!("call 415 555 {subscriber:04} 4111 1111 1111 1111");
+            let redacted = redact(&text);
+            assert!(!redacted.contains(" 555 "), "{text} -> {redacted}");
+        }
+    }
+
+    #[test]
+    fn cards_sent_as_numbers_from_every_network_are_redacted() {
+        let redacted = body(
+            serde_json::json!({"mastercard": 2223000048400011u64, "negative": -4111111111111111i64}),
+        );
+        assert_eq!(redacted["mastercard"], "[CARD]");
+        assert_eq!(redacted["negative"], "-[CARD]");
+    }
+
+    #[test]
+    fn grids_timestamps_and_counts_are_not_cards() {
+        assert_eq!(
+            redact("1 0 1 1 0 1 0 0 1 1 1 0 1 0 1 1 0 1 1"),
+            "1 0 1 1 0 1 0 0 1 1 1 0 1 0 1 1 0 1 1"
+        );
+        let kept = br#"{"created_ms":1727300000009,"count":4111}"#;
+        assert_eq!(redact_body(&PatternRedactor, kept), kept);
+    }
+
+    #[test]
+    fn a_repeated_key_cannot_hide_a_value() {
+        for repeated in [
+            &br#"{"note":"ada@example.com","note":"x"}"#[..],
+            &b"data: {\"d\":\"ada@example.com\",\"d\":\"x\"}"[..],
+        ] {
+            let stored = String::from_utf8(redact_body(&PatternRedactor, repeated)).unwrap();
+            assert!(!stored.contains("ada@example.com"), "{stored}");
+        }
+    }
+
+    #[test]
+    fn numbers_and_keys_are_redacted_too() {
+        let redacted = body(
+            serde_json::json!({"input": {"card": 4111111111111111u64, "count": 3},
+            "metadata": {"ada@example.com": "x"}}),
+        );
+        assert_eq!(redacted["input"]["card"], "[CARD]");
+        assert_eq!(redacted["input"]["count"], 3);
+        assert_eq!(redacted["metadata"]["[EMAIL]"], "x");
+    }
+
+    #[test]
+    fn a_body_with_nothing_to_redact_is_kept_byte_for_byte() {
+        for kept in [
+            &br#"{ "z":1.50e1, "a":"caf\u00e9\/x" }"#[..],
+            &b"plain text, nothing personal\r\n"[..],
+        ] {
+            assert_eq!(redact_body(&PatternRedactor, kept), kept);
+        }
+    }
+
+    #[test]
+    fn a_body_that_is_not_text_is_not_kept() {
+        assert!(redact_body(&PatternRedactor, &[0xff, 0xfe, 0x00, 0x41]).is_empty());
+    }
+
+    #[test]
+    fn a_crlf_stream_keeps_its_framing() {
+        let stream = b"data: {\"d\":\"ada@example.com\"}\r\n\r\n";
+        let redacted = String::from_utf8(redact_body(&PatternRedactor, stream)).unwrap();
+        assert_eq!(redacted, "data: {\"d\":\"[EMAIL]\"}\r\n\r\n");
+    }
+
+    #[test]
+    fn a_stream_is_redacted_event_by_event() {
+        let stream = b"data: {\"delta\":\"write to\\nada@example.com\"}\n\ndata: [DONE]\n";
+        let redacted = String::from_utf8(redact_body(&PatternRedactor, stream)).unwrap();
+        assert_eq!(
+            redacted,
+            "data: {\"delta\":\"write to\\n[EMAIL]\"}\n\ndata: [DONE]\n"
+        );
     }
 }
