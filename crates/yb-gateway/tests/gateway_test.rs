@@ -979,3 +979,76 @@ async fn a_client_that_stops_at_the_end_leaves_a_complete_turn() {
     assert!(!telemetry[0].is_error);
     assert_eq!(telemetry[0].output_tokens, 1);
 }
+
+/// An engine whose first deployment cannot be reached, and whose second
+/// answers with the given status.
+struct FirstUnreachable(u16);
+
+#[async_trait]
+impl UpstreamClient for FirstUnreachable {
+    async fn send(
+        &self,
+        req: yb_providers::UpstreamRequest,
+    ) -> Result<yb_providers::UpstreamResponse> {
+        if req.url.contains("engine-one") {
+            return Err(yb_core::Error::Upstream {
+                provider: "engine-one".into(),
+                status: 503,
+                message: "connection refused".into(),
+            });
+        }
+        Ok(yb_providers::UpstreamResponse {
+            status: self.0,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: yb_providers::ResponseBody::Full(b"{}".to_vec()),
+        })
+    }
+}
+
+/// An engine that cannot be reached is passed over for one that knows the
+/// video; when the other does not know it, the unreachable one may be the
+/// maker, and its error is the answer.
+#[tokio::test]
+async fn an_unreachable_video_engine_is_passed_over() {
+    let deployment = |base: &str| DeploymentConfig {
+        provider: "host-agent".into(),
+        upstream_model: "wan".into(),
+        api_base: Some(format!("http://{base}/v1")),
+        api_key: None,
+        upstream_format: yb_core::MediaFormat::OpenaiVideos.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+        extra: Default::default(),
+    };
+    // "wan/job_1/sig".
+    let id = "video_d2FuL2pvYl8xL3NpZw";
+    for (second, want) in [(200, Ok(200)), (404, Err(503))] {
+        let router = DeploymentRouter::from_models(
+            vec![ModelConfig {
+                model_name: "video".into(),
+                aliases: vec![],
+                deployments: vec![deployment("engine-one"), deployment("engine-two")],
+            }],
+            HashMap::new(),
+            HashMap::new(),
+            Strategy::Simple,
+        );
+        let gateway = Gateway::new(
+            Arc::new(FirstUnreachable(second)),
+            Arc::new(router),
+            Arc::new(RecordingStore::default()),
+            Arc::new(NullLogger),
+        );
+        let got = gateway
+            .handle_video(id, VideoLookup::Status, RequestCtx::new())
+            .await
+            .map(|resp| match resp {
+                GatewayResponse::Full { status, .. } => status,
+                _ => 0,
+            })
+            .map_err(|e| e.http_status());
+        assert_eq!(got, want, "the second engine answering {second}");
+    }
+}
