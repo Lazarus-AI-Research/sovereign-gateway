@@ -304,20 +304,25 @@ impl RequestLogger for DuckLogger {
             .recv()
             .map_err(|_| Error::Internal("reqlog: worker is gone".into()))?
             .map_err(Error::Storage)?;
+        // Shards pruned between listing and reading fail the first attempt;
+        // the second lists them again.
         export_turns(&conn, &shards_dir, filter)
+            .or_else(|_| export_turns(&conn, &shards_dir, filter))
     }
 }
 
 /// The captured turns the filter takes, from the write-ahead table and every
 /// shard, oldest first. A shard written before a column existed reads it as
-/// null, and a turn a rotation left in both places is taken once. Tags are
+/// null, and a turn a rotation left in both places (the same id, time and
+/// request) is taken once; turns that only share a caller's request id are
+/// all kept. Tags are
 /// matched here rather than in SQL: they are a small JSON object per turn.
 fn export_turns(
     conn: &Connection,
     shards_dir: &Path,
     filter: &CaptureFilter,
 ) -> Result<Vec<CapturedTurn>> {
-    let columns = "ts, request_id, surface, requested_model, api_key_id, user_id, tags, redaction, request_body, response_body, is_error";
+    let columns = "id, ts, request_id, surface, requested_model, api_key_id, user_id, tags, redaction, request_body, response_body, is_error";
     let has_shards = std::fs::read_dir(shards_dir)
         .map(|entries| {
             entries
@@ -362,7 +367,7 @@ fn export_turns(
     }
     let query = format!(
         "SELECT CAST(ts AS VARCHAR), request_id, surface, requested_model, api_key_id, user_id, tags, \
-         COALESCE(redaction, 'none'), request_body, response_body FROM ({source}) WHERE {} QUALIFY row_number() OVER (PARTITION BY request_id ORDER BY ts) = 1 ORDER BY ts",
+         COALESCE(redaction, 'none'), request_body, response_body FROM ({source}) WHERE {} QUALIFY row_number() OVER (PARTITION BY id, ts, request_id) = 1 ORDER BY ts",
         conditions.join(" AND ")
     );
     let mut statement = conn.prepare(&query).map_err(map_db)?;
@@ -634,13 +639,18 @@ impl Worker {
 
         let mut sealed: Option<PathBuf> = None;
         if self.count()? > 0 {
+            // Written under a name no export reads, then renamed into place,
+            // so an export never opens a shard that is half written.
             let path = self.shards_dir.join(format!("{}.parquet", shard_stamp()));
-            let path_sql = path.to_string_lossy().replace('\'', "''");
+            let partial = path.with_extension("parquet.partial");
+            let partial_sql = partial.to_string_lossy().replace('\'', "''");
             self.conn
                 .execute_batch(&format!(
-                    "COPY (SELECT * FROM turns) TO '{path_sql}' (FORMAT parquet, COMPRESSION zstd)"
+                    "COPY (SELECT * FROM turns) TO '{partial_sql}' (FORMAT parquet, COMPRESSION zstd)"
                 ))
                 .map_err(map_db)?;
+            std::fs::rename(&partial, &path)
+                .map_err(|e| Error::Storage(format!("reqlog: seal shard: {e}")))?;
             sealed = Some(path);
         }
 
@@ -1066,6 +1076,30 @@ mod tests {
         assert!(!policy.enabled);
         assert_eq!(policy.retention_days, 365);
         assert!(logger.captures());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Turns a caller sent with the same request id are all exported.
+    #[test]
+    fn turns_sharing_a_request_id_are_all_exported() {
+        let dir = scratch_dir();
+        let logger = capturing(
+            DuckLogger::new(ReqlogConfig {
+                dir: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        for i in 0..3 {
+            let mut turn = record(i);
+            turn.request_id = "reused".into();
+            logger.log(turn);
+        }
+        logger.force_rotate().unwrap();
+        let mut turn = record(4);
+        turn.request_id = "reused".into();
+        logger.log(turn);
+        assert_eq!(logger.export(&CaptureFilter::default()).unwrap().len(), 4);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

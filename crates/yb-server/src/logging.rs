@@ -49,12 +49,17 @@ pub(crate) async fn put_level(
     if let Some(refusal) = refused(&principal) {
         return refusal;
     }
-    let _settings = state.settings.lock().await;
-    if let Err(e) = state.store.set_log_level(body.level).await {
-        return error_response(&e);
+    // Applied before it is kept, so a level the process cannot take is never
+    // stored; under one lock and on a task of its own, as capture is.
+    let level = body.level;
+    let change = tokio::spawn(async move {
+        let _settings = state.settings.lock().await;
+        state.logging.apply(level)?;
+        state.store.set_log_level(level).await
+    });
+    match change.await {
+        Ok(Ok(())) => Json(body).into_response(),
+        Ok(Err(e)) => error_response(&e),
+        Err(e) => error_response(&Error::Internal(e.to_string())),
     }
-    if let Err(e) = state.logging.apply(body.level) {
-        return error_response(&e);
-    }
-    Json(body).into_response()
 }

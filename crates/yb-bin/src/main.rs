@@ -381,8 +381,10 @@ async fn run_serve(
     }
     // As does the log level; the environment's until one is set.
     if let Some(level) = store.log_level().await? {
-        logging.apply(level)?;
-        tracing::info!(level = level.as_str(), "log level applied");
+        match logging.apply(level) {
+            Ok(()) => tracing::info!(level = level.as_str(), "log level applied"),
+            Err(e) => tracing::warn!(error = %e, "the kept log level could not be applied"),
+        }
     }
     let observer: Arc<dyn Observer> = if cfg.telemetry.enabled {
         tracing::info!(

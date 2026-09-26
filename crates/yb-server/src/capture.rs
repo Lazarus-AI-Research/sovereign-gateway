@@ -53,13 +53,19 @@ pub(crate) async fn put_policy(
         ));
     }
     // Kept and applied under one lock, so two changes cannot leave the
-    // process running one and the database holding the other.
-    let _settings = state.settings.lock().await;
-    if let Err(e) = state.store.set_capture_policy(&policy).await {
-        return error_response(&e);
+    // process running one and the database holding the other; on a task of
+    // its own, so a caller that hangs up cannot stop it between the two.
+    let change = tokio::spawn(async move {
+        let _settings = state.settings.lock().await;
+        state.store.set_capture_policy(&policy).await?;
+        state.request_log.apply_policy(&policy);
+        Ok::<_, Error>(())
+    });
+    match change.await {
+        Ok(Ok(())) => Json(policy).into_response(),
+        Ok(Err(e)) => error_response(&e),
+        Err(e) => error_response(&Error::Internal(e.to_string())),
     }
-    state.request_log.apply_policy(&policy);
-    Json(policy).into_response()
 }
 
 #[derive(Deserialize, Default)]
