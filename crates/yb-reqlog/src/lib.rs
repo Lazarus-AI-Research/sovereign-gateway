@@ -453,6 +453,10 @@ impl Worker {
 
         let db_path = cfg.dir.join("wal.duckdb");
         let conn = Connection::open(&db_path).map_err(map_db)?;
+        // Nothing is ever fetched: an extension that is not compiled in
+        // fails at once instead of reaching for the network.
+        conn.execute_batch("SET autoinstall_known_extensions = false")
+            .map_err(map_db)?;
         conn.execute_batch(CREATE_TURNS).map_err(map_db)?;
         conn.execute_batch(ADD_LATER_COLUMNS).map_err(map_db)?;
 

@@ -57,7 +57,9 @@ argon2 = "0.5"
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.22"
-duckdb = { version = "1", features = ["bundled"] }
+# Parquet is compiled in: the appliance is offline, and DuckDB would otherwise
+# download the extension the first time a shard is written or read.
+duckdb = { version = "1", features = ["bundled", "parquet"] }
 
 [profile.dev]
 # keep iteration fast; the bundled duckdb build is the slow part
