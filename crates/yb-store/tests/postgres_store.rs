@@ -20,7 +20,7 @@ impl Drop for TempDatabase {
     fn drop(&mut self) {
         let (server, name) = (self.server.clone(), self.name.clone());
         // Drop cannot wait on the test's runtime; the database is dropped
-        // on a runtime of its own, closing the store's connections first.
+        // on a runtime of its own, ending the store's connections with it.
         let _ = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -38,10 +38,15 @@ impl Drop for TempDatabase {
     }
 }
 
-/// The server's URL with another database in place of its own.
+/// The server's URL with another database in place of its own, or added
+/// where it names none.
 fn database_url(server: &str, name: &str) -> String {
     let (address, query) = server.split_once('?').unwrap_or((server, ""));
-    let base = address.rsplit_once('/').map_or(address, |(base, _)| base);
+    let authority_start = address.find("://").map_or(0, |scheme| scheme + 3);
+    let base = match address[authority_start..].find('/') {
+        Some(path) => &address[..authority_start + path],
+        None => address,
+    };
     match query {
         "" => format!("{base}/{name}"),
         query => format!("{base}/{name}?{query}"),
@@ -69,6 +74,24 @@ async fn fresh_store() -> Option<(PostgresStore, TempDatabase)> {
     // migrate is idempotent — running twice must not error.
     store.migrate().await.expect("migrate twice");
     Some((store, database))
+}
+
+#[test]
+fn a_test_database_takes_the_servers_address() {
+    for (server, want) in [
+        ("postgres://u:p@h:5432/test", "postgres://u:p@h:5432/db"),
+        (
+            "postgres://u:p@h:5432/test?sslmode=disable",
+            "postgres://u:p@h:5432/db?sslmode=disable",
+        ),
+        ("postgres://u:p@h:5432", "postgres://u:p@h:5432/db"),
+        (
+            "postgres://u:p@h:5432?sslmode=disable",
+            "postgres://u:p@h:5432/db?sslmode=disable",
+        ),
+    ] {
+        assert_eq!(database_url(server, "db"), want, "{server}");
+    }
 }
 
 async fn set_column(store: &PostgresStore, table: &str, column: &str, value: &str, id: &str) {
