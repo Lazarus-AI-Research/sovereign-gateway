@@ -540,7 +540,9 @@ pub fn emit_response(resp: &ChatResponse) -> Result<Vec<u8>> {
             "input_tokens": u.input_tokens,
             "output_tokens": u.output_tokens,
             "total_tokens": u.input_tokens + u.output_tokens,
-            "input_tokens_details": {"cached_tokens": u.cache_read_tokens},
+            "input_tokens_details": {"cached_tokens": u.cache_read_tokens,
+                "cache_write_tokens": u.cache_write_tokens},
+            "output_tokens_details": {"reasoning_tokens": u.reasoning_tokens},
         },
     });
     // The Responses response object echoes the prompt-cache fields.
@@ -562,7 +564,14 @@ fn parse_usage(v: Option<&Value>) -> Usage {
         input_tokens: opt_u32(v, "input_tokens").unwrap_or(0),
         output_tokens: opt_u32(v, "output_tokens").unwrap_or(0),
         cache_read_tokens: cache_read,
-        cache_write_tokens: 0,
+        cache_write_tokens: v
+            .get("input_tokens_details")
+            .and_then(|d| opt_u32(d, "cache_write_tokens"))
+            .unwrap_or(0),
+        reasoning_tokens: v
+            .get("output_tokens_details")
+            .and_then(|d| opt_u32(d, "reasoning_tokens"))
+            .unwrap_or(0),
     }
 }
 
@@ -925,8 +934,12 @@ impl EmitState {
             .usage
             .map(|u| {
                 json!({
-            "input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
-            "total_tokens": u.input_tokens + u.output_tokens})
+                "input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
+                "total_tokens": u.input_tokens + u.output_tokens,
+                "input_tokens_details": {"cached_tokens": u.cache_read_tokens,
+                    "cache_write_tokens": u.cache_write_tokens},
+                "output_tokens_details": {"reasoning_tokens": u.reasoning_tokens}
+                    })
             })
             .unwrap_or(Value::Null);
         let mut resp = json!({"id": self.resp_id, "object": "response", "status": status,
@@ -1178,6 +1191,43 @@ mod tests {
             "one event, named twice: {sse}"
         );
         assert_eq!(completed(&sse)["response"]["usage"]["total_tokens"], 3);
+    }
+
+    #[test]
+    fn response_usage_retains_cache_and_reasoning_details() {
+        let raw = json!({"input_tokens": 1441, "output_tokens": 60,
+            "input_tokens_details": {"cached_tokens": 1436, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 57}});
+        let line = format!(
+            "data: {}",
+            json!({"type": "response.completed",
+            "response": {"usage": raw}})
+        );
+        let mut decoder = SseState::default();
+        let usage = decode_sse(&line, &mut decoder)
+            .into_iter()
+            .find_map(|event| {
+                if let StreamEvent::UsageDelta { usage } = event {
+                    Some(usage)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(usage.cache_read_tokens, 1436);
+        assert_eq!(usage.reasoning_tokens, 57);
+        let sse = encode_all(&[
+            StreamEvent::MessageStart {
+                model: "qwen".into(),
+            },
+            StreamEvent::UsageDelta { usage },
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+            },
+        ]);
+        let output = &completed(&sse)["response"]["usage"];
+        assert_eq!(output["input_tokens_details"]["cached_tokens"], 1436);
+        assert_eq!(output["output_tokens_details"]["reasoning_tokens"], 57);
     }
 
     /// An upstream that hangs up without ever sending usage must still leave
