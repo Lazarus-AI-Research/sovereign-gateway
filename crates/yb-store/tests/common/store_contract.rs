@@ -1,0 +1,1130 @@
+// The store contract every backend meets, included by each backend's test
+// file after it defines `TestStore`, `fresh_store` (None where the backend
+// cannot be reached, which skips the test) and `set_column` (a raw write
+// standing for a row an older release left).
+
+use yb_core::crypto::{Encryptor, PasswordHasher};
+use yb_core::model::{Role, Team, TeamMembership, TelemetryRecord, User};
+use yb_core::spend::{Budget, BudgetAction, Period, RollupDelta, SubjectType};
+use yb_core::{new_id, now, AccessPolicy, ExternalKey, LimitColumns, Store};
+use yb_store::crypto::{AesGcmEncryptor, Argon2Hasher};
+use yb_store::keys::{ensure_control_key, hash_token, issue_api_key};
+
+/// Create a login user with the given username/role and return its id.
+async fn make_user(store: &TestStore, username: &str, role: Role) -> String {
+    let hasher = Argon2Hasher;
+    let user = User {
+        id: new_id(),
+        username: username.into(),
+        password_hash: hasher.hash("hunter2").unwrap(),
+        role,
+        rpm_limit: None,
+        tpm_limit: None,
+        max_concurrent: None,
+        created_at: now(),
+        last_login_at: None,
+        deleted_at: None,
+    };
+    store.create_user(&user).await.unwrap();
+    user.id
+}
+
+#[tokio::test]
+async fn users_login_roles_and_admin_count() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let hasher = Argon2Hasher;
+
+    assert_eq!(store.count_users().await.unwrap(), 0);
+
+    // The login account *is* the user.
+    let admin = User {
+        id: new_id(),
+        username: "admin".into(),
+        password_hash: hasher.hash("hunter2").unwrap(),
+        role: Role::Admin,
+        rpm_limit: None,
+        tpm_limit: None,
+        max_concurrent: None,
+        created_at: now(),
+        last_login_at: None,
+        deleted_at: None,
+    };
+    store.create_user(&admin).await.unwrap();
+    assert_eq!(store.count_users().await.unwrap(), 1);
+    assert_eq!(store.count_admins().await.unwrap(), 1);
+
+    // Login: resolve by username (unique), then argon2-verify.
+    let by_name = store
+        .get_user_by_username("admin")
+        .await
+        .unwrap()
+        .expect("admin resolves");
+    assert_eq!(by_name.id, admin.id);
+    assert!(hasher.verify("hunter2", &by_name.password_hash));
+
+    // Demote -> no admins left (last-admin guard input).
+    store.set_user_role(&admin.id, Role::Member).await.unwrap();
+    assert_eq!(store.count_admins().await.unwrap(), 0);
+
+    // Password reset + login mark + limits.
+    let new_hash = hasher.hash("newpass").unwrap();
+    store.set_user_password(&admin.id, &new_hash).await.unwrap();
+    store.mark_user_login(&admin.id).await.unwrap();
+    store
+        .set_user_limits(
+            &admin.id,
+            LimitColumns {
+                rpm: Some(120),
+                tpm: Some(50_000),
+                max_concurrent: Some(8),
+            },
+        )
+        .await
+        .unwrap();
+    let reloaded = store.get_user(&admin.id).await.unwrap().unwrap();
+    assert_eq!(reloaded.role, Role::Member);
+    assert!(reloaded.last_login_at.is_some());
+    assert_eq!(reloaded.rpm_limit, Some(120));
+    assert!(hasher.verify("newpass", &reloaded.password_hash));
+
+    assert_eq!(store.list_users().await.unwrap().len(), 1);
+
+    // Soft delete removes it from the active set and username lookups.
+    store.delete_user(&admin.id).await.unwrap();
+    assert_eq!(store.count_users().await.unwrap(), 0);
+    assert!(store.get_user_by_username("admin").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn api_key_issue_and_verify_owned_by_user() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let user_id = make_user(&store, "alice", Role::Member).await;
+
+    let issued = issue_api_key(
+        &store,
+        &user_id,
+        Some("ci-key".into()),
+        None,
+        Default::default(),
+        AccessPolicy {
+            denied_model_ids: vec!["secret-model".into()],
+            ..Default::default()
+        },
+        LimitColumns {
+            rpm: Some(10),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(issued.token.starts_with("yb_"));
+    assert_eq!(issued.key.owner_user_id, user_id);
+
+    // Hot auth path: verify by hashing the plaintext token -> KeyAuth{user, key}.
+    let auth = store
+        .verify_api_key(&hash_token(&issued.token))
+        .await
+        .unwrap()
+        .expect("key resolves");
+    assert_eq!(auth.user.id, user_id);
+    assert_eq!(auth.user.username, "alice");
+    assert_eq!(auth.api_key.id, issued.key.id);
+    assert_eq!(auth.api_key.owner_user_id, user_id);
+    assert_eq!(auth.api_key.rpm_limit, Some(10));
+    assert!(!auth.api_key.access.permits_model("secret-model"));
+
+    // Admin listing returns all keys; per-user listing scopes to the owner.
+    assert_eq!(store.list_api_keys().await.unwrap().len(), 1);
+    let mine = store.list_api_keys_for_user(&user_id).await.unwrap();
+    assert_eq!(mine.len(), 1);
+    let by_id = store.get_api_key(&issued.key.id).await.unwrap().unwrap();
+    assert_eq!(by_id.key_prefix, issued.key.key_prefix);
+
+    // Keys owned by another user do not show up under this user.
+    let other = make_user(&store, "bob", Role::Member).await;
+    assert!(store
+        .list_api_keys_for_user(&other)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Mark-used updates last_used_at.
+    store.mark_api_key_used(&issued.key.id).await.unwrap();
+    let used = store.get_api_key(&issued.key.id).await.unwrap().unwrap();
+    assert!(used.last_used_at.is_some());
+
+    // Update access + limits (no installation scope).
+    store
+        .update_api_key_access(&issued.key.id, &AccessPolicy::default())
+        .await
+        .unwrap();
+    store
+        .update_api_key_limits(
+            &issued.key.id,
+            LimitColumns {
+                rpm: Some(99),
+                tpm: None,
+                max_concurrent: None,
+            },
+        )
+        .await
+        .unwrap();
+    let updated = store.get_api_key(&issued.key.id).await.unwrap().unwrap();
+    assert!(updated.access.is_unrestricted());
+    assert_eq!(updated.rpm_limit, Some(99));
+
+    // Delete removes it from verify + listings.
+    store.delete_api_key(&issued.key.id).await.unwrap();
+    assert!(store
+        .verify_api_key(&hash_token(&issued.token))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store.list_api_keys().await.unwrap().is_empty());
+
+    // Unknown hash resolves to None.
+    assert!(store.verify_api_key("deadbeef").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn external_keys_encrypted_roundtrip() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let user_id = make_user(&store, "byok", Role::Member).await;
+
+    let enc = AesGcmEncryptor::new([42u8; 32]);
+    let aad = format!("{}\0openai", user_id);
+    let ciphertext = enc.encrypt(b"sk-live-123", aad.as_bytes()).unwrap();
+
+    let ext = ExternalKey {
+        id: new_id(),
+        user_id: user_id.clone(),
+        provider: "openai".into(),
+        ciphertext: ciphertext.clone(),
+        key_prefix: "sk-li".into(),
+        key_suffix: "-123".into(),
+        created_at: now(),
+        last_used_at: None,
+    };
+    store.upsert_external_key(&ext).await.unwrap();
+
+    // Upsert again with a new ciphertext (same user+provider).
+    let ciphertext2 = enc.encrypt(b"sk-live-456", aad.as_bytes()).unwrap();
+    let mut ext2 = ext.clone();
+    ext2.ciphertext = ciphertext2.clone();
+    ext2.key_suffix = "-456".into();
+    store.upsert_external_key(&ext2).await.unwrap();
+
+    let listed = store.list_external_keys(&user_id).await.unwrap();
+    assert_eq!(listed.len(), 1, "upsert must not duplicate");
+    let stored = &listed[0];
+    assert_eq!(stored.key_suffix, "-456");
+    let plaintext = enc.decrypt(&stored.ciphertext, aad.as_bytes()).unwrap();
+    assert_eq!(plaintext, b"sk-live-456");
+
+    store.delete_external_key(&user_id, "openai").await.unwrap();
+    assert!(store.list_external_keys(&user_id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn teams_and_memberships() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+
+    let team = Team {
+        id: new_id(),
+        name: "Platform".into(),
+        access: AccessPolicy::default(),
+        created_at: now(),
+        updated_at: now(),
+        deleted_at: None,
+        created_by: Some("seed".into()),
+    };
+    store.create_team(&team).await.unwrap();
+    assert_eq!(store.list_teams().await.unwrap().len(), 1);
+
+    store
+        .update_team_access(
+            &team.id,
+            &AccessPolicy {
+                allowed_provider_ids: vec!["anthropic".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let got = store.get_team(&team.id).await.unwrap().unwrap();
+    assert!(got.access.permits_provider("anthropic"));
+    assert!(!got.access.permits_provider("openai"));
+
+    let alice = make_user(&store, "alice", Role::Member).await;
+    let bob = make_user(&store, "bob", Role::Member).await;
+    let m = TeamMembership {
+        id: new_id(),
+        team_id: team.id.clone(),
+        user_id: alice.clone(),
+        created_at: now(),
+    };
+    store.upsert_membership(&m).await.unwrap();
+    // Upsert again — should be idempotent, not duplicate.
+    store.upsert_membership(&m).await.unwrap();
+    store
+        .upsert_membership(&TeamMembership {
+            id: new_id(),
+            team_id: team.id.clone(),
+            user_id: bob.clone(),
+            created_at: now(),
+        })
+        .await
+        .unwrap();
+
+    let for_alice = store.list_memberships_for_user(&alice).await.unwrap();
+    assert_eq!(for_alice.len(), 1);
+    assert_eq!(for_alice[0].team_id, team.id);
+
+    let members = store.list_team_members(&team.id).await.unwrap();
+    assert_eq!(members.len(), 2);
+
+    store.delete_membership(&team.id, &alice).await.unwrap();
+    assert!(store
+        .list_memberships_for_user(&alice)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.list_team_members(&team.id).await.unwrap().len(), 1);
+
+    store.delete_team(&team.id).await.unwrap();
+    assert!(store.list_teams().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn telemetry_insert_by_key_user_team() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let user_id = make_user(&store, "alice", Role::Member).await;
+    let issued = issue_api_key(
+        &store,
+        &user_id,
+        None,
+        None,
+        Default::default(),
+        AccessPolicy::default(),
+        LimitColumns::default(),
+    )
+    .await
+    .unwrap();
+
+    let rec = TelemetryRecord {
+        id: new_id(),
+        request_id: "req-1".into(),
+        trace_id: Some("trace-1".into()),
+        parent_span_id: None,
+        api_key_id: Some(issued.key.id.clone()),
+        user_id: Some(user_id.clone()),
+        team_id: None,
+        surface: "anthropic".into(),
+        requested_model: "claude".into(),
+        decision_model: "claude-3".into(),
+        decision_provider: "anthropic".into(),
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_read_tokens: 10,
+        cache_write_tokens: 0,
+        cost_micros: 1_234,
+        status: 200,
+        is_error: false,
+        latency_ms: 321,
+        created_at: now(),
+    };
+    store.insert_telemetry(&rec).await.unwrap();
+}
+
+/// Usage sums the day's turns per key and model, counts errors, and leaves
+/// out turns outside the range.
+#[tokio::test]
+async fn usage_sums_turns_per_day_key_and_model() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let today = Period::Day.bucket_start(now());
+    let turn = |model: &str, tokens: i64, is_error: bool, at: yb_core::Timestamp| TelemetryRecord {
+        id: new_id(),
+        request_id: new_id(),
+        trace_id: None,
+        parent_span_id: None,
+        api_key_id: Some("key-1".into()),
+        user_id: Some("user-1".into()),
+        team_id: None,
+        surface: "openai_chat".into(),
+        requested_model: model.into(),
+        decision_model: model.into(),
+        decision_provider: "local".into(),
+        input_tokens: tokens,
+        output_tokens: 1,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cost_micros: 0,
+        status: if is_error { 500 } else { 200 },
+        is_error,
+        latency_ms: 5,
+        created_at: at,
+    };
+    let noon = today + chrono::Duration::hours(12);
+    for record in [
+        turn("assistant", 10, false, noon),
+        turn("assistant", 20, true, noon),
+        turn("coder", 5, false, noon),
+        turn("assistant", 99, false, today - chrono::Duration::days(3)),
+    ] {
+        store.insert_telemetry(&record).await.unwrap();
+    }
+    let rows = store
+        .usage(today, today + chrono::Duration::days(1))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let assistant = rows.iter().find(|r| r.model == "assistant").unwrap();
+    assert_eq!(assistant.day, today.format("%Y-%m-%d").to_string());
+    assert_eq!(assistant.requests, 2);
+    assert_eq!(assistant.errors, 1);
+    assert_eq!(assistant.input_tokens, 30);
+    assert_eq!(assistant.output_tokens, 2);
+    assert_eq!(assistant.api_key_id.as_deref(), Some("key-1"));
+    assert_eq!(assistant.user_id.as_deref(), Some("user-1"));
+}
+
+#[tokio::test]
+async fn spend_rollup_and_period_spend_by_key_and_user() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+
+    let at = now();
+    let period_start = Period::Day.bucket_start(at);
+
+    // Roll up spend against a key subject and a user subject.
+    for (st, sid) in [(SubjectType::Key, "key-1"), (SubjectType::User, "user-1")] {
+        let delta = RollupDelta {
+            subject_type: st,
+            subject_id: sid.into(),
+            period: Period::Day,
+            period_start,
+            spend_micros: 500,
+            request_count: 1,
+            input_tokens: 100,
+            output_tokens: 20,
+        };
+        store.upsert_rollup(&delta).await.unwrap();
+        // Second increment accumulates.
+        store.upsert_rollup(&delta).await.unwrap();
+    }
+
+    let by_key = store
+        .period_spend(SubjectType::Key, "key-1", Period::Day, period_start)
+        .await
+        .unwrap();
+    assert_eq!(by_key, 1_000, "two 500-micro deltas must sum");
+    let by_user = store
+        .period_spend(SubjectType::User, "user-1", Period::Day, period_start)
+        .await
+        .unwrap();
+    assert_eq!(by_user, 1_000);
+
+    let rows = store.spend_rows().await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|r| r.request_count == 2 && r.input_tokens == 200));
+}
+
+/// Spend is rolled up by day, so a week, month or total budget reads the sum
+/// of the days since its period began; before, those periods always read 0.
+#[tokio::test]
+async fn longer_periods_sum_the_days_since_they_began() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let today = Period::Day.bucket_start(now());
+    let long_ago = today - chrono::Duration::days(400);
+    for (day, spend) in [(today, 300), (long_ago, 1_000)] {
+        store
+            .upsert_rollup(&RollupDelta {
+                subject_type: SubjectType::Key,
+                subject_id: "key-1".into(),
+                period: Period::Day,
+                period_start: day,
+                spend_micros: spend,
+                request_count: 1,
+                input_tokens: 0,
+                output_tokens: 0,
+            })
+            .await
+            .unwrap();
+    }
+    let spend = |period: Period| {
+        let store = &store;
+        async move {
+            store
+                .period_spend(
+                    SubjectType::Key,
+                    "key-1",
+                    period,
+                    period.bucket_start(now()),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(spend(Period::Day).await, 300);
+    assert_eq!(spend(Period::Week).await, 300);
+    assert_eq!(spend(Period::Month).await, 300);
+    assert_eq!(spend(Period::Total).await, 1_300);
+}
+
+#[tokio::test]
+async fn budgets_by_user_subject() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let user_id = make_user(&store, "alice", Role::Member).await;
+
+    let budget = Budget {
+        id: new_id(),
+        subject_type: SubjectType::User,
+        subject_id: user_id.clone(),
+        period: Period::Day,
+        hard_limit_micros: 10_000,
+        soft_limit_micros: Some(8_000),
+        action: BudgetAction::Block,
+        enabled: true,
+        created_at: now(),
+        updated_at: now(),
+        deleted_at: None,
+    };
+    store.upsert_budget(&budget).await.unwrap();
+    // Upsert same id raises the cap.
+    let mut b2 = budget.clone();
+    b2.hard_limit_micros = 20_000;
+    store.upsert_budget(&b2).await.unwrap();
+
+    let budgets = store
+        .list_budgets(SubjectType::User, &user_id)
+        .await
+        .unwrap();
+    assert_eq!(budgets.len(), 1);
+    assert_eq!(budgets[0].hard_limit_micros, 20_000);
+    assert_eq!(budgets[0].action, BudgetAction::Block);
+    assert!(budgets[0].enabled);
+
+    // Admin overview lists across subjects.
+    assert_eq!(store.list_all_budgets().await.unwrap().len(), 1);
+
+    store.delete_budget(&budget.id).await.unwrap();
+    assert!(store
+        .list_budgets(SubjectType::User, &user_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store.list_all_budgets().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rate_counter_accumulates() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+
+    let window = Period::Day.bucket_start(now());
+    let a = store
+        .incr_rate_counter("key-1", "rpm", window, 1)
+        .await
+        .unwrap();
+    let b = store
+        .incr_rate_counter("key-1", "rpm", window, 2)
+        .await
+        .unwrap();
+    assert_eq!(a, 1);
+    assert_eq!(b, 3);
+}
+
+/// A `NewDeployment` of `model_name`, served by `provider`.
+fn new_dep(model_name: &str, provider: &str) -> yb_core::NewDeployment {
+    use yb_core::routing::WireFormat;
+    yb_core::NewDeployment {
+        model_name: model_name.into(),
+        provider_name: provider.into(),
+        upstream_model: "gpt-4o".into(),
+        upstream_format: WireFormat::OpenaiChat.into(),
+        weight: 2,
+        health_check: Default::default(),
+        health_path: None,
+        pricing: Some(yb_core::catalog::ModelPrice::new(2.5, 10.0)),
+    }
+}
+
+#[tokio::test]
+async fn deployments_seed_create_and_list() {
+    use yb_core::routing::WireFormat;
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+
+    let dep = new_dep("gpt-4o", "openai");
+
+    // Seeding is idempotent on the deployment's identity tuple.
+    assert!(store.seed_deployment(&dep).await.unwrap());
+    assert!(!store.seed_deployment(&dep).await.unwrap());
+
+    let all = store.list_deployments().await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].model_name, "gpt-4o");
+    assert_eq!(all[0].weight, 2);
+    assert_eq!(all[0].upstream_format, WireFormat::OpenaiChat.into());
+    assert!(all[0].pricing.is_some());
+
+    // Explicit create + soft delete.
+    let dep2 = store
+        .create_deployment(&new_dep("gpt-4o", "azure"))
+        .await
+        .unwrap();
+    assert_eq!(store.list_deployments().await.unwrap().len(), 2);
+
+    store.delete_deployment(&dep2.id).await.unwrap();
+    assert_eq!(store.list_deployments().await.unwrap().len(), 1);
+    assert!(store.get_deployment(&dep2.id).await.unwrap().is_none());
+}
+
+/// Two deployments through one provider share its endpoint and credential —
+/// the duplication that moving them off the deployment row removes.
+#[tokio::test]
+async fn deployments_share_one_provider_row() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    store
+        .seed_deployment(&new_dep("gpt-4o", "openai"))
+        .await
+        .unwrap();
+    let mut second = new_dep("text-embedding-3-small", "openai");
+    second.upstream_model = "text-embedding-3-small".into();
+    store.seed_deployment(&second).await.unwrap();
+
+    let providers = store.list_providers().await.unwrap();
+    assert_eq!(providers.len(), 1, "one endpoint, not one per deployment");
+
+    // Configure it once; both deployments read the same base and key.
+    store
+        .update_provider(
+            &providers[0].id,
+            "openai",
+            Some("https://api.example/v1"),
+            Some("sk-shared"),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let deps = store.list_deployments().await.unwrap();
+    assert_eq!(deps.len(), 2);
+    for d in &deps {
+        assert_eq!(d.provider_id, providers[0].id);
+        assert_eq!(d.api_base.as_deref(), Some("https://api.example/v1"));
+        assert_eq!(d.api_key.as_deref(), Some("sk-shared"));
+    }
+}
+
+/// Seeding stays idempotent on (model, provider, upstream model).
+#[tokio::test]
+async fn seed_deployment_is_idempotent() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let dep = new_dep("gpt-4o", "openai");
+    assert!(store.seed_deployment(&dep).await.unwrap());
+    assert!(!store.seed_deployment(&dep).await.unwrap());
+    assert_eq!(store.list_deployments().await.unwrap().len(), 1);
+}
+
+/// A provider backing live deployments cannot be deleted out from under them.
+#[tokio::test]
+async fn a_provider_in_use_cannot_be_deleted() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    store
+        .seed_deployment(&new_dep("gpt-4o", "openai"))
+        .await
+        .unwrap();
+    let p = store.get_provider_by_name("openai").await.unwrap().unwrap();
+
+    let err = store.delete_provider(&p.id).await.unwrap_err();
+    assert!(matches!(err, yb_core::Error::Conflict(_)), "got {err:?}");
+
+    // Once its deployments are gone, it can be removed.
+    for d in store.list_deployments().await.unwrap() {
+        store.delete_deployment(&d.id).await.unwrap();
+    }
+    store.delete_provider(&p.id).await.unwrap();
+    assert!(store.list_providers().await.unwrap().is_empty());
+}
+
+/// An edit that omits the key keeps the stored one. The admin API never reads a
+/// credential back out, so a round-trip through the console must not be able to
+/// blank one by omission.
+#[tokio::test]
+async fn omitting_the_api_key_on_update_keeps_it() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let p = store.ensure_provider("openai").await.unwrap();
+    store
+        .update_provider(
+            &p.id,
+            "openai",
+            None,
+            Some("sk-secret"),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+    // Rename and change the base, sending no key.
+    let after = store
+        .update_provider(
+            &p.id,
+            "openai-prod",
+            Some("https://x.test/v1"),
+            None,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.name, "openai-prod");
+    assert_eq!(after.api_base.as_deref(), Some("https://x.test/v1"));
+    assert_eq!(
+        after.api_key.as_deref(),
+        Some("sk-secret"),
+        "the key must survive"
+    );
+}
+
+/// Two deployments of one public name are the load-balancing fan-out: one
+/// model row, two deployments, one shared id.
+#[tokio::test]
+async fn two_deployments_of_one_name_share_one_model() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    store
+        .seed_deployment(&new_dep("gpt-4o", "openai"))
+        .await
+        .unwrap();
+    store
+        .seed_deployment(&new_dep("gpt-4o", "azure"))
+        .await
+        .unwrap();
+
+    let models = store.list_models().await.unwrap();
+    assert_eq!(models.len(), 1);
+    let deps = store.list_deployments().await.unwrap();
+    assert_eq!(deps.len(), 2);
+    assert_eq!(deps[0].model_id, models[0].id);
+    assert_eq!(deps[1].model_id, models[0].id);
+}
+
+#[tokio::test]
+async fn rename_model_leaves_the_old_name_as_an_alias() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    store
+        .seed_deployment(&new_dep("gpt-4o", "openai"))
+        .await
+        .unwrap();
+    let before = store.list_models().await.unwrap().pop().unwrap();
+
+    let renamed = store.rename_model(&before.id, "gpt-4o-2024").await.unwrap();
+
+    // Same entity, new name.
+    assert_eq!(renamed.id, before.id);
+    assert_eq!(renamed.name, "gpt-4o-2024");
+    assert!(store.get_model_by_name("gpt-4o").await.unwrap().is_none());
+    assert_eq!(
+        store
+            .get_model_by_name("gpt-4o-2024")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        before.id
+    );
+
+    // The old name still resolves, via the alias the rename left behind.
+    let aliases = store.list_aliases().await.unwrap();
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].alias, "gpt-4o");
+    assert_eq!(aliases[0].target, "gpt-4o-2024");
+    assert_eq!(aliases[0].model_id, before.id);
+
+    // The deployment followed the rename without being written to.
+    let deps = store.list_deployments().await.unwrap();
+    assert_eq!(deps[0].model_name, "gpt-4o-2024");
+    assert_eq!(deps[0].model_id, before.id);
+}
+
+/// The rename and its alias insert commit together, so a rejected rename must
+/// leave the model *and* the alias table exactly as they were.
+#[tokio::test]
+async fn rename_to_a_taken_name_conflicts_and_changes_nothing() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    store
+        .seed_deployment(&new_dep("gpt-4o", "openai"))
+        .await
+        .unwrap();
+    store
+        .seed_deployment(&new_dep("claude-sonnet", "anthropic"))
+        .await
+        .unwrap();
+    let target = store.get_model_by_name("gpt-4o").await.unwrap().unwrap();
+
+    let err = store
+        .rename_model(&target.id, "claude-sonnet")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, yb_core::Error::Conflict(_)), "got {err:?}");
+
+    assert_eq!(
+        store.get_model_by_name("gpt-4o").await.unwrap().unwrap().id,
+        target.id
+    );
+    assert!(store.list_aliases().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rename_of_an_unknown_model_is_not_found() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let err = store.rename_model("nope", "whatever").await.unwrap_err();
+    assert!(matches!(err, yb_core::Error::NotFound(_)), "got {err:?}");
+}
+
+/// Renaming back consumes the alias the first rename created, rather than
+/// conflicting with it or leaving a self-referential `a -> a` behind.
+#[tokio::test]
+async fn rename_back_consumes_its_own_alias() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    store
+        .seed_deployment(&new_dep("a", "openai"))
+        .await
+        .unwrap();
+    let m = store.get_model_by_name("a").await.unwrap().unwrap();
+
+    store.rename_model(&m.id, "b").await.unwrap();
+    store.rename_model(&m.id, "a").await.unwrap();
+
+    let aliases = store.list_aliases().await.unwrap();
+    assert_eq!(aliases.len(), 1, "expected only b -> a, got {aliases:?}");
+    assert_eq!(aliases[0].alias, "b");
+    assert_eq!(aliases[0].target, "a");
+}
+
+/// A public name is either a model's or an alias's, never both.
+///
+/// Found the hard way: rename `luna` -> `nova` (leaving `luna` as an alias),
+/// then re-run `gateway import` with a file that still says `luna`. Without
+/// this guard `ensure_model` happily created a second model called `luna`, and
+/// because a concrete model shadows an alias in `Snapshot::canonical`, the
+/// alias silently stopped resolving to `nova`.
+#[tokio::test]
+async fn a_model_cannot_be_created_over_an_existing_alias() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    store
+        .seed_deployment(&new_dep("luna", "openai"))
+        .await
+        .unwrap();
+    let m = store.get_model_by_name("luna").await.unwrap().unwrap();
+    store.rename_model(&m.id, "nova").await.unwrap();
+
+    // "luna" is now an alias of "nova" — re-importing the stale name must fail
+    // loudly rather than shadow it.
+    let err = store.ensure_model("luna").await.unwrap_err();
+    assert!(matches!(err, yb_core::Error::Conflict(_)), "got {err:?}");
+    assert!(
+        err.to_string().contains("nova"),
+        "the error should name the target: {err}"
+    );
+
+    // And the alias still resolves.
+    assert_eq!(store.list_models().await.unwrap().len(), 1);
+    let aliases = store.list_aliases().await.unwrap();
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].alias, "luna");
+    assert_eq!(aliases[0].target, "nova");
+}
+
+/// Aliases store the model id, so a rename retargets every one of them with no
+/// write to the alias table at all.
+#[tokio::test]
+async fn renaming_retargets_every_alias() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    store
+        .seed_deployment(&new_dep("gpt-4o", "openai"))
+        .await
+        .unwrap();
+    let m = store.get_model_by_name("gpt-4o").await.unwrap().unwrap();
+    store.upsert_alias("fast", &m.id).await.unwrap();
+    store.upsert_alias("smart", &m.id).await.unwrap();
+
+    store.rename_model(&m.id, "gpt-4o-2024").await.unwrap();
+
+    let aliases = store.list_aliases().await.unwrap();
+    for a in &aliases {
+        assert_eq!(
+            a.target, "gpt-4o-2024",
+            "alias {} did not follow the rename",
+            a.alias
+        );
+    }
+    // fast, smart, and the old name.
+    assert_eq!(aliases.len(), 3);
+}
+
+#[tokio::test]
+async fn model_aliases_upsert_list_delete() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+
+    assert!(store.list_aliases().await.unwrap().is_empty());
+
+    let a = store.ensure_model("gpt-4o").await.unwrap();
+    let b = store.ensure_model("gpt-4o-mini").await.unwrap();
+
+    store.upsert_alias("gpt-4", &a.id).await.unwrap();
+    // Upsert on the same alias key repoints it (uniqueness via PK).
+    store.upsert_alias("gpt-4", &b.id).await.unwrap();
+
+    let all = store.list_aliases().await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].alias, "gpt-4");
+    assert_eq!(all[0].target, "gpt-4o-mini");
+    assert_eq!(all[0].model_id, b.id);
+
+    store.delete_alias("gpt-4").await.unwrap();
+    assert!(store.list_aliases().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn embed_format_deployment_roundtrips() {
+    use yb_core::routing::{EmbedFormat, UpstreamFormat};
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let dep = yb_core::NewDeployment {
+        model_name: "embedding-omni-default".into(),
+        provider_name: "runtime".into(),
+        upstream_model: "LCO-Embedding-Omni".into(),
+        upstream_format: EmbedFormat::OpenaiEmbed.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+    };
+    store.create_deployment(&dep).await.unwrap();
+    let all = store.list_deployments().await.unwrap();
+    assert_eq!(
+        all[0].upstream_format,
+        UpstreamFormat::Embed(EmbedFormat::OpenaiEmbed)
+    );
+}
+
+/// The edge flags are a JSON object on the *provider* row now: they round-trip
+/// onto every deployment served through it, and a row written before the column
+/// existed (NULL/blank) decodes to "no extras" rather than failing the whole
+/// list query.
+#[tokio::test]
+async fn provider_extra_roundtrip_and_lenient_decode() {
+    use yb_core::routing::Extra;
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    store
+        .seed_deployment(&new_dep("lambda0", "vllm"))
+        .await
+        .unwrap();
+    let p = store.get_provider_by_name("vllm").await.unwrap().unwrap();
+    store
+        .update_provider(
+            &p.id,
+            "vllm",
+            Some("https://lambda0.example/v1"),
+            Some("sk-origin"),
+            &Extra {
+                cloudflare_access: true,
+                headers: [("X-Tenant".to_string(), "acme".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // The deployment reads the provider's edge settings through the join.
+    let got = store.list_deployments().await.unwrap().pop().unwrap();
+    assert!(got.extra.cloudflare_access);
+    assert_eq!(
+        got.extra.headers.get("X-Tenant").map(String::as_str),
+        Some("acme")
+    );
+    assert!(got.to_deployment().extra.cloudflare_access);
+
+    // Decoding is lenient: a blank or unrecognised value degrades to "no extras"
+    // instead of failing the query, so one bad row cannot take the list down.
+    for bad in ["", "   ", "not json"] {
+        set_column(&store, "providers", "extra", bad, &p.id).await;
+        let got = store.get_provider(&p.id).await.unwrap().unwrap();
+        assert!(
+            got.extra.is_empty(),
+            "value {bad:?} should decode to default"
+        );
+        assert_eq!(store.list_deployments().await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn api_key_scopes_roundtrip_and_legacy_single_value() {
+    use yb_core::model::KeyScope;
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let user_id = make_user(&store, "scoped", Role::Admin).await;
+
+    // A key holding BOTH scopes round-trips as a set.
+    let issued = issue_api_key(
+        &store,
+        &user_id,
+        Some("dual".into()),
+        None,
+        vec![KeyScope::Inference, KeyScope::Admin],
+        AccessPolicy::default(),
+        LimitColumns::default(),
+    )
+    .await
+    .unwrap();
+    let auth = store
+        .verify_api_key(&hash_token(&issued.token))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(auth.api_key.has_scope(KeyScope::Inference));
+    assert!(auth.api_key.has_scope(KeyScope::Admin));
+    assert_eq!(auth.api_key.scopes.len(), 2);
+
+    // A pre-existing row storing a single bare value (the old storage form)
+    // parses to a one-element set — no migration needed.
+    set_column(&store, "api_keys", "scope", "admin", &auth.api_key.id).await;
+    let auth = store
+        .verify_api_key(&hash_token(&issued.token))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(auth.api_key.scopes, vec![KeyScope::Admin]);
+}
+
+/// The control key exists after `serve` starts, acts as an administrator with
+/// both scopes, survives a restart unchanged, and a new token revokes the old.
+#[tokio::test]
+async fn control_key_is_ensured_and_rotated() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    let first = ensure_control_key(&store, "control-token-one")
+        .await
+        .unwrap();
+    let auth = store
+        .verify_api_key(&hash_token("control-token-one"))
+        .await
+        .unwrap()
+        .expect("the control token authenticates");
+    assert_eq!(auth.user.username, "control");
+    assert_eq!(auth.user.role, Role::Admin);
+    assert!(auth.api_key.has_scope(yb_core::KeyScope::Admin));
+    assert!(auth.api_key.has_scope(yb_core::KeyScope::Inference));
+    assert!(!Argon2Hasher.verify("", &auth.user.password_hash));
+
+    let again = ensure_control_key(&store, "control-token-one")
+        .await
+        .unwrap();
+    assert_eq!(again.id, first.id, "a restart keeps the same key");
+
+    ensure_control_key(&store, "control-token-two")
+        .await
+        .unwrap();
+    assert!(store
+        .verify_api_key(&hash_token("control-token-one"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .verify_api_key(&hash_token("control-token-two"))
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(store.count_users().await.unwrap(), 1);
+}
+
+/// No policy is kept until an operator sets one, and the policy set is the
+/// one read back, across the one row the table holds.
+#[tokio::test]
+async fn the_capture_policy_starts_off_and_keeps_what_is_set() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    assert_eq!(store.capture_policy().await.unwrap(), None);
+    for policy in [
+        yb_core::CapturePolicy {
+            enabled: true,
+            redaction: yb_core::Redaction::MetadataOnly,
+            retention_days: 7,
+        },
+        yb_core::CapturePolicy {
+            enabled: false,
+            redaction: yb_core::Redaction::None,
+            retention_days: 0,
+        },
+    ] {
+        store.set_capture_policy(&policy).await.unwrap();
+        assert_eq!(store.capture_policy().await.unwrap(), Some(policy));
+    }
+}
+
+/// No level is kept until an operator sets one, and the last one set is read
+/// back.
+#[tokio::test]
+async fn the_log_level_is_unset_until_one_is_kept() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    assert_eq!(store.log_level().await.unwrap(), None);
+    for level in [yb_core::LogLevel::Debug, yb_core::LogLevel::Warn] {
+        store.set_log_level(level).await.unwrap();
+        assert_eq!(store.log_level().await.unwrap(), Some(level));
+    }
+}
