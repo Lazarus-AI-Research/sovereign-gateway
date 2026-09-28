@@ -88,6 +88,8 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
                 name: req_str(f, "name")?.to_string(),
                 description: opt_str(f, "description").map(str::to_string),
                 input_schema: f.get("parameters").cloned().unwrap_or(json!({})),
+                strict: f.get("strict").and_then(Value::as_bool),
+                anthropic_cache_control: None,
             });
         }
     }
@@ -166,6 +168,7 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
                 f.insert("name".into(), json!(t.name));
                 insert_opt(&mut f, "description", t.description.clone());
                 f.insert("parameters".into(), t.input_schema.clone());
+                insert_opt(&mut f, "strict", t.strict);
                 json!({"type": "function", "function": Value::Object(f)})
             })
             .collect();
@@ -267,7 +270,9 @@ fn emit_assistant(m: &Message) -> Result<Value> {
     let mut tool_calls: Vec<Value> = Vec::new();
     for b in &m.content {
         match b {
-            ContentBlock::Text { text: t } => text.push_str(t),
+            ContentBlock::Text { text: t } | ContentBlock::CachedText { text: t, .. } => {
+                text.push_str(t)
+            }
             ContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(json!({
                     "id": id,
@@ -305,13 +310,15 @@ fn emit_assistant(m: &Message) -> Result<Value> {
 
 /// Build OpenAI user `content`: a plain string when all-text, else a parts array.
 fn emit_user_content(blocks: &[&ContentBlock]) -> Value {
-    if blocks
-        .iter()
-        .all(|b| matches!(b, ContentBlock::Text { .. }))
-    {
+    if blocks.iter().all(|b| {
+        matches!(
+            b,
+            ContentBlock::Text { .. } | ContentBlock::CachedText { .. }
+        )
+    }) {
         let mut s = String::new();
         for b in blocks {
-            if let ContentBlock::Text { text } = b {
+            if let ContentBlock::Text { text } | ContentBlock::CachedText { text, .. } = b {
                 s.push_str(text);
             }
         }
@@ -320,7 +327,9 @@ fn emit_user_content(blocks: &[&ContentBlock]) -> Value {
     let parts: Vec<Value> = blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(json!({"type": "text", "text": text})),
+            ContentBlock::Text { text } | ContentBlock::CachedText { text, .. } => {
+                Some(json!({"type": "text", "text": text}))
+            }
             ContentBlock::Image {
                 media_type,
                 data,
@@ -388,7 +397,9 @@ pub fn emit_response(resp: &ChatResponse) -> Result<Vec<u8>> {
     let mut tool_calls: Vec<Value> = Vec::new();
     for b in &resp.content {
         match b {
-            ContentBlock::Text { text: t } => text.push_str(t),
+            ContentBlock::Text { text: t } | ContentBlock::CachedText { text: t, .. } => {
+                text.push_str(t)
+            }
             ContentBlock::Thinking { text: t, .. } => reasoning.push_str(t),
             ContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                 "id": id,
@@ -561,7 +572,7 @@ fn parse_arguments(s: Option<&str>) -> Value {
 fn join_text(blocks: &[ContentBlock]) -> String {
     let mut s = String::new();
     for b in blocks {
-        if let ContentBlock::Text { text } = b {
+        if let ContentBlock::Text { text } | ContentBlock::CachedText { text, .. } = b {
             s.push_str(text);
         }
     }
