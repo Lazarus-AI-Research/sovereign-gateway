@@ -98,12 +98,19 @@ impl Gateway {
                 body: up_body,
                 stream: false,
             };
-            let resp = match self.client.send(ureq).await {
+            // A pooled connection the upstream closed as it was reused fails
+            // in transport before the upstream sees the request; an embedding
+            // changes nothing upstream, so the same deployment is asked once
+            // more before the next candidate.
+            let resp = match self.client.send(ureq.clone()).await {
                 Ok(r) => r,
-                Err(e) => {
-                    last_err = Some(e);
-                    continue;
-                }
+                Err(_) => match self.client.send(ureq).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                },
             };
 
             let status = resp.status;

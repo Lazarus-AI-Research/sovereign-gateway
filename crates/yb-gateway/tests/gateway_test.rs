@@ -610,6 +610,71 @@ async fn embed_happy_path_records_telemetry() {
     assert!(!telemetry[0].is_error);
 }
 
+/// An upstream whose first request fails in transport, as a pooled
+/// connection it closed while the gateway reused it does; it counts every
+/// request it is sent.
+struct ClosedOnce {
+    sent: std::sync::atomic::AtomicUsize,
+    failures: usize,
+}
+
+#[async_trait]
+impl UpstreamClient for ClosedOnce {
+    async fn send(
+        &self,
+        _req: yb_providers::UpstreamRequest,
+    ) -> Result<yb_providers::UpstreamResponse> {
+        let sent = self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if sent < self.failures {
+            return Err(yb_core::Error::Upstream {
+                provider: "upstream".into(),
+                status: 502,
+                message: "error sending request".into(),
+            });
+        }
+        let upstream = json!({
+            "object": "list", "model": "text-embedding-3-small",
+            "data": [{"object": "embedding", "index": 0, "embedding": [1.0]}],
+            "usage": {"prompt_tokens": 1, "total_tokens": 1}
+        });
+        Ok(yb_providers::UpstreamResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: yb_providers::ResponseBody::Full(serde_json::to_vec(&upstream).unwrap()),
+        })
+    }
+}
+
+/// An embedding whose request fails in transport is sent to the same
+/// deployment once more; a second failure is the answer.
+#[tokio::test]
+async fn an_embedding_is_sent_again_once_after_a_transport_failure() {
+    use yb_core::EmbedFormat;
+    let body = serde_json::to_vec(&json!({"model": "my-embed", "input": "hello"})).unwrap();
+    for (failures, want) in [(1, Ok(200)), (2, Err(502))] {
+        let client = Arc::new(ClosedOnce {
+            sent: Default::default(),
+            failures,
+        });
+        let gateway = Gateway::new(
+            client.clone(),
+            Arc::new(embed_router()),
+            Arc::new(RecordingStore::default()),
+            Arc::new(NullLogger),
+        );
+        let got = gateway
+            .handle_embed(EmbedFormat::OpenaiEmbed, &body, RequestCtx::new())
+            .await
+            .map(|resp| match resp {
+                GatewayResponse::Full { status, .. } => status,
+                _ => panic!("expected a buffered response"),
+            })
+            .map_err(|err| err.http_status());
+        assert_eq!(got, want, "after {failures} failures");
+        assert_eq!(client.sent.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+}
+
 #[tokio::test]
 async fn kind_mismatch_is_a_clean_400_both_ways() {
     use yb_core::EmbedFormat;
