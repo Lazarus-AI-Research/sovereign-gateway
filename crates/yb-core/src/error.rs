@@ -49,6 +49,12 @@ pub enum Error {
         message: String,
     },
 
+    /// The connection to an upstream was lost while the request was sent,
+    /// as a pooled connection the upstream closed while it was reused is:
+    /// neither a failed connect nor a timeout.
+    #[error("upstream connection lost: {0}")]
+    ConnectionLost(String),
+
     #[error("storage error: {0}")]
     Storage(String),
 
@@ -78,6 +84,7 @@ impl Error {
             Error::RateLimited { .. } => 429,
             Error::NoEligibleProvider(_) => 400,
             Error::Upstream { status, .. } => *status,
+            Error::ConnectionLost(_) => 502,
             // Wire errors overwhelmingly stem from a client body the
             // translators cannot represent (unknown fields/roles, token
             // arrays, unsupported content): a client error, not a server one.
@@ -97,7 +104,7 @@ impl Error {
             Error::BudgetExceeded(_) => "budget_exceeded",
             Error::RateLimited { .. } => "rate_limited",
             Error::NoEligibleProvider(_) => "no_eligible_provider",
-            Error::Upstream { .. } => "upstream_error",
+            Error::Upstream { .. } | Error::ConnectionLost(_) => "upstream_error",
             Error::Storage(_) => "storage_error",
             Error::Crypto(_) => "crypto_error",
             Error::Config(_) => "config_error",

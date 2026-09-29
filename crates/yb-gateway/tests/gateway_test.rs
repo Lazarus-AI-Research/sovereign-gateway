@@ -610,6 +610,95 @@ async fn embed_happy_path_records_telemetry() {
     assert!(!telemetry[0].is_error);
 }
 
+/// An upstream whose first requests fail with the given error; it counts
+/// every request it is sent.
+struct FailingFirst {
+    sent: std::sync::atomic::AtomicUsize,
+    failures: usize,
+    error: fn() -> yb_core::Error,
+}
+
+#[async_trait]
+impl UpstreamClient for FailingFirst {
+    async fn send(
+        &self,
+        _req: yb_providers::UpstreamRequest,
+    ) -> Result<yb_providers::UpstreamResponse> {
+        let sent = self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if sent < self.failures {
+            return Err((self.error)());
+        }
+        let upstream = json!({
+            "object": "list", "model": "text-embedding-3-small",
+            "data": [{"object": "embedding", "index": 0, "embedding": [1.0]}],
+            "usage": {"prompt_tokens": 1, "total_tokens": 1}
+        });
+        Ok(yb_providers::UpstreamResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: yb_providers::ResponseBody::Full(serde_json::to_vec(&upstream).unwrap()),
+        })
+    }
+}
+
+fn connection_lost() -> yb_core::Error {
+    yb_core::Error::ConnectionLost("connection closed before message completed".into())
+}
+
+fn connect_failed() -> yb_core::Error {
+    yb_core::Error::Upstream {
+        provider: "upstream".into(),
+        status: 502,
+        message: "error trying to connect".into(),
+    }
+}
+
+/// How many first requests fail and with what, the answer the caller gets,
+/// and how many requests the upstream is sent.
+type Case = (
+    usize,
+    fn() -> yb_core::Error,
+    std::result::Result<u16, u16>,
+    usize,
+);
+
+/// An embedding whose connection is lost as it is sent goes to the same
+/// deployment once more, and a second loss is the answer; a failed connect
+/// is not retried.
+#[tokio::test]
+async fn an_embedding_is_sent_again_once_after_its_connection_is_lost() {
+    use yb_core::EmbedFormat;
+    let body = serde_json::to_vec(&json!({"model": "my-embed", "input": "hello"})).unwrap();
+    let cases: [Case; 3] = [
+        (1, connection_lost, Ok(200), 2),
+        (2, connection_lost, Err(502), 2),
+        (1, connect_failed, Err(502), 1),
+    ];
+    for (failures, error, want, sends) in cases {
+        let client = Arc::new(FailingFirst {
+            sent: Default::default(),
+            failures,
+            error,
+        });
+        let gateway = Gateway::new(
+            client.clone(),
+            Arc::new(embed_router()),
+            Arc::new(RecordingStore::default()),
+            Arc::new(NullLogger),
+        );
+        let got = gateway
+            .handle_embed(EmbedFormat::OpenaiEmbed, &body, RequestCtx::new())
+            .await
+            .map(|resp| match resp {
+                GatewayResponse::Full { status, .. } => status,
+                _ => panic!("expected a buffered response"),
+            })
+            .map_err(|err| err.http_status());
+        assert_eq!(got, want, "after {failures} failures");
+        assert_eq!(client.sent.load(std::sync::atomic::Ordering::SeqCst), sends);
+    }
+}
+
 #[tokio::test]
 async fn kind_mismatch_is_a_clean_400_both_ways() {
     use yb_core::EmbedFormat;

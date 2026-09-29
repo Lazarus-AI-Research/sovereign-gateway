@@ -60,6 +60,17 @@ fn map_transport_err(e: reqwest::Error) -> Error {
     }
 }
 
+/// A failure while the request was sent: one that is neither a connect
+/// failure nor a timeout lost a connection that was open, which a pooled
+/// connection the upstream closed as it was reused does. The caller may send
+/// such a request again; every other failure maps as any transport error.
+fn map_send_err(e: reqwest::Error) -> Error {
+    if e.is_request() && !e.is_connect() && !e.is_timeout() {
+        return Error::ConnectionLost(e.to_string());
+    }
+    map_transport_err(e)
+}
+
 /// Collects a `reqwest::HeaderMap` into ordered `(name, value)` pairs, lossily
 /// decoding any non-UTF-8 header values.
 fn collect_headers(map: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
@@ -87,7 +98,7 @@ impl UpstreamClient for HttpClient {
             builder = builder.header(name, value);
         }
 
-        let resp = builder.send().await.map_err(map_transport_err)?;
+        let resp = builder.send().await.map_err(map_send_err)?;
 
         let status = resp.status().as_u16();
         let headers = collect_headers(resp.headers());
