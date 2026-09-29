@@ -325,6 +325,8 @@ pub struct Usage {
     pub cache_read_tokens: u32,
     #[serde(default)]
     pub cache_write_tokens: u32,
+    #[serde(default)]
+    pub reasoning_tokens: u32,
 }
 
 impl Usage {
@@ -341,6 +343,7 @@ impl Usage {
         self.output_tokens = self.output_tokens.max(other.output_tokens);
         self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
         self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.max(other.reasoning_tokens);
     }
 
     /// Whether any token was reported at all.
@@ -352,6 +355,7 @@ impl Usage {
             && self.output_tokens == 0
             && self.cache_read_tokens == 0
             && self.cache_write_tokens == 0
+            && self.reasoning_tokens == 0
     }
 }
 

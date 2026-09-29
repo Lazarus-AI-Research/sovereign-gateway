@@ -428,11 +428,7 @@ pub fn emit_response(resp: &ChatResponse) -> Result<Vec<u8>> {
             "message": Value::Object(message),
             "finish_reason": stop_to_finish(&resp.stop_reason),
         }],
-        "usage": {
-            "prompt_tokens": u.input_tokens,
-            "completion_tokens": u.output_tokens,
-            "total_tokens": u.input_tokens + u.output_tokens,
-        },
+        "usage": emit_usage(u),
     });
     Ok(serde_json::to_vec(&body)?)
 }
@@ -447,8 +443,33 @@ fn parse_usage(v: Option<&Value>) -> Usage {
         input_tokens: opt_u32(v, "prompt_tokens").unwrap_or(0),
         output_tokens: opt_u32(v, "completion_tokens").unwrap_or(0),
         cache_read_tokens: cache_read,
-        cache_write_tokens: 0,
+        cache_write_tokens: v
+            .get("prompt_tokens_details")
+            .and_then(|d| opt_u32(d, "cache_write_tokens"))
+            .unwrap_or(0),
+        reasoning_tokens: v
+            .get("completion_tokens_details")
+            .and_then(|d| opt_u32(d, "reasoning_tokens"))
+            .unwrap_or(0),
     }
+}
+
+fn emit_usage(u: &Usage) -> Value {
+    let mut usage = json!({
+        "prompt_tokens": u.input_tokens,
+        "completion_tokens": u.output_tokens,
+        "total_tokens": u.input_tokens + u.output_tokens,
+    });
+    if u.cache_read_tokens > 0 || u.cache_write_tokens > 0 {
+        usage["prompt_tokens_details"] = json!({
+            "cached_tokens": u.cache_read_tokens,
+            "cache_write_tokens": u.cache_write_tokens,
+        });
+    }
+    if u.reasoning_tokens > 0 {
+        usage["completion_tokens_details"] = json!({"reasoning_tokens": u.reasoning_tokens});
+    }
+    usage
 }
 
 // ===========================================================================
@@ -852,11 +873,7 @@ fn write_usage_chunk(out: &mut String, state: &EmitState, u: &Usage) {
         "created": 0,
         "model": state.model,
         "choices": [],
-        "usage": {
-            "prompt_tokens": u.input_tokens,
-            "completion_tokens": u.output_tokens,
-            "total_tokens": u.input_tokens + u.output_tokens,
-        },
+        "usage": emit_usage(u),
     });
     out.push_str("data: ");
     out.push_str(&chunk.to_string());

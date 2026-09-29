@@ -256,6 +256,7 @@ fn parse_usage(v: Option<&Value>) -> Usage {
         output_tokens: opt_u32(v, "output_tokens").unwrap_or(0),
         cache_read_tokens: opt_u32(v, "cache_read_input_tokens").unwrap_or(0),
         cache_write_tokens: opt_u32(v, "cache_creation_input_tokens").unwrap_or(0),
+        reasoning_tokens: 0,
     }
 }
 
