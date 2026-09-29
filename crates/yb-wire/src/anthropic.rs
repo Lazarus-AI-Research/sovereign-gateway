@@ -72,6 +72,8 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
                 name: req_str(t, "name")?.to_string(),
                 description: opt_str(t, "description").map(str::to_string),
                 input_schema: t.get("input_schema").cloned().unwrap_or(Value::Null),
+                strict: None,
+                anthropic_cache_control: t.get("cache_control").cloned(),
             });
         }
     }
@@ -133,6 +135,9 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
                 o.insert("name".into(), json!(t.name));
                 insert_opt(&mut o, "description", t.description.clone());
                 o.insert("input_schema".into(), t.input_schema.clone());
+                if let Some(control) = &t.anthropic_cache_control {
+                    o.insert("cache_control".into(), control.clone());
+                }
                 Value::Object(o)
             })
             .collect();
@@ -275,8 +280,29 @@ fn parse_content(v: &Value) -> Result<Vec<ContentBlock>> {
 }
 
 fn parse_block(b: &Value) -> Result<ContentBlock> {
+    if b.get("cache_control").is_some() && opt_str(b, "type") != Some("text") {
+        return Ok(ContentBlock::Native {
+            format: "anthropic".into(),
+            raw: b.clone(),
+        });
+    }
     match opt_str(b, "type") {
-        Some("text") => Ok(ContentBlock::text(opt_str(b, "text").unwrap_or_default())),
+        Some("text") => {
+            let text = opt_str(b, "text").unwrap_or_default().to_string();
+            if let Some(control) = b.get("cache_control") {
+                if opt_str(control, "type") == Some("ephemeral") {
+                    return Ok(ContentBlock::CachedText {
+                        text,
+                        ttl: opt_str(control, "ttl").map(str::to_string),
+                    });
+                }
+                return Ok(ContentBlock::Native {
+                    format: "anthropic".into(),
+                    raw: b.clone(),
+                });
+            }
+            Ok(ContentBlock::text(text))
+        }
         Some("image") => {
             let src = b.get("source").unwrap_or(&Value::Null);
             match opt_str(src, "type") {
@@ -331,6 +357,13 @@ fn parse_block(b: &Value) -> Result<ContentBlock> {
 fn emit_block(b: &ContentBlock) -> Value {
     match b {
         ContentBlock::Text { text } => json!({"type": "text", "text": text}),
+        ContentBlock::CachedText { text, ttl } => {
+            let mut control = json!({"type": "ephemeral"});
+            if let Some(ttl) = ttl {
+                control["ttl"] = json!(ttl);
+            }
+            json!({"type": "text", "text": text, "cache_control": control})
+        }
         ContentBlock::Image {
             media_type,
             data,

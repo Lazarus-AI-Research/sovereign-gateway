@@ -61,6 +61,8 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
                     name: req_str(t, "name")?.to_string(),
                     description: opt_str(t, "description").map(str::to_string),
                     input_schema: t.get("parameters").cloned().unwrap_or(json!({})),
+                    strict: t.get("strict").and_then(Value::as_bool),
+                    anthropic_cache_control: None,
                 });
             }
         }
@@ -76,6 +78,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
     }
     req.prompt_cache_key = opt_str(&v, "prompt_cache_key").map(str::to_string);
     req.prompt_cache_retention = opt_str(&v, "prompt_cache_retention").map(str::to_string);
+    req.prompt_cache_options = v.get("prompt_cache_options").cloned();
 
     Ok(req)
 }
@@ -217,7 +220,9 @@ fn join_parts(item: &Value) -> String {
                 parse_content_parts(Some(v))
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.clone()),
+                        ContentBlock::Text { text } | ContentBlock::CachedText { text, .. } => {
+                            Some(text.clone())
+                        }
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -234,7 +239,15 @@ fn parse_content_parts(v: Option<&Value>) -> Vec<ContentBlock> {
             .iter()
             .filter_map(|p| match opt_str(p, "type") {
                 Some("input_text") | Some("output_text") | Some("text") => {
-                    Some(ContentBlock::text(opt_str(p, "text").unwrap_or_default()))
+                    let text = opt_str(p, "text").unwrap_or_default().to_string();
+                    if p.get("prompt_cache_breakpoint")
+                        .and_then(|b| opt_str(b, "mode"))
+                        == Some("explicit")
+                    {
+                        Some(ContentBlock::CachedText { text, ttl: None })
+                    } else {
+                        Some(ContentBlock::text(text))
+                    }
                 }
                 Some("input_image") => {
                     let url = opt_str(p, "image_url").unwrap_or_default();
@@ -272,9 +285,16 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     // is never persisted upstream.
     body.insert("store".into(), json!(false));
 
+    let marked_system = req.system.as_ref().is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::CachedText { .. }))
+    });
     if let Some(system) = &req.system {
         // The Responses `instructions` field is a single string.
-        body.insert("instructions".into(), json!(join_text(system)));
+        if !marked_system {
+            body.insert("instructions".into(), json!(join_text(system)));
+        }
     }
 
     // A Responses→Responses relay forwards the client's `input` untouched, so
@@ -287,6 +307,12 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
         Some(items) => items.clone(),
         None => {
             let mut out = Vec::new();
+            if marked_system {
+                if let Some(system) = &req.system {
+                    out.push(json!({"type": "message", "role": "developer",
+                        "content": response_text_parts(system)}));
+                }
+            }
             for m in &req.messages {
                 emit_input_items(m, &mut out)?;
             }
@@ -294,6 +320,17 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
         }
     };
     body.insert("input".into(), Value::Array(input));
+    if let Some(options) = &req.prompt_cache_options {
+        body.insert("prompt_cache_options".into(), options.clone());
+    } else if marked_system
+        || req.messages.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::CachedText { .. }))
+        })
+    {
+        body.insert("prompt_cache_options".into(), json!({"mode": "explicit"}));
+    }
 
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
@@ -305,6 +342,7 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
                 o.insert("name".into(), json!(t.name));
                 insert_opt(&mut o, "description", t.description.clone());
                 o.insert("parameters".into(), t.input_schema.clone());
+                insert_opt(&mut o, "strict", t.strict);
                 Value::Object(o)
             })
             .collect();
@@ -339,18 +377,30 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     Ok((bytes, headers))
 }
 
+fn response_text_parts(blocks: &[ContentBlock]) -> Vec<Value> {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(json!({"type": "input_text", "text": text})),
+            ContentBlock::CachedText { text, .. } => Some(json!({"type": "input_text",
+            "text": text, "prompt_cache_breakpoint": {"mode": "explicit"}})),
+            _ => None,
+        })
+        .collect()
+}
+
 fn emit_input_items(m: &Message, out: &mut Vec<Value>) -> Result<()> {
     match m.role {
         Role::System => {
             out.push(json!({"type": "message", "role": "system",
-                "content": [{"type": "input_text", "text": m.text()}]}));
+                "content": response_text_parts(&m.content)}));
         }
         Role::Developer => {
             // Preserve `developer` verbatim: it may legally appear mid-conversation
             // (unlike `system`), and backends that convert Responses input to chat
             // reject a `system` message that is not first.
             out.push(json!({"type": "message", "role": "developer",
-                "content": [{"type": "input_text", "text": m.text()}]}));
+                "content": response_text_parts(&m.content)}));
         }
         Role::User => {
             // Tool results inside a user turn become function_call_output items;
@@ -368,6 +418,10 @@ fn emit_input_items(m: &Message, out: &mut Vec<Value>) -> Result<()> {
                     }
                     ContentBlock::Text { text } => {
                         parts.push(json!({"type": "input_text", "text": text}));
+                    }
+                    ContentBlock::CachedText { text, .. } => {
+                        parts.push(json!({"type": "input_text", "text": text,
+                            "prompt_cache_breakpoint": {"mode": "explicit"}}));
                     }
                     ContentBlock::Image {
                         media_type,
@@ -407,6 +461,10 @@ fn emit_input_items(m: &Message, out: &mut Vec<Value>) -> Result<()> {
                 match b {
                     ContentBlock::Text { text } => {
                         parts.push(json!({"type": "output_text", "text": text}));
+                    }
+                    ContentBlock::CachedText { text, .. } => {
+                        parts.push(json!({"type": "output_text", "text": text,
+                            "prompt_cache_breakpoint": {"mode": "explicit"}}));
                     }
                     ContentBlock::ToolUse { id, name, input } => {
                         // Flush any pending assistant text first so the message
@@ -511,7 +569,7 @@ pub fn emit_response(resp: &ChatResponse) -> Result<Vec<u8>> {
     let mut text_parts: Vec<Value> = Vec::new();
     for b in &resp.content {
         match b {
-            ContentBlock::Text { text } => {
+            ContentBlock::Text { text } | ContentBlock::CachedText { text, .. } => {
                 text_parts.push(json!({"type": "output_text", "text": text}));
             }
             ContentBlock::ToolUse { id, name, input } => {
@@ -601,7 +659,7 @@ fn parse_arguments(s: Option<&str>) -> Value {
 fn join_text(blocks: &[ContentBlock]) -> String {
     let mut s = String::new();
     for b in blocks {
-        if let ContentBlock::Text { text } = b {
+        if let ContentBlock::Text { text } | ContentBlock::CachedText { text, .. } = b {
             s.push_str(text);
         }
     }
@@ -1228,6 +1286,85 @@ mod tests {
         let output = &completed(&sse)["response"]["usage"];
         assert_eq!(output["input_tokens_details"]["cached_tokens"], 1436);
         assert_eq!(output["output_tokens_details"]["reasoning_tokens"], 57);
+    }
+
+    #[test]
+    fn strict_function_schema_round_trips() {
+        let body = json!({"model": "m", "input": "hi", "tools": [{
+            "type": "function", "name": "submit", "strict": true,
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+        }]});
+        let req = parse_request(body.to_string().as_bytes()).unwrap();
+        let emitted = emit_request(&req, &EmitOptions::default()).unwrap();
+        let output: Value = serde_json::from_slice(&emitted.0).unwrap();
+        assert_eq!(output["tools"][0]["strict"], true);
+        let chat = crate::openai_chat::emit_request(&req, &EmitOptions::default()).unwrap();
+        let chat: Value = serde_json::from_slice(&chat.0).unwrap();
+        assert_eq!(chat["tools"][0]["function"]["strict"], true);
+        let chat_req = crate::openai_chat::parse_request(chat.to_string().as_bytes()).unwrap();
+        let back = emit_request(&chat_req, &EmitOptions::default()).unwrap();
+        let back: Value = serde_json::from_slice(&back.0).unwrap();
+        assert_eq!(back["tools"][0]["strict"], true);
+    }
+
+    #[test]
+    fn explicit_breakpoint_round_trips_and_maps_to_anthropic() {
+        let body = json!({"model": "m", "prompt_cache_options": {"mode": "explicit"},
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "stable",
+                 "prompt_cache_breakpoint": {"mode": "explicit"}},
+                {"type": "input_text", "text": "dynamic"}]}]});
+        let req = parse_request(body.to_string().as_bytes()).unwrap();
+        let same = emit_request(&req, &EmitOptions::default()).unwrap();
+        let same: Value = serde_json::from_slice(&same.0).unwrap();
+        assert_eq!(same["prompt_cache_options"], body["prompt_cache_options"]);
+        assert_eq!(same["input"], body["input"]);
+        let cross = crate::anthropic::emit_request(&req, &EmitOptions::default()).unwrap();
+        let cross: Value = serde_json::from_slice(&cross.0).unwrap();
+        assert_eq!(
+            cross["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn anthropic_explicit_breakpoint_maps_to_responses() {
+        let body = json!({"model": "m", "max_tokens": 100,
+            "system": [{"type": "text", "text": "stable system",
+                "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "stable user",
+                "cache_control": {"type": "ephemeral"}}]}]});
+        let req = crate::anthropic::parse_request(body.to_string().as_bytes()).unwrap();
+        let same = crate::anthropic::emit_request(&req, &EmitOptions::default()).unwrap();
+        let same: Value = serde_json::from_slice(&same.0).unwrap();
+        assert_eq!(same["system"], body["system"]);
+        assert_eq!(same["messages"], body["messages"]);
+        let cross = emit_request(&req, &EmitOptions::default()).unwrap();
+        let cross: Value = serde_json::from_slice(&cross.0).unwrap();
+        assert_eq!(cross["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(
+            cross["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(
+            cross["input"][1]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+    }
+
+    #[test]
+    fn anthropic_non_text_and_tool_cache_markers_survive_same_shape() {
+        let body = json!({"model": "m", "max_tokens": 100,
+            "tools": [{"name": "lookup", "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [{"type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+                "cache_control": {"type": "ephemeral"}}]}]});
+        let req = crate::anthropic::parse_request(body.to_string().as_bytes()).unwrap();
+        let emitted = crate::anthropic::emit_request(&req, &EmitOptions::default()).unwrap();
+        let emitted: Value = serde_json::from_slice(&emitted.0).unwrap();
+        assert_eq!(emitted["tools"], body["tools"]);
+        assert_eq!(emitted["messages"], body["messages"]);
     }
 
     /// An upstream that hangs up without ever sending usage must still leave

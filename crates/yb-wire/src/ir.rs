@@ -107,6 +107,9 @@ pub struct ChatRequest {
     /// (defaulting to `"24h"` when the client didn't send one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<String>,
+    /// Responses caching mode and TTL. Preserved on a Responses relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<Value>,
 }
 
 /// A single conversational turn.
@@ -126,8 +129,11 @@ impl Message {
     pub fn text(&self) -> String {
         let mut out = String::new();
         for block in &self.content {
-            if let ContentBlock::Text { text } = block {
-                out.push_str(text);
+            match block {
+                ContentBlock::Text { text } | ContentBlock::CachedText { text, .. } => {
+                    out.push_str(text)
+                }
+                _ => {}
             }
         }
         out
@@ -156,6 +162,13 @@ pub enum Role {
 pub enum ContentBlock {
     /// Plain text.
     Text { text: String },
+    /// Text ending at an explicit prompt-cache breakpoint. A TTL is carried
+    /// when the source format provides one.
+    CachedText {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl: Option<String>,
+    },
     /// An image, either inline base64 (`data` + `media_type`) or by `url`.
     Image {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,6 +229,13 @@ pub struct Tool {
     pub description: Option<String>,
     /// JSON Schema for the tool's arguments.
     pub input_schema: Value,
+    /// OpenAI function-schema enforcement; omitted on other protocols.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+    /// Anthropic's tool-definition cache marker. Responses has no equivalent
+    /// breakpoint placement on a tool definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_cache_control: Option<Value>,
 }
 
 /// How the model may use tools on a given turn.

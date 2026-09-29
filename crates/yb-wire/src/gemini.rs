@@ -67,6 +67,8 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
                         name: req_str(d, "name")?.to_string(),
                         description: opt_str(d, "description").map(str::to_string),
                         input_schema: d.get("parameters").cloned().unwrap_or(json!({})),
+                        strict: None,
+                        anthropic_cache_control: None,
                     });
                 }
             }
@@ -172,7 +174,9 @@ fn emit_part(b: &ContentBlock) -> Option<Value> {
         // A block only another provider understands has no Gemini equivalent,
         // so it is skipped rather than mistranslated.
         ContentBlock::Native { .. } => None,
-        ContentBlock::Text { text } => Some(json!({"text": text})),
+        ContentBlock::Text { text } | ContentBlock::CachedText { text, .. } => {
+            Some(json!({"text": text}))
+        }
         ContentBlock::Image {
             media_type,
             data,
@@ -330,7 +334,7 @@ fn parse_parts(v: Option<&Value>) -> Vec<ContentBlock> {
 fn join_text(blocks: &[ContentBlock]) -> String {
     let mut s = String::new();
     for b in blocks {
-        if let ContentBlock::Text { text } = b {
+        if let ContentBlock::Text { text } | ContentBlock::CachedText { text, .. } = b {
             s.push_str(text);
         }
     }
