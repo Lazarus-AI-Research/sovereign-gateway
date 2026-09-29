@@ -610,27 +610,23 @@ async fn embed_happy_path_records_telemetry() {
     assert!(!telemetry[0].is_error);
 }
 
-/// An upstream whose first request fails in transport, as a pooled
-/// connection it closed while the gateway reused it does; it counts every
-/// request it is sent.
-struct ClosedOnce {
+/// An upstream whose first requests fail with the given error; it counts
+/// every request it is sent.
+struct FailingFirst {
     sent: std::sync::atomic::AtomicUsize,
     failures: usize,
+    error: fn() -> yb_core::Error,
 }
 
 #[async_trait]
-impl UpstreamClient for ClosedOnce {
+impl UpstreamClient for FailingFirst {
     async fn send(
         &self,
         _req: yb_providers::UpstreamRequest,
     ) -> Result<yb_providers::UpstreamResponse> {
         let sent = self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if sent < self.failures {
-            return Err(yb_core::Error::Upstream {
-                provider: "upstream".into(),
-                status: 502,
-                message: "error sending request".into(),
-            });
+            return Err((self.error)());
         }
         let upstream = json!({
             "object": "list", "model": "text-embedding-3-small",
@@ -645,16 +641,44 @@ impl UpstreamClient for ClosedOnce {
     }
 }
 
-/// An embedding whose request fails in transport is sent to the same
-/// deployment once more; a second failure is the answer.
+fn connection_lost() -> yb_core::Error {
+    yb_core::Error::ConnectionLost("connection closed before message completed".into())
+}
+
+fn connect_failed() -> yb_core::Error {
+    yb_core::Error::Upstream {
+        provider: "upstream".into(),
+        status: 502,
+        message: "error trying to connect".into(),
+    }
+}
+
+/// How many first requests fail and with what, the answer the caller gets,
+/// and how many requests the upstream is sent.
+type Case = (
+    usize,
+    fn() -> yb_core::Error,
+    std::result::Result<u16, u16>,
+    usize,
+);
+
+/// An embedding whose connection is lost as it is sent goes to the same
+/// deployment once more, and a second loss is the answer; a failed connect
+/// is not retried.
 #[tokio::test]
-async fn an_embedding_is_sent_again_once_after_a_transport_failure() {
+async fn an_embedding_is_sent_again_once_after_its_connection_is_lost() {
     use yb_core::EmbedFormat;
     let body = serde_json::to_vec(&json!({"model": "my-embed", "input": "hello"})).unwrap();
-    for (failures, want) in [(1, Ok(200)), (2, Err(502))] {
-        let client = Arc::new(ClosedOnce {
+    let cases: [Case; 3] = [
+        (1, connection_lost, Ok(200), 2),
+        (2, connection_lost, Err(502), 2),
+        (1, connect_failed, Err(502), 1),
+    ];
+    for (failures, error, want, sends) in cases {
+        let client = Arc::new(FailingFirst {
             sent: Default::default(),
             failures,
+            error,
         });
         let gateway = Gateway::new(
             client.clone(),
@@ -671,7 +695,7 @@ async fn an_embedding_is_sent_again_once_after_a_transport_failure() {
             })
             .map_err(|err| err.http_status());
         assert_eq!(got, want, "after {failures} failures");
-        assert_eq!(client.sent.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(client.sent.load(std::sync::atomic::Ordering::SeqCst), sends);
     }
 }
 

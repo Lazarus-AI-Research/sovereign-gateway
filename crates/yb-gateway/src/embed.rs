@@ -98,19 +98,23 @@ impl Gateway {
                 body: up_body,
                 stream: false,
             };
-            // A pooled connection the upstream closed as it was reused fails
-            // in transport before the upstream sees the request; an embedding
-            // changes nothing upstream, so the same deployment is asked once
-            // more before the next candidate.
+            // A pooled connection the upstream closed as it was reused is
+            // lost as the request is sent; an embedding changes nothing
+            // upstream, so the same deployment is asked once more before the
+            // next candidate. A failed connect or a timeout is not retried.
             let resp = match self.client.send(ureq.clone()).await {
                 Ok(r) => r,
-                Err(_) => match self.client.send(ureq).await {
+                Err(Error::ConnectionLost(_)) => match self.client.send(ureq).await {
                     Ok(r) => r,
                     Err(e) => {
                         last_err = Some(e);
                         continue;
                     }
                 },
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
             };
 
             let status = resp.status;
