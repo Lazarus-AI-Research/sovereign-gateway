@@ -94,6 +94,12 @@ pub trait RequestLogger: Send + Sync {
     fn export(&self, _filter: &CaptureFilter) -> crate::Result<Vec<CapturedTurn>> {
         Ok(Vec::new())
     }
+
+    /// Deletes every captured turn made with these keys, kept or sealed, and
+    /// returns how many there were: a person's data is erased with them.
+    fn forget(&self, _api_key_ids: &[String]) -> crate::Result<u64> {
+        Ok(0)
+    }
 }
 
 /// A logger that discards everything (the default when capture is disabled).
