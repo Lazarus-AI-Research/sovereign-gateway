@@ -723,6 +723,21 @@ impl Worker {
                 continue;
             }
             let shard = path.to_string_lossy().replace('\'', "''");
+            // A shard sealed before turns carried their key holds no turn of
+            // any key; asking it for the column would fail.
+            let keyed: i64 = self
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM parquet_schema('{shard}') WHERE name = 'api_key_id'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(map_db)?;
+            if keyed == 0 {
+                continue;
+            }
             let held: i64 = self
                 .conn
                 .query_row(
@@ -1226,6 +1241,11 @@ mod tests {
         logger.log(record(2));
         let all = logger.export(&CaptureFilter::default()).unwrap();
         assert_eq!(all.len(), 3);
+        // Forgetting a key passes over the old shard, which holds no keys.
+        assert_eq!(logger.forget(&["key-1".to_string()]).unwrap(), 2);
+        let left = logger.export(&CaptureFilter::default()).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].request_id, "old-1");
         let _ = std::fs::remove_dir_all(dir);
     }
 
