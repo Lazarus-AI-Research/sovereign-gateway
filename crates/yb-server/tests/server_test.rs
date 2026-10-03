@@ -1931,3 +1931,40 @@ async fn capture_is_refused_without_a_request_log() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
+
+/// Forgetting keys' captured turns is for an administrator and names the
+/// keys; with no request log there is nothing to forget.
+#[tokio::test]
+async fn forgetting_captured_turns_names_keys() {
+    let (state, _) = setup().await;
+    let cookie = admin_cookie(state.store.as_ref()).await;
+    let app = build_router(state);
+    let (status, got) = post_json_as(
+        &app,
+        "/admin/v1/capture/forget",
+        &cookie,
+        json!({ "keys": ["key-1"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["forgotten"], 0);
+    let (status, _) = post_json_as(
+        &app,
+        "/admin/v1/capture/forget",
+        &cookie,
+        json!({ "keys": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post_json_as(
+        &app,
+        "/admin/v1/capture/forget",
+        "",
+        json!({ "keys": ["key-1"] }),
+    )
+    .await;
+    assert!(
+        status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN,
+        "{status}"
+    );
+}

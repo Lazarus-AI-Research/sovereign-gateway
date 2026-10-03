@@ -143,6 +143,7 @@ enum Msg {
     /// Flushed, the worker hands back a connection of its own for the
     /// export to read through, so a long export never holds up logging.
     Export(mpsc::Sender<std::result::Result<(Connection, PathBuf), String>>),
+    Forget(Vec<String>, mpsc::Sender<std::result::Result<u64, String>>),
     Shutdown(Ack),
 }
 
@@ -308,6 +309,20 @@ impl RequestLogger for DuckLogger {
         // the second lists them again.
         export_turns(&conn, &shards_dir, filter)
             .or_else(|_| export_turns(&conn, &shards_dir, filter))
+    }
+
+    fn forget(&self, api_key_ids: &[String]) -> Result<u64> {
+        if api_key_ids.is_empty() {
+            return Ok(0);
+        }
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.tx
+            .send(Msg::Forget(api_key_ids.to_vec(), ack_tx))
+            .map_err(|_| Error::Internal("reqlog: worker is gone".into()))?;
+        ack_rx
+            .recv()
+            .map_err(|_| Error::Internal("reqlog: worker is gone".into()))?
+            .map_err(Error::Storage)
     }
 }
 
@@ -515,6 +530,10 @@ impl Worker {
                     });
                     let _ = ack.send(r.map_err(|e| e.to_string()));
                 }
+                Ok(Msg::Forget(keys, ack)) => {
+                    let r = self.flush().and_then(|()| self.forget(&keys));
+                    let _ = ack.send(r.map_err(|e| e.to_string()));
+                }
                 Ok(Msg::Shutdown(ack)) => {
                     let _ = ack.send(self.flush().map_err(|e| e.to_string()));
                     break;
@@ -679,6 +698,74 @@ impl Worker {
             self.run_roll_hook(&path);
         }
         Ok(())
+    }
+
+    /// Deletes the turns made with these keys from the write-ahead table, and
+    /// rewrites each sealed shard that holds any without them: written under a
+    /// name no export reads, given the shard's own modification time so the
+    /// retention window still counts from when it was sealed, then renamed
+    /// over it. Copies a roll hook made elsewhere are not reached.
+    fn forget(&mut self, keys: &[String]) -> Result<u64> {
+        let placeholders = vec!["?"; keys.len()].join(", ");
+        let mut forgotten = self
+            .conn
+            .execute(
+                &format!("DELETE FROM turns WHERE api_key_id IN ({placeholders})"),
+                duckdb::params_from_iter(keys.iter()),
+            )
+            .map_err(map_db)? as u64;
+        let Ok(entries) = std::fs::read_dir(&self.shards_dir) else {
+            return Ok(forgotten);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+                continue;
+            }
+            let shard = path.to_string_lossy().replace('\'', "''");
+            let held: i64 = self
+                .conn
+                .query_row(
+                    &format!("SELECT count(*) FROM read_parquet('{shard}') WHERE api_key_id IN ({placeholders})"),
+                    duckdb::params_from_iter(keys.iter()),
+                    |row| row.get(0),
+                )
+                .map_err(map_db)?;
+            if held == 0 {
+                continue;
+            }
+            let partial = path.with_extension("parquet.partial");
+            let partial_sql = partial.to_string_lossy().replace('\'', "''");
+            let sealed_at = entry.metadata().and_then(|m| m.modified()).ok();
+            let rewritten = self
+                .conn
+                .execute(
+                    &format!(
+                        "COPY (SELECT * FROM read_parquet('{shard}') WHERE api_key_id IS NULL OR api_key_id NOT IN ({placeholders})) \
+                         TO '{partial_sql}' (FORMAT parquet, COMPRESSION zstd)"
+                    ),
+                    duckdb::params_from_iter(keys.iter()),
+                )
+                .map_err(map_db)
+                .and_then(|_| {
+                    if let Some(time) = sealed_at {
+                        std::fs::File::options()
+                            .write(true)
+                            .open(&partial)
+                            .and_then(|file| file.set_modified(time))
+                            .map_err(|e| Error::Storage(format!("reqlog: keep the shard's time: {e}")))?;
+                    }
+                    std::fs::rename(&partial, &path)
+                        .map_err(|e| Error::Storage(format!("reqlog: replace shard: {e}")))
+                });
+            if let Err(e) = rewritten {
+                self.remove_partial_shards();
+                return Err(e);
+            }
+            forgotten += held as u64;
+        }
+        self.conn.execute_batch("CHECKPOINT").map_err(map_db)?;
+        Ok(forgotten)
     }
 
     /// Run the optional `on_roll` command against a freshly-sealed `shard`.
@@ -923,6 +1010,58 @@ mod tests {
             std::path::Path::new(&recorded).exists(),
             "the shard the hook named exists"
         );
+
+        logger.shutdown().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A person's captured turns go with their key, sealed or not: the shard
+    /// holding some is rewritten without them and keeps the time it was
+    /// sealed, so it still ages out on schedule; another key's turns stay.
+    #[test]
+    fn forgetting_a_key_removes_its_turns_everywhere() {
+        let dir = scratch_dir();
+        let cfg = ReqlogConfig {
+            dir: dir.clone(),
+            rotate_interval: Duration::from_secs(3600),
+            shard_max_bytes: u64::MAX,
+            ..ReqlogConfig::default()
+        };
+        let logger = capturing(DuckLogger::new(cfg).unwrap());
+        let keyed = |i: usize, key: &str| RequestLogRecord {
+            api_key_id: Some(key.to_string()),
+            ..record(i)
+        };
+        logger.log(keyed(1, "key-gone"));
+        logger.log(keyed(2, "key-kept"));
+        logger.force_rotate().unwrap();
+        let shard = std::fs::read_dir(dir.join("shards"))
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .path();
+        let old = std::time::SystemTime::now() - Duration::from_secs(5 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&shard)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        logger.log(keyed(3, "key-gone"));
+        logger.log(keyed(4, "key-kept"));
+
+        assert_eq!(logger.forget(&["key-gone".to_string()]).unwrap(), 2);
+        let left: Vec<String> = logger
+            .export(&CaptureFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|turn| turn.request_id)
+            .collect();
+        assert_eq!(left, vec!["req-2".to_string(), "req-4".to_string()]);
+        let modified = std::fs::metadata(&shard).unwrap().modified().unwrap();
+        assert_eq!(modified, old, "the rewritten shard keeps its sealed time");
+        assert_eq!(logger.forget(&["key-gone".to_string()]).unwrap(), 0);
 
         logger.shutdown().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

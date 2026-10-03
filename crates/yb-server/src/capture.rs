@@ -143,6 +143,40 @@ pub(crate) async fn export(
     ([(header::CONTENT_TYPE, "application/x-ndjson")], body).into_response()
 }
 
+#[derive(Deserialize)]
+pub(crate) struct ForgetRequest {
+    /// The keys whose turns go.
+    keys: Vec<String>,
+}
+
+/// `POST /capture/forget` — every captured turn made with these keys,
+/// deleted from the request log, as when a person's data is erased; answers
+/// how many there were.
+pub(crate) async fn forget(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(request): Json<ForgetRequest>,
+) -> Response {
+    if let Some(refusal) = refused(&principal) {
+        return refusal;
+    }
+    if request.keys.is_empty()
+        || request.keys.len() > 1000
+        || request
+            .keys
+            .iter()
+            .any(|key| key.is_empty() || key.len() > 200)
+    {
+        return error_response(&Error::BadRequest("name 1 to 1000 keys".into()));
+    }
+    let log = state.request_log.clone();
+    match tokio::task::spawn_blocking(move || log.forget(&request.keys)).await {
+        Ok(Ok(forgotten)) => Json(json!({ "forgotten": forgotten })).into_response(),
+        Ok(Err(e)) => error_response(&e),
+        Err(e) => error_response(&Error::Internal(e.to_string())),
+    }
+}
+
 /// A captured turn as one training example, or nothing for a turn with no
 /// text (metadata only) or one that is not a chat.
 pub fn training_example(turn: &CapturedTurn) -> Option<Value> {
