@@ -89,6 +89,7 @@ pub fn parse_request(body: &[u8]) -> Result<EmbedRequest> {
         encoding_format,
         cohere_embedding_types: None,
         gemini_batch: false,
+        openai_content: false,
     })
 }
 
@@ -120,6 +121,12 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
                     (None, Some(u)) => content.push(json!({"type": "image_url", "image_url": u})),
                     _ => return Err(WireError::invalid("inputs[]", "image without data or url")),
                 },
+                EmbedPart::Audio { .. } => {
+                    return Err(WireError::InvalidRequest(
+                        "voyage_embed has no audio input; route audio to an openai_embed upstream"
+                            .into(),
+                    ))
+                }
             }
         }
         items.push(json!({"content": content}));

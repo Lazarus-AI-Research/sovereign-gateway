@@ -62,6 +62,7 @@ pub fn parse_request(body: &[u8]) -> Result<EmbedRequest> {
         encoding_format: None,
         cohere_embedding_types: None,
         gemini_batch: batch,
+        openai_content: false,
     })
 }
 
@@ -129,9 +130,9 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
 
     let mut requests = Vec::with_capacity(req.inputs.len());
     for input in &req.inputs {
-        if input.has_image() {
+        if input.has_image() || input.has_audio() {
             return Err(WireError::InvalidRequest(
-                "gemini_embed is text-only; route image inputs to a multimodal upstream \
+                "gemini_embed is text-only; route image and audio inputs to a multimodal upstream \
                  (voyage_embed)"
                     .into(),
             ));
@@ -141,7 +142,7 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
             .iter()
             .filter_map(|p| match p {
                 EmbedPart::Text { text } => Some(json!({"text": text})),
-                EmbedPart::Image { .. } => None,
+                EmbedPart::Image { .. } | EmbedPart::Audio { .. } => None,
             })
             .collect();
         let mut r = Map::new();

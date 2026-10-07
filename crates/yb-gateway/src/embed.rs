@@ -222,7 +222,7 @@ fn build_embed_route_request(req: &EmbedRequest, ctx: &RequestCtx) -> RouteReque
         .flat_map(|i| &i.parts)
         .map(|p| match p {
             EmbedPart::Text { text } => text.len(),
-            EmbedPart::Image { .. } => 0,
+            EmbedPart::Image { .. } | EmbedPart::Audio { .. } => 0,
         })
         .sum();
 

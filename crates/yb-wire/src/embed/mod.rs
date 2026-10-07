@@ -34,6 +34,14 @@ pub enum EmbedPart {
         /// http(s) URL; mutually exclusive with `data`.
         url: Option<String>,
     },
+    /// A recording, carried inline: only the OpenAI dialect's content parts
+    /// (`input_audio`) can express it.
+    Audio {
+        /// The container, e.g. `wav` or `mp3`; `None` when unknown.
+        format: Option<String>,
+        /// Raw base64 payload.
+        data: String,
+    },
 }
 
 /// One embedding-producing unit: a list of parts. Multimodal formats allow
@@ -63,6 +71,12 @@ impl EmbedInput {
         self.parts
             .iter()
             .any(|p| matches!(p, EmbedPart::Image { .. }))
+    }
+
+    pub fn has_audio(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| matches!(p, EmbedPart::Audio { .. }))
     }
 }
 
@@ -97,6 +111,10 @@ pub struct EmbedRequest {
     /// The client used Gemini's `:batchEmbedContents` (vs single `:embedContent`).
     #[serde(default)]
     pub gemini_batch: bool,
+    /// The client sent OpenAI content parts (`{"content": [...]}`), the shape
+    /// llama.cpp and OpenRouter take for media, so media goes upstream in it.
+    #[serde(default)]
+    pub openai_content: bool,
 }
 
 /// Usage attribution for an embeddings turn (input-only; embeddings have no
