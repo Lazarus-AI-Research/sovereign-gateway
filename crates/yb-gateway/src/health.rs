@@ -222,6 +222,7 @@ fn probe_embed_request(model: &str) -> EmbedRequest {
         encoding_format: None,
         cohere_embedding_types: None,
         gemini_batch: false,
+        openai_content: false,
     }
 }
 

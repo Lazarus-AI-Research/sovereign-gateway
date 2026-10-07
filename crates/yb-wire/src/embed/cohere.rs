@@ -141,6 +141,7 @@ pub fn parse_request(body: &[u8]) -> Result<EmbedRequest> {
         encoding_format: None,
         cohere_embedding_types,
         gemini_batch: false,
+        openai_content: false,
     })
 }
 
@@ -197,6 +198,10 @@ pub fn emit_request(req: &EmbedRequest, opts: &EmbedEmitOptions) -> Result<Emitt
                         let uri = image_to_data_uri(media_type.as_deref(), data.as_deref())?;
                         content.push(json!({"type": "image_url", "image_url": {"url": uri}}));
                     }
+                    EmbedPart::Audio { .. } => return Err(WireError::InvalidRequest(
+                        "cohere_embed has no audio input; route audio to an openai_embed upstream"
+                            .into(),
+                    )),
                 }
             }
             items.push(json!({"content": content}));
@@ -352,6 +357,7 @@ mod tests {
             encoding_format: None,
             cohere_embedding_types: None,
             gemini_batch: false,
+            openai_content: false,
         };
         assert!(emit_request(&req, &EmbedEmitOptions::default()).is_err());
     }
