@@ -246,12 +246,16 @@ pub fn emit_response(resp: &ChatResponse) -> Result<Vec<u8>> {
 }
 
 fn emit_usage(u: &Usage) -> Value {
-    json!({
+    let mut usage = json!({
         "input_tokens": u.input_tokens,
         "output_tokens": u.output_tokens,
         "cache_read_input_tokens": u.cache_read_tokens,
         "cache_creation_input_tokens": u.cache_write_tokens,
-    })
+    });
+    if u.reasoning_tokens > 0 {
+        usage["output_tokens_details"] = json!({"thinking_tokens": u.reasoning_tokens});
+    }
+    usage
 }
 
 fn parse_usage(v: Option<&Value>) -> Usage {
@@ -261,7 +265,10 @@ fn parse_usage(v: Option<&Value>) -> Usage {
         output_tokens: opt_u32(v, "output_tokens").unwrap_or(0),
         cache_read_tokens: opt_u32(v, "cache_read_input_tokens").unwrap_or(0),
         cache_write_tokens: opt_u32(v, "cache_creation_input_tokens").unwrap_or(0),
-        reasoning_tokens: 0,
+        reasoning_tokens: v
+            .get("output_tokens_details")
+            .and_then(|details| opt_u32(details, "thinking_tokens"))
+            .unwrap_or(0),
     }
 }
 
@@ -666,12 +673,17 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
             StreamEvent::Done { stop_reason } => {
                 ensure_started(&mut out, state);
                 close_open(&mut out, state);
+                let mut usage = json!({"output_tokens": state.usage.output_tokens});
+                if state.usage.reasoning_tokens > 0 {
+                    usage["output_tokens_details"] =
+                        json!({"thinking_tokens": state.usage.reasoning_tokens});
+                }
                 write_event(
                     &mut out,
                     "message_delta",
                     &json!({"type": "message_delta",
                             "delta": {"stop_reason": stop_reason_str(stop_reason), "stop_sequence": Value::Null},
-                            "usage": {"output_tokens": state.usage.output_tokens}}),
+                            "usage": usage}),
                 );
                 write_event(&mut out, "message_stop", &json!({"type": "message_stop"}));
             }
@@ -753,7 +765,39 @@ pub(crate) fn sse_data(line: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod extension_field_tests {
-    use crate::EmitOptions;
+    use crate::{
+        ir::{StopReason, StreamEvent},
+        EmitOptions,
+    };
+
+    #[test]
+    fn reasoning_usage_round_trips_in_messages_and_streams() {
+        let input = serde_json::json!({
+            "input_tokens": 100,
+            "output_tokens": 30,
+            "output_tokens_details": {"thinking_tokens": 20}
+        });
+        let usage = super::parse_usage(Some(&input));
+        assert_eq!(usage.reasoning_tokens, 20);
+        assert_eq!(
+            super::emit_usage(&usage)["output_tokens_details"]["thinking_tokens"],
+            20
+        );
+
+        let mut state = super::EmitState::default();
+        let stream = super::encode_sse(
+            &[
+                StreamEvent::MessageStart { model: "m".into() },
+                StreamEvent::UsageDelta { usage },
+                StreamEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                },
+            ],
+            &mut state,
+        );
+        let stream = String::from_utf8(stream).unwrap();
+        assert!(stream.contains("\"thinking_tokens\":20"));
+    }
 
     // An Anthropic body carrying Anthropic-only features plus a field we don't
     // model at all.
