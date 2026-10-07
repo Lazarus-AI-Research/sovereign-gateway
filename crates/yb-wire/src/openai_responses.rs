@@ -351,8 +351,7 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     if let Some(tc) = &req.tool_choice {
         body.insert("tool_choice".into(), emit_tool_choice(tc));
     }
-    // NOTE: `max_output_tokens` is intentionally not emitted — some gateway
-    // backends reject it as an unsupported parameter.
+    insert_opt(&mut body, "max_output_tokens", req.max_tokens);
     insert_opt(&mut body, "temperature", req.temperature);
     insert_opt(&mut body, "top_p", req.top_p);
     if opts.stream {
@@ -1305,6 +1304,16 @@ mod tests {
         let back = emit_request(&chat_req, &EmitOptions::default()).unwrap();
         let back: Value = serde_json::from_slice(&back.0).unwrap();
         assert_eq!(back["tools"][0]["strict"], true);
+    }
+
+    #[test]
+    fn output_token_limit_survives_anthropic_to_responses_translation() {
+        let body = json!({"model": "m", "max_tokens": 32768,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let req = crate::anthropic::parse_request(body.to_string().as_bytes()).unwrap();
+        let emitted = emit_request(&req, &EmitOptions::default()).unwrap();
+        let output: Value = serde_json::from_slice(&emitted.0).unwrap();
+        assert_eq!(output["max_output_tokens"], 32768);
     }
 
     #[test]
