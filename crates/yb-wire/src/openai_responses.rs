@@ -357,10 +357,20 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     if opts.stream {
         body.insert("stream".into(), json!(true));
     }
-    let effort = opts
-        .force_reasoning_effort
-        .clone()
-        .or_else(|| req.reasoning.as_ref().and_then(|r| r.effort.clone()));
+    let effort = opts.force_reasoning_effort.clone().or_else(|| {
+        req.reasoning.as_ref().and_then(|r| {
+            r.effort.clone().or_else(|| {
+                r.budget_tokens.map(|budget| {
+                    match budget {
+                        0..=1024 => "low",
+                        1025..=4096 => "medium",
+                        _ => "high",
+                    }
+                    .to_string()
+                })
+            })
+        })
+    });
     if let Some(effort) = effort {
         body.insert("reasoning".into(), json!({"effort": effort}));
     }
@@ -1309,11 +1319,26 @@ mod tests {
     #[test]
     fn output_token_limit_survives_anthropic_to_responses_translation() {
         let body = json!({"model": "m", "max_tokens": 32768,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
             "messages": [{"role": "user", "content": "hi"}]});
         let req = crate::anthropic::parse_request(body.to_string().as_bytes()).unwrap();
         let emitted = emit_request(&req, &EmitOptions::default()).unwrap();
         let output: Value = serde_json::from_slice(&emitted.0).unwrap();
         assert_eq!(output["max_output_tokens"], 32768);
+        assert_eq!(output["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn anthropic_thinking_budget_maps_to_responses_effort_tiers() {
+        for (budget, effort) in [(1024, "low"), (4096, "medium"), (8192, "high")] {
+            let body = json!({"model": "m", "max_tokens": 16384,
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+                "messages": [{"role": "user", "content": "hi"}]});
+            let req = crate::anthropic::parse_request(body.to_string().as_bytes()).unwrap();
+            let emitted = emit_request(&req, &EmitOptions::default()).unwrap();
+            let output: Value = serde_json::from_slice(&emitted.0).unwrap();
+            assert_eq!(output["reasoning"]["effort"], effort);
+        }
     }
 
     #[test]
