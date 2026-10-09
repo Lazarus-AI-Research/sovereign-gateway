@@ -766,8 +766,8 @@ impl Store for SqliteStore {
              (id, request_id, trace_id, api_key_id, user_id, team_id, surface, \
               requested_model, decision_model, decision_provider, input_tokens, output_tokens, \
               cache_read_tokens, cache_write_tokens, cost_micros, status, is_error, latency_ms, \
-              created_at) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              first_token_ms, generation_ms, queue_ms, created_at) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(&rec.id)
         .bind(&rec.request_id)
@@ -787,6 +787,9 @@ impl Store for SqliteStore {
         .bind(rec.status)
         .bind(rec.is_error)
         .bind(rec.latency_ms)
+        .bind(rec.first_token_ms)
+        .bind(rec.generation_ms)
+        .bind(rec.queue_ms)
         .bind(ts(&rec.created_at))
         .execute(&self.pool)
         .await

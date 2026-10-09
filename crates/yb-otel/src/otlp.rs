@@ -12,7 +12,7 @@
 use serde_json::{json, Value};
 use yb_core::model::TelemetryRecord;
 
-use crate::registry::{Labels, Series, LATENCY_BUCKETS_MS};
+use crate::registry::{output_rate, Histogram, Labels, Series, LATENCY_BUCKETS_MS};
 
 /// The shared `resource` block (`service.name`).
 fn resource(service_name: &str) -> Value {
@@ -68,7 +68,21 @@ pub fn metrics_payload(
     let mut tokens = Vec::new();
     let mut cost = Vec::new();
     let mut latency = Vec::new();
+    let (mut first_token, mut queue, mut output) = (Vec::new(), Vec::new(), Vec::new());
     for (l, s) in snapshot {
+        first_token.push(histogram_point(
+            label_attrs(l),
+            &s.first_token,
+            start_ns,
+            now_ns,
+        ));
+        queue.push(histogram_point(label_attrs(l), &s.queue, start_ns, now_ns));
+        output.push(histogram_point(
+            label_attrs(l),
+            &s.output_rate,
+            start_ns,
+            now_ns,
+        ));
         let attrs = label_attrs(l);
         requests.push(point(attrs.clone(), s.requests));
         errors.push(point(attrs.clone(), s.errors));
@@ -117,9 +131,42 @@ pub fn metrics_payload(
                     "dataPoints": latency,
                     "aggregationTemporality": 2,
                 }},
+                {"name": "gateway.time_to_first_token", "unit": "ms", "histogram": {
+                    "dataPoints": first_token,
+                    "aggregationTemporality": 2,
+                }},
+                {"name": "gateway.queue.wait", "unit": "ms", "histogram": {
+                    "dataPoints": queue,
+                    "aggregationTemporality": 2,
+                }},
+                {"name": "gateway.output.rate", "unit": "{token}/s", "histogram": {
+                    "dataPoints": output,
+                    "aggregationTemporality": 2,
+                }},
             ],
         }],
     }]})
+}
+
+/// A histogram data point: OTLP counts each bucket on its own, where the
+/// registry's counts are cumulative.
+fn histogram_point(attrs: Vec<Value>, h: &Histogram, start_ns: &str, now_ns: &str) -> Value {
+    let mut bucket_counts: Vec<String> = Vec::with_capacity(h.bounds.len() + 1);
+    let mut prev = 0u64;
+    for c in &h.bucket_counts {
+        bucket_counts.push((c - prev).to_string());
+        prev = *c;
+    }
+    bucket_counts.push((h.count - prev).to_string());
+    json!({
+        "attributes": attrs,
+        "startTimeUnixNano": start_ns,
+        "timeUnixNano": now_ns,
+        "count": h.count.to_string(),
+        "sum": h.sum,
+        "bucketCounts": bucket_counts,
+        "explicitBounds": h.bounds,
+    })
 }
 
 /// Per-turn attributes shared by the event and the span: structured metadata
@@ -140,6 +187,18 @@ fn turn_attrs(rec: &TelemetryRecord) -> Vec<Value> {
         kv_int("latency_ms", rec.latency_ms),
         json!({"key": "error", "value": {"boolValue": rec.is_error}}),
     ];
+    for (key, v) in [
+        ("time_to_first_token_ms", rec.first_token_ms),
+        ("generation_ms", rec.generation_ms),
+        ("queue_wait_ms", rec.queue_ms),
+    ] {
+        if let Some(v) = v {
+            attrs.push(kv_int(key, v));
+        }
+    }
+    if let Some(rate) = output_rate(rec) {
+        attrs.push(json!({"key": "output_tokens_per_second", "value": {"doubleValue": rate}}));
+    }
     for (key, v) in [
         ("api_key_id", &rec.api_key_id),
         ("user_id", &rec.user_id),
@@ -245,6 +304,9 @@ mod tests {
             status: 200,
             is_error: false,
             latency_ms: 1234,
+            first_token_ms: Some(200),
+            generation_ms: Some(1000),
+            queue_ms: Some(50),
             created_at: now(),
         }
     }

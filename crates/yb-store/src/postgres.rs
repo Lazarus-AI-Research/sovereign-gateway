@@ -740,8 +740,8 @@ impl Store for PostgresStore {
              (id, request_id, trace_id, api_key_id, user_id, team_id, surface, \
               requested_model, decision_model, decision_provider, input_tokens, output_tokens, \
               cache_read_tokens, cache_write_tokens, cost_micros, status, is_error, latency_ms, \
-              created_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
+              first_token_ms, generation_ms, queue_ms, created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)",
         )
         .bind(&rec.id)
         .bind(&rec.request_id)
@@ -761,6 +761,9 @@ impl Store for PostgresStore {
         .bind(rec.status)
         .bind(rec.is_error)
         .bind(rec.latency_ms)
+        .bind(rec.first_token_ms)
+        .bind(rec.generation_ms)
+        .bind(rec.queue_ms)
         .bind(rec.created_at)
         .execute(&self.pool)
         .await

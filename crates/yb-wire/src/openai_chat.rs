@@ -384,7 +384,7 @@ pub fn parse_response(bytes: &[u8]) -> Result<ChatResponse> {
         model: opt_str(&v, "model").unwrap_or_default().to_string(),
         content,
         stop_reason: finish_to_stop(opt_str(choice, "finish_reason")),
-        usage: parse_usage(v.get("usage")),
+        usage: parse_usage(v.get("usage"), v.get("timings")),
         prompt_cache_key: None,
         prompt_cache_retention: None,
     })
@@ -444,8 +444,24 @@ pub fn emit_response(resp: &ChatResponse) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&body)?)
 }
 
-fn parse_usage(v: Option<&Value>) -> Usage {
-    let Some(v) = v else { return Usage::default() };
+/// The usage an OpenAI-compatible upstream reports, with the phase timings
+/// llama.cpp's server adds beside it.
+fn parse_usage(v: Option<&Value>, timings: Option<&Value>) -> Usage {
+    let milliseconds = |key: &str| {
+        timings
+            .and_then(|t| t.get(key))
+            .and_then(Value::as_f64)
+            .filter(|ms| ms.is_finite() && *ms > 0.0)
+            .map_or(0, |ms| ms.round().min(u32::MAX as f64) as u32)
+    };
+    let (prompt_ms, generation_ms) = (milliseconds("prompt_ms"), milliseconds("predicted_ms"));
+    let Some(v) = v else {
+        return Usage {
+            prompt_ms,
+            generation_ms,
+            ..Usage::default()
+        };
+    };
     let cache_read = v
         .get("prompt_tokens_details")
         .and_then(|d| opt_u32(d, "cached_tokens"))
@@ -462,6 +478,8 @@ fn parse_usage(v: Option<&Value>) -> Usage {
             .get("completion_tokens_details")
             .and_then(|d| opt_u32(d, "reasoning_tokens"))
             .unwrap_or(0),
+        prompt_ms,
+        generation_ms,
     }
 }
 
@@ -718,7 +736,7 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
     // their terminal event.
     if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
         out.push(StreamEvent::UsageDelta {
-            usage: parse_usage(Some(u)),
+            usage: parse_usage(Some(u), v.get("timings")),
         });
     }
     if let Some(stop_reason) = finish {
@@ -1060,6 +1078,32 @@ mod tests {
         assert_eq!(got.matches("data: [DONE]").count(), 1, "{got}");
         assert_eq!(got.matches("\"usage\"").count(), 1, "{got}");
         assert!(got.trim_end().ends_with("data: [DONE]"));
+    }
+
+    #[test]
+    fn llama_cpp_timings_ride_with_the_usage() {
+        let line = r#"data: {"choices":[],"usage":{"completion_tokens":10,"prompt_tokens":11,"prompt_tokens_details":{"cached_tokens":6}},"timings":{"cache_n":6,"prompt_n":5,"prompt_ms":72.873,"predicted_n":10,"predicted_ms":231.933}}"#;
+        let events = decode_sse(line, &mut SseState::default());
+        let Some(usage) = events.iter().find_map(|e| match e {
+            StreamEvent::UsageDelta { usage } => Some(*usage),
+            _ => None,
+        }) else {
+            panic!("no usage: {events:?}");
+        };
+        assert_eq!(
+            (
+                usage.cache_read_tokens,
+                usage.prompt_ms,
+                usage.generation_ms
+            ),
+            (6, 73, 232)
+        );
+        // Timings are not tokens: a report of them alone bills nothing.
+        assert!(Usage {
+            prompt_ms: 5,
+            ..Usage::default()
+        }
+        .is_empty());
     }
 
     #[test]

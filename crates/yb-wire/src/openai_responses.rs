@@ -630,6 +630,7 @@ fn parse_usage(v: Option<&Value>) -> Usage {
             .get("output_tokens_details")
             .and_then(|d| opt_u32(d, "reasoning_tokens"))
             .unwrap_or(0),
+        ..Usage::default()
     }
 }
 

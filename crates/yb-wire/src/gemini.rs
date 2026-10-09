@@ -281,6 +281,7 @@ fn parse_usage(v: Option<&Value>) -> Usage {
         cache_read_tokens: opt_u32(v, "cachedContentTokenCount").unwrap_or(0),
         cache_write_tokens: 0,
         reasoning_tokens: 0,
+        ..Usage::default()
     }
 }
 

@@ -342,6 +342,9 @@ async fn telemetry_insert_by_key_user_team() {
         status: 200,
         is_error: false,
         latency_ms: 321,
+        first_token_ms: Some(120),
+        generation_ms: Some(900),
+        queue_ms: None,
         created_at: now(),
     };
     store.insert_telemetry(&rec).await.unwrap();
@@ -375,6 +378,9 @@ async fn usage_sums_turns_per_day_key_and_model() {
         status: if is_error { 500 } else { 200 },
         is_error,
         latency_ms: 5,
+        first_token_ms: Some(120),
+        generation_ms: Some(900),
+        queue_ms: None,
         created_at: at,
     };
     let noon = today + chrono::Duration::hours(12);

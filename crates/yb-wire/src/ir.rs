@@ -347,6 +347,17 @@ pub struct Usage {
     pub cache_write_tokens: u32,
     #[serde(default)]
     pub reasoning_tokens: u32,
+    /// The engine's own time reading the prompt and writing the answer, in
+    /// milliseconds, where it reports them (llama.cpp's `timings`); zero
+    /// where it does not. Not tokens, so not usage that bills.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub prompt_ms: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation_ms: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Usage {
@@ -364,6 +375,8 @@ impl Usage {
         self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
         self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
         self.reasoning_tokens = self.reasoning_tokens.max(other.reasoning_tokens);
+        self.prompt_ms = self.prompt_ms.max(other.prompt_ms);
+        self.generation_ms = self.generation_ms.max(other.generation_ms);
     }
 
     /// Whether any token was reported at all.

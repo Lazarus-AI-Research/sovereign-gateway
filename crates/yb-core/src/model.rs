@@ -361,6 +361,21 @@ pub struct TelemetryRecord {
     pub status: i32,
     pub is_error: bool,
     pub latency_ms: i64,
+    /// Milliseconds from the request's arrival to its first token (time to
+    /// first token); None where no token was seen and the engine gave no
+    /// timings to infer it from.
+    #[serde(default)]
+    pub first_token_ms: Option<i64>,
+    /// Milliseconds the engine spent writing the answer, over which its
+    /// output tokens were made: output tokens per second is the one over
+    /// the other. None where it could not be told.
+    #[serde(default)]
+    pub generation_ms: Option<i64>,
+    /// Milliseconds the request waited before the engine began reading it,
+    /// for an engine that reports how long reading the prompt took; None
+    /// for any other.
+    #[serde(default)]
+    pub queue_ms: Option<i64>,
     pub created_at: Timestamp,
 }
 
