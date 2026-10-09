@@ -908,7 +908,12 @@ impl Store for PostgresStore {
             "SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day, api_key_id, user_id, requested_model, surface, \
                     COUNT(*)::BIGINT AS requests, SUM(CASE WHEN is_error THEN 1 ELSE 0 END)::BIGINT AS errors, \
                     SUM(input_tokens)::BIGINT AS input_tokens, SUM(output_tokens)::BIGINT AS output_tokens, \
-                    SUM(cost_micros)::BIGINT AS cost_micros \
+                    SUM(cost_micros)::BIGINT AS cost_micros, \
+                    SUM(cache_read_tokens)::BIGINT AS cache_read_tokens, \
+                    COUNT(first_token_ms)::BIGINT AS first_token_turns, COALESCE(SUM(first_token_ms), 0)::BIGINT AS first_token_ms, \
+                    COALESCE(SUM(CASE WHEN generation_ms IS NOT NULL THEN output_tokens END), 0)::BIGINT AS generated_tokens, \
+                    COALESCE(SUM(generation_ms), 0)::BIGINT AS generation_ms, \
+                    COUNT(queue_ms)::BIGINT AS queued_turns, COALESCE(SUM(queue_ms), 0)::BIGINT AS queue_ms \
              FROM request_telemetry WHERE created_at >= $1 AND created_at < $2 \
              GROUP BY 1, api_key_id, user_id, requested_model, surface \
              ORDER BY 1, api_key_id, requested_model",
@@ -931,6 +936,13 @@ impl Store for PostgresStore {
                     input_tokens: row.try_get("input_tokens").map_err(storage_err)?,
                     output_tokens: row.try_get("output_tokens").map_err(storage_err)?,
                     cost_micros: row.try_get("cost_micros").map_err(storage_err)?,
+                    cache_read_tokens: row.try_get("cache_read_tokens").map_err(storage_err)?,
+                    first_token_turns: row.try_get("first_token_turns").map_err(storage_err)?,
+                    first_token_ms: row.try_get("first_token_ms").map_err(storage_err)?,
+                    generated_tokens: row.try_get("generated_tokens").map_err(storage_err)?,
+                    generation_ms: row.try_get("generation_ms").map_err(storage_err)?,
+                    queued_turns: row.try_get("queued_turns").map_err(storage_err)?,
+                    queue_ms: row.try_get("queue_ms").map_err(storage_err)?,
                 })
             })
             .collect()

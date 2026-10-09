@@ -934,7 +934,12 @@ impl Store for SqliteStore {
             "SELECT substr(created_at, 1, 10) AS day, api_key_id, user_id, requested_model, surface, \
                     COUNT(*) AS requests, SUM(is_error) AS errors, \
                     SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, \
-                    SUM(cost_micros) AS cost_micros \
+                    SUM(cost_micros) AS cost_micros, \
+                    SUM(cache_read_tokens) AS cache_read_tokens, \
+                    COUNT(first_token_ms) AS first_token_turns, COALESCE(SUM(first_token_ms), 0) AS first_token_ms, \
+                    COALESCE(SUM(CASE WHEN generation_ms IS NOT NULL THEN output_tokens END), 0) AS generated_tokens, \
+                    COALESCE(SUM(generation_ms), 0) AS generation_ms, \
+                    COUNT(queue_ms) AS queued_turns, COALESCE(SUM(queue_ms), 0) AS queue_ms \
              FROM request_telemetry WHERE created_at >= ? AND created_at < ? \
              GROUP BY 1, api_key_id, user_id, requested_model, surface \
              ORDER BY 1, api_key_id, requested_model",
@@ -957,6 +962,13 @@ impl Store for SqliteStore {
                     input_tokens: row.try_get("input_tokens").map_err(storage_err)?,
                     output_tokens: row.try_get("output_tokens").map_err(storage_err)?,
                     cost_micros: row.try_get("cost_micros").map_err(storage_err)?,
+                    cache_read_tokens: row.try_get("cache_read_tokens").map_err(storage_err)?,
+                    first_token_turns: row.try_get("first_token_turns").map_err(storage_err)?,
+                    first_token_ms: row.try_get("first_token_ms").map_err(storage_err)?,
+                    generated_tokens: row.try_get("generated_tokens").map_err(storage_err)?,
+                    generation_ms: row.try_get("generation_ms").map_err(storage_err)?,
+                    queued_turns: row.try_get("queued_turns").map_err(storage_err)?,
+                    queue_ms: row.try_get("queue_ms").map_err(storage_err)?,
                 })
             })
             .collect()

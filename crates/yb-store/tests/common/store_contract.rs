@@ -405,6 +405,10 @@ async fn usage_sums_turns_per_day_key_and_model() {
     assert_eq!(assistant.output_tokens, 2);
     assert_eq!(assistant.api_key_id.as_deref(), Some("key-1"));
     assert_eq!(assistant.user_id.as_deref(), Some("user-1"));
+    // Both of the day's assistant turns were timed; neither said it waited.
+    assert_eq!((assistant.first_token_turns, assistant.first_token_ms), (2, 240));
+    assert_eq!((assistant.generated_tokens, assistant.generation_ms), (2, 1800));
+    assert_eq!((assistant.queued_turns, assistant.queue_ms), (0, 0));
 }
 
 #[tokio::test]
