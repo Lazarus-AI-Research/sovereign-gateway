@@ -183,6 +183,18 @@ pub struct UsageRow {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cost_micros: Micros,
+    /// Prompt tokens the engine read from its cache rather than again.
+    pub cache_read_tokens: i64,
+    /// Turns whose first token was timed, and their times to it summed.
+    pub first_token_turns: i64,
+    pub first_token_ms: i64,
+    /// Output tokens of the turns whose writing was timed, and those times
+    /// summed: the one over the other is output tokens per second.
+    pub generated_tokens: i64,
+    pub generation_ms: i64,
+    /// Turns whose wait was told, and their waits summed.
+    pub queued_turns: i64,
+    pub queue_ms: i64,
 }
 
 #[cfg(test)]

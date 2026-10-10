@@ -85,6 +85,9 @@ impl TurnGuard {
             status: status as i32,
             is_error: true,
             latency_ms: self.started.elapsed().as_millis() as i64,
+            first_token_ms: None,
+            generation_ms: None,
+            queue_ms: None,
             created_at: self.created_at,
         }
     }
@@ -697,6 +700,7 @@ impl Gateway {
             deployment: deployment.clone(),
             request_body,
             start: started,
+            first_token: std::sync::OnceLock::new(),
             created_at,
             token_meter: ctx.token_meter.clone(),
             tags: ctx.tags.clone(),
@@ -768,6 +772,8 @@ pub(crate) struct RecordCtx {
     deployment: Deployment,
     request_body: Vec<u8>,
     start: Instant,
+    /// When the upstream's first token arrived, for a turn read as a stream.
+    first_token: std::sync::OnceLock<Instant>,
     created_at: Timestamp,
     token_meter: Option<TokenMeter>,
     tags: Option<String>,
@@ -776,7 +782,68 @@ pub(crate) struct RecordCtx {
     pub(crate) reports_usage: bool,
 }
 
+/// How fast a turn was served: its time to first token, the time its
+/// answer took to write, and the time it waited before the engine began.
+#[derive(Debug, Default, PartialEq)]
+struct Speed {
+    first_token_ms: Option<i64>,
+    generation_ms: Option<i64>,
+    queue_ms: Option<i64>,
+}
+
+/// Whether an event is the model's output: the first such event is the
+/// turn's first token.
+fn is_output(event: &StreamEvent) -> bool {
+    matches!(
+        event,
+        StreamEvent::TextDelta { text } | StreamEvent::ThinkingDelta { text } if !text.is_empty()
+    ) || matches!(
+        event,
+        StreamEvent::ToolUseStart { .. } | StreamEvent::ToolUseDelta { .. }
+    )
+}
+
+/// A turn's speed from what was seen of it and what its engine reported.
+/// The first token is when it arrived, or else the turn's whole time less
+/// the engine's time writing the answer. The answer's time is the engine's,
+/// or else from the first token to the end, stretched by one token since
+/// the first token marks the end of the first one written. What precedes
+/// the engine's reading of the prompt is waiting.
+fn speed(usage: &Usage, latency_ms: i64, first_token_ms: Option<i64>, output_tokens: i64) -> Speed {
+    let engine_generation = (usage.generation_ms > 0).then_some(i64::from(usage.generation_ms));
+    let first_token_ms =
+        first_token_ms.or_else(|| engine_generation.map(|ms| (latency_ms - ms).max(0)));
+    let generation_ms = engine_generation.or_else(|| {
+        let streamed = latency_ms - first_token_ms?;
+        (output_tokens > 1 && streamed > 0).then(|| streamed * output_tokens / (output_tokens - 1))
+    });
+    let queue_ms = (usage.prompt_ms > 0)
+        .then_some(first_token_ms)
+        .flatten()
+        .map(|first| (first - i64::from(usage.prompt_ms)).max(0));
+    Speed {
+        first_token_ms,
+        generation_ms,
+        queue_ms,
+    }
+}
+
 impl RecordCtx {
+    /// Notes the turn's first token among events read from the upstream.
+    pub(crate) fn saw(&self, events: &[StreamEvent]) {
+        if events.iter().any(is_output) {
+            self.first_token.get_or_init(Instant::now);
+        }
+    }
+
+    fn speed(&self, usage: &Usage, latency_ms: i64) -> Speed {
+        let first = self
+            .first_token
+            .get()
+            .map(|at| at.duration_since(self.start).as_millis() as i64);
+        speed(usage, latency_ms, first, usage.output_tokens as i64)
+    }
+
     /// Price the turn (deployment pricing → built-in catalog → free), then write
     /// the telemetry row, upsert the spend rollups (key/user/team), and emit the
     /// request-log record. Storage failures are logged, not propagated: they
@@ -818,6 +885,7 @@ impl RecordCtx {
         let cache_write = usage.cache_write_tokens as i64;
         let cost = price.cost_micros(input, output, cache_read, cache_write);
         let latency_ms = self.start.elapsed().as_millis() as i64;
+        let speed = self.speed(&usage, latency_ms);
         if let Some(meter) = &self.token_meter {
             if input + output > 0 {
                 meter.charge(input + output);
@@ -844,6 +912,9 @@ impl RecordCtx {
             status: status as i32,
             is_error,
             latency_ms,
+            first_token_ms: speed.first_token_ms,
+            generation_ms: speed.generation_ms,
+            queue_ms: speed.queue_ms,
             created_at: self.created_at,
         };
         // Observability export (non-blocking aggregate/enqueue).
@@ -1011,7 +1082,9 @@ async fn aggregate_stream(
                     let line: Vec<u8> = buf.drain(..=pos).collect();
                     let text = String::from_utf8_lossy(&line);
                     let line = text.trim_end_matches(['\r', '\n']);
-                    agg.push_all(&decoder.decode_line(line));
+                    let events = decoder.decode_line(line);
+                    rctx.saw(&events);
+                    agg.push_all(&events);
                 }
             }
             Err(e) => {
@@ -1186,6 +1259,7 @@ fn translate_stream(
                         let text = String::from_utf8_lossy(&line);
                         let line = text.trim_end_matches(['\r', '\n']);
                         let evs = st.decoder.decode_line(line);
+                        st.rctx.saw(&evs);
                         for ev in &evs {
                             if let StreamEvent::UsageDelta { usage } = ev {
                                 merge_usage(&mut st.usage, usage);
@@ -1270,4 +1344,64 @@ fn translate_stream(
     });
 
     Box::pin(s)
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::{speed, Speed};
+    use yb_wire::Usage;
+
+    #[test]
+    fn a_stream_without_engine_timings_is_timed_by_its_first_token() {
+        // Ten tokens, the first at 300 ms, the last at 1200 ms: nine tokens
+        // in 900 ms, ten tokens a second, and nothing said about waiting.
+        let s = speed(&Usage::default(), 1200, Some(300), 10);
+        assert_eq!(
+            s,
+            Speed {
+                first_token_ms: Some(300),
+                generation_ms: Some(1000),
+                queue_ms: None
+            }
+        );
+    }
+
+    #[test]
+    fn an_engine_that_reports_its_timings_says_how_long_the_request_waited() {
+        let usage = Usage {
+            prompt_ms: 400,
+            generation_ms: 2000,
+            ..Usage::default()
+        };
+        // Read whole: the first token is the turn less the writing.
+        let whole = speed(&usage, 3000, None, 50);
+        assert_eq!(
+            whole,
+            Speed {
+                first_token_ms: Some(1000),
+                generation_ms: Some(2000),
+                queue_ms: Some(600)
+            }
+        );
+        // Streamed: the first token is when it arrived.
+        let streamed = speed(&usage, 3000, Some(900), 50);
+        assert_eq!(
+            streamed,
+            Speed {
+                first_token_ms: Some(900),
+                generation_ms: Some(2000),
+                queue_ms: Some(500)
+            }
+        );
+    }
+
+    #[test]
+    fn a_turn_with_nothing_to_time_records_nothing() {
+        assert_eq!(speed(&Usage::default(), 800, None, 0), Speed::default());
+        // One token: no time between tokens to measure.
+        assert_eq!(
+            speed(&Usage::default(), 800, Some(700), 1).generation_ms,
+            None
+        );
+    }
 }
