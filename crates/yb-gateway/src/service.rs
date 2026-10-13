@@ -530,7 +530,7 @@ impl Gateway {
             //      client stream     + upstream stream  → translate SSE through
             //      client stream     + upstream full    → expand body → one SSE
             guard.disarm();
-            let rctx = self.record_ctx(
+            let mut rctx = self.record_ctx(
                 &ctx,
                 surface.as_str(),
                 &chat.model,
@@ -539,6 +539,7 @@ impl Gateway {
                 started,
                 created_at,
             );
+            rctx.waited_ms = waited_ms(&resp.headers);
             // The Responses response object echoes the request's prompt-cache
             // fields; when the upstream doesn't echo them, fill from the request.
             let cache_echo = (
@@ -705,6 +706,7 @@ impl Gateway {
             token_meter: ctx.token_meter.clone(),
             tags: ctx.tags.clone(),
             reports_usage: true,
+            waited_ms: None,
         }
     }
 }
@@ -780,6 +782,21 @@ pub(crate) struct RecordCtx {
     /// False for a turn that never reports tokens (an image or speech), so a
     /// zero count is not taken for an upstream fault.
     pub(crate) reports_usage: bool,
+    /// How long the turn waited for a place in its engine, where what stands
+    /// in front of the engine said.
+    pub(crate) waited_ms: Option<i64>,
+}
+
+/// The header the Sovereign host agent answers with: how long the request
+/// waited for a place in its engine, in milliseconds.
+const QUEUE_HEADER: &str = "x-queue-ms";
+
+fn waited_ms(headers: &[(String, String)]) -> Option<i64> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(QUEUE_HEADER))
+        .and_then(|(_, value)| value.trim().parse().ok())
+        .filter(|ms: &i64| *ms >= 0)
 }
 
 /// How fast a turn was served: its time to first token, the time its
@@ -807,9 +824,16 @@ fn is_output(event: &StreamEvent) -> bool {
 /// The first token is when it arrived, or else the turn's whole time less
 /// the engine's time writing the answer. The answer's time is the engine's,
 /// or else from the first token to the end, stretched by one token since
-/// the first token marks the end of the first one written. What precedes
-/// the engine's reading of the prompt is waiting.
-fn speed(usage: &Usage, latency_ms: i64, first_token_ms: Option<i64>, output_tokens: i64) -> Speed {
+/// the first token marks the end of the first one written. The wait is what
+/// stands in front of the engine said; or else what precedes the engine's
+/// reading of the prompt, which also holds the request's own handling.
+fn speed(
+    usage: &Usage,
+    latency_ms: i64,
+    first_token_ms: Option<i64>,
+    output_tokens: i64,
+    waited_ms: Option<i64>,
+) -> Speed {
     let engine_generation = (usage.generation_ms > 0).then_some(i64::from(usage.generation_ms));
     let first_token_ms =
         first_token_ms.or_else(|| engine_generation.map(|ms| (latency_ms - ms).max(0)));
@@ -817,10 +841,12 @@ fn speed(usage: &Usage, latency_ms: i64, first_token_ms: Option<i64>, output_tok
         let streamed = latency_ms - first_token_ms?;
         (output_tokens > 1 && streamed > 0).then(|| streamed * output_tokens / (output_tokens - 1))
     });
-    let queue_ms = (usage.prompt_ms > 0)
-        .then_some(first_token_ms)
-        .flatten()
-        .map(|first| (first - i64::from(usage.prompt_ms)).max(0));
+    let queue_ms = waited_ms.or_else(|| {
+        (usage.prompt_ms > 0)
+            .then_some(first_token_ms)
+            .flatten()
+            .map(|first| (first - i64::from(usage.prompt_ms)).max(0))
+    });
     Speed {
         first_token_ms,
         generation_ms,
@@ -841,7 +867,13 @@ impl RecordCtx {
             .first_token
             .get()
             .map(|at| at.duration_since(self.start).as_millis() as i64);
-        speed(usage, latency_ms, first, usage.output_tokens as i64)
+        speed(
+            usage,
+            latency_ms,
+            first,
+            usage.output_tokens as i64,
+            self.waited_ms,
+        )
     }
 
     /// Price the turn (deployment pricing → built-in catalog → free), then write
@@ -1348,14 +1380,14 @@ fn translate_stream(
 
 #[cfg(test)]
 mod speed_tests {
-    use super::{speed, Speed};
+    use super::{speed, waited_ms, Speed};
     use yb_wire::Usage;
 
     #[test]
     fn a_stream_without_engine_timings_is_timed_by_its_first_token() {
         // Ten tokens, the first at 300 ms, the last at 1200 ms: nine tokens
         // in 900 ms, ten tokens a second, and nothing said about waiting.
-        let s = speed(&Usage::default(), 1200, Some(300), 10);
+        let s = speed(&Usage::default(), 1200, Some(300), 10, None);
         assert_eq!(
             s,
             Speed {
@@ -1374,7 +1406,7 @@ mod speed_tests {
             ..Usage::default()
         };
         // Read whole: the first token is the turn less the writing.
-        let whole = speed(&usage, 3000, None, 50);
+        let whole = speed(&usage, 3000, None, 50, None);
         assert_eq!(
             whole,
             Speed {
@@ -1384,7 +1416,7 @@ mod speed_tests {
             }
         );
         // Streamed: the first token is when it arrived.
-        let streamed = speed(&usage, 3000, Some(900), 50);
+        let streamed = speed(&usage, 3000, Some(900), 50, None);
         assert_eq!(
             streamed,
             Speed {
@@ -1396,11 +1428,28 @@ mod speed_tests {
     }
 
     #[test]
+    fn the_wait_the_agent_measured_stands_over_the_estimate() {
+        let usage = Usage {
+            prompt_ms: 400,
+            generation_ms: 2000,
+            ..Usage::default()
+        };
+        let told = waited_ms(&[("X-Queue-Ms".into(), "0".into())]);
+        assert_eq!(told, Some(0));
+        assert_eq!(speed(&usage, 3000, Some(900), 50, told).queue_ms, Some(0));
+        assert_eq!(waited_ms(&[("x-queue-ms".into(), "-5".into())]), None);
+        assert_eq!(waited_ms(&[("x-queue-ms".into(), "soon".into())]), None);
+    }
+
+    #[test]
     fn a_turn_with_nothing_to_time_records_nothing() {
-        assert_eq!(speed(&Usage::default(), 800, None, 0), Speed::default());
+        assert_eq!(
+            speed(&Usage::default(), 800, None, 0, None),
+            Speed::default()
+        );
         // One token: no time between tokens to measure.
         assert_eq!(
-            speed(&Usage::default(), 800, Some(700), 1).generation_ms,
+            speed(&Usage::default(), 800, Some(700), 1, None).generation_ms,
             None
         );
     }
