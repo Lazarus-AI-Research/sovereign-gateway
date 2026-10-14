@@ -161,18 +161,29 @@ impl AuthProvider {
     }
 }
 
-/// Settings for the `sso` provider: how to reach the identity provider's
-/// client-authenticated login API and what to send it.
+/// Settings for the `sso` provider: which SPIFFE identity the gateway presents
+/// to the identity provider, and what to send it.
+///
+/// The IdP serves its relying-party API only over mTLS and authenticates the
+/// gateway by the X.509-SVID it presents: the peer's SPIFFE id maps to a service
+/// name on the IdP, which must equal `client_id`. There is no shared secret. The
+/// transport side — the gateway's SVID, where the IdP listens, and which SPIFFE
+/// id it must present — lives in a separate greater-spire `identity.toml`
+/// (`[identity]` + `[identity.source]` + `[peers.sso]`) named by
+/// `identity_config`, so credential rotation never touches this file.
+///
+/// The former `base_url` and `client_secret` keys are rejected at parse time
+/// with a message saying so, rather than silently ignored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(try_from = "RawSsoAuthConfig")]
 pub struct SsoAuthConfig {
-    /// Base URL of the IdP backend, reached server-to-server (e.g. an internal
-    /// `http://127.0.0.1:1411`). No trailing slash required.
-    pub base_url: String,
-    /// The relying-party client id registered with the IdP.
+    /// Path to the greater-spire identity file (e.g.
+    /// `/etc/greater-spire/gateway/identity.toml`). Its `[peers.sso]` entry
+    /// carries the IdP's mTLS URL and expected SPIFFE id.
+    pub identity_config: String,
+    /// The relying-party client id registered with the IdP. The IdP checks it
+    /// against the service name its SPIFFE-id mapping yields for our SVID.
     pub client_id: String,
-    /// The relying-party client secret (kept server-side; never sent to the browser).
-    pub client_secret: String,
     /// The origin the IdP embeds in the emailed magic link (this app's public
     /// URL, e.g. `https://gateway.lzrlab.dev`). Must be in the client's IdP
     /// origin allow-list.
@@ -180,18 +191,63 @@ pub struct SsoAuthConfig {
     /// Cloudflare Turnstile **sitekey** (public) for the login widget. When set,
     /// the login UI renders a Turnstile challenge and forwards its token to the
     /// IdP, which validates it before emailing. Empty/unset disables the widget.
-    #[serde(default)]
     pub turnstile_sitekey: Option<String>,
     /// The unified cross-app session cookie name (default `lzr_session`). This is
     /// the cookie the IdP-issued session lands in, shared across `*.lzrlab.dev`.
-    #[serde(default)]
     pub session_cookie: Option<String>,
     /// The `Domain` for the unified cookie (e.g. `lzrlab.dev`). **When set, SSO is
     /// on:** a successful sso login sets this domain-scoped cookie, and the admin
     /// console authenticates it by introspecting against the IdP. Unset ⇒ the
     /// gateway keeps only its own host-only `yb_session` (no cross-app SSO).
-    #[serde(default)]
     pub session_cookie_domain: Option<String>,
+}
+
+impl SsoAuthConfig {
+    /// Whether enough is set to build an SSO client (`identity_config` and
+    /// `client_id`). Anything less leaves the provider unavailable, as before.
+    pub fn is_complete(&self) -> bool {
+        !self.identity_config.trim().is_empty() && !self.client_id.trim().is_empty()
+    }
+}
+
+/// What the `[auth.sso]` table may contain on disk: the live keys plus the two
+/// removed ones, which are accepted by the parser only so they can be refused
+/// with an explanation.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawSsoAuthConfig {
+    identity_config: String,
+    client_id: String,
+    callback_base: String,
+    turnstile_sitekey: Option<String>,
+    session_cookie: Option<String>,
+    session_cookie_domain: Option<String>,
+    base_url: Option<String>,
+    client_secret: Option<String>,
+}
+
+/// The startup error for a config still carrying the pre-mTLS SSO keys.
+pub const SSO_SECRET_REMOVED: &str = "[auth.sso] `base_url` and `client_secret` were removed: \
+the SSO authenticates the gateway by its SPIFFE identity over mTLS; \
+set `identity_config` to the greater-spire identity.toml \
+(whose [peers.sso] carries the SSO url and SPIFFE id) and drop both keys";
+
+impl TryFrom<RawSsoAuthConfig> for SsoAuthConfig {
+    type Error = String;
+
+    fn try_from(raw: RawSsoAuthConfig) -> Result<Self, String> {
+        if raw.base_url.is_some() || raw.client_secret.is_some() {
+            return Err(SSO_SECRET_REMOVED.to_string());
+        }
+        Ok(SsoAuthConfig {
+            identity_config: raw.identity_config,
+            client_id: raw.client_id,
+            callback_base: raw.callback_base,
+            turnstile_sitekey: raw.turnstile_sitekey,
+            session_cookie: raw.session_cookie,
+            session_cookie_domain: raw.session_cookie_domain,
+        })
+    }
 }
 
 /// Settings for the `saml` provider. Present as a config seam; the SP backend
@@ -532,9 +588,8 @@ extra = { future_knob = 7 }
 providers = ["local", "sso"]
 
 [auth.sso]
-base_url = "http://127.0.0.1:1411"
+identity_config = "/etc/greater-spire/gateway/identity.toml"
 client_id = "gateway"
-client_secret = "s3cret"
 callback_base = "https://gateway.lzrlab.dev"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
@@ -545,12 +600,71 @@ callback_base = "https://gateway.lzrlab.dev"
         assert!(cfg.auth.has(AuthProvider::Sso));
         let sso = cfg.auth.sso.clone().expect("sso config present");
         assert_eq!(sso.client_id, "gateway");
-        assert_eq!(sso.base_url, "http://127.0.0.1:1411");
+        assert_eq!(
+            sso.identity_config,
+            "/etc/greater-spire/gateway/identity.toml"
+        );
         assert_eq!(sso.callback_base, "https://gateway.lzrlab.dev");
+        assert!(sso.is_complete());
 
         // Re-serialize and re-parse: providers survive the round trip.
         let back = toml::to_string(&cfg).unwrap();
         let cfg2: Config = toml::from_str(&back).unwrap();
         assert_eq!(cfg2.auth.providers, cfg.auth.providers);
+        assert_eq!(
+            cfg2.auth.sso.unwrap().identity_config,
+            "/etc/greater-spire/gateway/identity.toml"
+        );
+    }
+
+    #[test]
+    fn sso_shared_secret_keys_are_refused_with_the_reason() {
+        // A config written for the plaintext, shared-secret SSO must not start
+        // with the secret silently dropped: each removed key is a parse error
+        // that says what replaced it.
+        for stale in [
+            r#"
+[auth]
+providers = ["sso"]
+[auth.sso]
+identity_config = "/etc/greater-spire/gateway/identity.toml"
+client_id = "gateway"
+client_secret = "s3cret"
+"#,
+            r#"
+[auth]
+providers = ["sso"]
+[auth.sso]
+base_url = "http://127.0.0.1:1411"
+client_id = "gateway"
+"#,
+        ] {
+            let err = toml::from_str::<Config>(stale)
+                .expect_err("stale sso keys must be refused")
+                .to_string();
+            assert!(err.contains("removed"), "{err}");
+            assert!(err.contains("SPIFFE identity over mTLS"), "{err}");
+            assert!(err.contains("identity_config"), "{err}");
+        }
+    }
+
+    #[test]
+    fn sso_config_is_incomplete_without_identity_or_client_id() {
+        let cfg: Config = toml::from_str(
+            r#"
+[auth.sso]
+client_id = "gateway"
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.auth.sso.unwrap().is_complete());
+        let cfg: Config = toml::from_str(
+            r#"
+[auth.sso]
+identity_config = "/etc/greater-spire/gateway/identity.toml"
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.auth.sso.unwrap().is_complete());
     }
 }

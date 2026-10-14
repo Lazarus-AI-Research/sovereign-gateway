@@ -64,6 +64,43 @@ Open `http://localhost:8080/` for the bundled admin console (Preact, compiled in
 
 Users have roles: **admin** (full control) and **member** (use the gateway, manage their own keys). Users own keys; there is no password in the TOML.
 
+## SSO login
+
+Besides local username/password users, the admin console can sign people in through the lair identity provider (`[auth] providers = ["local", "sso"]`). The gateway is a relying party of the IdP's direct, non-SAML API and reaches it **only over SPIFFE mTLS**: it presents its own X.509-SVID, the IdP maps that SPIFFE id to a service name that must equal `client_id`, and the gateway requires the IdP to present the SPIFFE id it was told to expect. No shared secret exists anywhere.
+
+The serve config names the identity file and the relying-party settings:
+
+```toml
+[auth]
+providers = ["local", "sso"]
+
+[auth.sso]
+identity_config = "/etc/greater-spire/gateway/identity.toml"
+client_id = "gateway"
+callback_base = "https://gateway.example.com"
+```
+
+The identity file is [greater-spire](vendor/greater-spire/README.md)'s: the gateway's SPIFFE id, where its credentials are published, and the one peer it talks to. The credentials directory holds generations (`cert-chain.pem`, `key.pem`, `bundle.pem`) under a `current` symlink that the installer replaces atomically on renewal; the gateway polls it and reloads without a restart.
+
+```toml
+# /etc/greater-spire/gateway/identity.toml
+version = 1
+
+[identity]
+spiffe_id = "spiffe://lzrlab.internal/service/gateway"
+
+[identity.source]
+kind = "files"
+directory = "/var/lib/greater-spire/gateway/current"
+poll_interval_secs = 5
+
+[peers.sso]
+url = "https://127.0.0.1:8444"
+spiffe_id = "spiffe://lzrlab.internal/service/sso"
+```
+
+The identity runtime starts with the server and is shut down after the listener drains on SIGINT/SIGTERM. A missing or invalid identity file is a startup error when `sso` is enabled; a config still carrying the pre-mTLS `base_url` or `client_secret` keys is refused with a message saying what replaced them.
+
 ## CLI usage
 
 ```

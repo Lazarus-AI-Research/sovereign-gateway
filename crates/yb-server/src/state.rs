@@ -15,7 +15,7 @@ use yb_core::ratelimit::Limiter;
 use yb_core::{LogControl, Observer, RequestLogger, Store};
 use yb_gateway::{DeploymentRouter, Gateway};
 
-use crate::sso::SsoClient;
+use crate::sso::{SsoClient, SsoIdentity};
 
 /// Process-wide state shared by all routes. Clone is `Arc`-cheap.
 #[derive(Clone)]
@@ -43,6 +43,10 @@ pub struct AppState {
     /// External IdP client for the `sso` login provider — `Some` iff `sso` is
     /// enabled and configured. Built once from `auth.sso`.
     pub sso: Option<Arc<SsoClient>>,
+    /// The gateway's SPIFFE identity the `sso` client presents — `Some` iff `sso`
+    /// is. Owned here for the life of the process; the binary shuts it down
+    /// after the listener stops, which invalidates the client.
+    pub identity: Option<Arc<SsoIdentity>>,
     /// When false, budget enforcement on the inference path is skipped.
     pub budgets_enabled: bool,
     /// When false, rate-limit enforcement on the inference path is skipped.
