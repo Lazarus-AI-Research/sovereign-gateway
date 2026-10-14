@@ -118,6 +118,7 @@ async fn setup() -> (AppState, String) {
         mode: DeploymentMode::Selfhosted,
         auth: Arc::new(yb_core::config::AuthConfig::default()),
         sso: None,
+        identity: None,
         budgets_enabled: false,
         ratelimit_enabled: false,
         request_log: Arc::new(NullLogger),
@@ -264,19 +265,92 @@ async fn x_goog_api_key_header_authenticates() {
 
 // ---------------------------------------------------------------------------
 // Pluggable admin auth: the `sso` provider (direct code flow) against a mock IdP
+// reached the way the real one is: over SPIFFE mTLS, no shared secret.
 // ---------------------------------------------------------------------------
 
-/// Spawn a minimal mock identity provider on an ephemeral port. It speaks the
-/// relying-party contract the gateway's `SsoClient` calls: `/api/login/start`
-/// returns a dev code, and `/api/login/code` accepts `123456` for
-/// `admin@example.com` (returning `{user, role}`) and rejects everything else.
-/// Returns the base URL.
+/// The throwaway trust domain the mock IdP and the gateway-under-test share.
+const TRUST_DOMAIN: &str = "lzrlab.test";
+/// The SVID the gateway presents; the IdP maps it to the service `gateway`.
+const GATEWAY_SPIFFE_ID: &str = "spiffe://lzrlab.test/service/gateway";
+/// The SVID the gateway requires the IdP to present (`[peers.sso]`).
+const SSO_SPIFFE_ID: &str = "spiffe://lzrlab.test/service/sso";
+
+/// Every request body the mock IdP accepted, by path, for assertions on what
+/// actually went over the wire.
+type Seen = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
+/// Spawn a minimal mock identity provider on an ephemeral mTLS port and return
+/// the path of a greater-spire identity file that lets the gateway reach it:
+/// a fresh static CA mints the gateway's SVID (published to a temp directory
+/// the file names) and the IdP's. The mock speaks the relying-party contract
+/// the gateway's `SsoClient` calls: `/api/login/start` returns a dev code, and
+/// `/api/login/code` accepts `123456` for `admin@example.com` (returning
+/// `{user, role}`) and rejects everything else.
+///
+/// Like the real IdP, it admits a call only when it came over mTLS from the
+/// gateway's SPIFFE id, the body's `client_id` is the service that id maps to,
+/// and no `client_secret` rides along; anything else is `{error:"invalid_client"}`
+/// with the reason, so a regression shows up as a 401 naming it.
 async fn mock_idp() -> String {
+    mock_idp_recording(SSO_SPIFFE_ID).await.0
+}
+
+/// As [`mock_idp`], presenting `server_id` as the IdP's SVID (the gateway still
+/// expects [`SSO_SPIFFE_ID`]), and returning the bodies it admitted.
+async fn mock_idp_recording(server_id: &str) -> (String, Seen) {
+    use axum::response::IntoResponse;
     use axum::routing::post;
-    use axum::{Json, Router};
+    use axum::{Extension, Json, Router};
+    use greater_spire::{static_ca::StaticCa, AuthenticatedPeer, SpiffeId};
+    use hyper_util::service::TowerToHyperService;
     use serde_json::Value as J;
 
-    async fn start(Json(b): Json<J>) -> Json<J> {
+    /// The IdP's admission check for a relying-party call: `Some` is the
+    /// rejection to send back.
+    fn reject(peer: &AuthenticatedPeer, body: &J) -> Option<axum::response::Response> {
+        let reason = if peer.spiffe_id().to_string() != GATEWAY_SPIFFE_ID {
+            Some(format!("peer {} is not the gateway", peer.spiffe_id()))
+        } else if body.get("client_secret").is_some() {
+            Some("client_secret present in body".to_string())
+        } else if body.get("client_id").and_then(|c| c.as_str()) != Some("gateway") {
+            Some(format!(
+                "client_id {:?} is not the peer's service",
+                body.get("client_id")
+            ))
+        } else {
+            None
+        };
+        reason.map(|why| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": format!("invalid_client: {why}") })),
+            )
+                .into_response()
+        })
+    }
+
+    #[derive(Clone)]
+    struct Mock {
+        seen: Seen,
+    }
+    impl Mock {
+        fn record(&self, path: &str, body: &J) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((path.to_string(), body.clone()));
+        }
+    }
+
+    async fn start(
+        axum::extract::State(m): axum::extract::State<Mock>,
+        Extension(peer): Extension<AuthenticatedPeer>,
+        Json(b): Json<J>,
+    ) -> axum::response::Response {
+        if let Some(r) = reject(&peer, &b) {
+            return r;
+        }
+        m.record("/api/login/start", &b);
         // Echo any turnstile_token back as dev_code so a test can assert the
         // gateway forwarded it; otherwise the fixed dev code.
         let dev = b
@@ -284,10 +358,17 @@ async fn mock_idp() -> String {
             .and_then(|t| t.as_str())
             .filter(|s| !s.is_empty())
             .unwrap_or("123456");
-        Json(json!({ "ok": true, "dev_code": dev }))
+        Json(json!({ "ok": true, "dev_code": dev })).into_response()
     }
-    async fn code(Json(b): Json<J>) -> axum::response::Response {
-        use axum::response::IntoResponse;
+    async fn code(
+        axum::extract::State(m): axum::extract::State<Mock>,
+        Extension(peer): Extension<AuthenticatedPeer>,
+        Json(b): Json<J>,
+    ) -> axum::response::Response {
+        if let Some(r) = reject(&peer, &b) {
+            return r;
+        }
+        m.record("/api/login/code", &b);
         let email = b.get("email").and_then(|e| e.as_str()).unwrap_or("");
         let code = b.get("code").and_then(|c| c.as_str()).unwrap_or("");
         if email == "admin@example.com" && code == "123456" {
@@ -306,8 +387,15 @@ async fn mock_idp() -> String {
         }
     }
     // Unified-session introspection: the one shared token resolves to the identity.
-    async fn introspect(Json(b): Json<J>) -> axum::response::Response {
-        use axum::response::IntoResponse;
+    async fn introspect(
+        axum::extract::State(m): axum::extract::State<Mock>,
+        Extension(peer): Extension<AuthenticatedPeer>,
+        Json(b): Json<J>,
+    ) -> axum::response::Response {
+        if let Some(r) = reject(&peer, &b) {
+            return r;
+        }
+        m.record("/api/session/introspect", &b);
         let session = b.get("session").and_then(|s| s.as_str()).unwrap_or("");
         if session == "SHARED-SESSION-TOKEN" {
             Json(json!({ "user": { "id": "u1", "email": "admin@example.com", "name": "Admin" }, "role": "x" }))
@@ -320,36 +408,108 @@ async fn mock_idp() -> String {
                 .into_response()
         }
     }
+    async fn invite(
+        axum::extract::State(m): axum::extract::State<Mock>,
+        Extension(peer): Extension<AuthenticatedPeer>,
+        Json(b): Json<J>,
+    ) -> axum::response::Response {
+        if let Some(r) = reject(&peer, &b) {
+            return r;
+        }
+        m.record("/api/users/invite", &b);
+        Json(json!({ "ok": true })).into_response()
+    }
 
+    // --- identities: one CA, an SVID for each side ---------------------------
+    let ca = StaticCa::generate(
+        TRUST_DOMAIN.try_into().unwrap(),
+        Duration::from_secs(86_400),
+    )
+    .unwrap();
+    let gateway_id: SpiffeId = GATEWAY_SPIFFE_ID.try_into().unwrap();
+    let server_id: SpiffeId = server_id.try_into().unwrap();
+    let dir = std::env::temp_dir().join(format!("yb-sso-{}", new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // The gateway's credentials, published as a generation under `svid/current`
+    // the way the installer would.
+    let current = ca
+        .issue_svid(&gateway_id, Duration::from_secs(3600))
+        .unwrap()
+        .publish(dir.join("svid"))
+        .unwrap();
+    // The IdP's credentials stay in memory: it is the server.
+    let server = ca
+        .issue_svid(&server_id, Duration::from_secs(3600))
+        .unwrap()
+        .identity_source()
+        .unwrap();
+
+    // --- the IdP listener ------------------------------------------------------
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen: Seen = Default::default();
     let app = Router::new()
         .route("/api/login/start", post(start))
         .route("/api/login/code", post(code))
         .route("/api/session/introspect", post(introspect))
-        .route(
-            "/api/users/invite",
-            post(|| async { Json(json!({ "ok": true })) }),
-        );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+        .route("/api/users/invite", post(invite))
+        .with_state(Mock { seen: seen.clone() });
+    let service = TowerToHyperService::new(app);
+    let acceptor = server.acceptor();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            let service = service.clone();
+            tokio::spawn(async move {
+                // A refused handshake (e.g. the wrong-peer test) is the point of
+                // the test, not a failure of the mock.
+                let _ = acceptor.serve_http_connection(tcp, service).await;
+            });
+        }
     });
-    format!("http://{addr}")
+
+    // --- the gateway's identity file, as the operator would write it ----------
+    let identity_toml = dir.join("identity.toml");
+    std::fs::write(
+        &identity_toml,
+        format!(
+            r#"version = 1
+
+[identity]
+spiffe_id = "{GATEWAY_SPIFFE_ID}"
+
+[identity.source]
+kind = "files"
+directory = {current:?}
+poll_interval_secs = 5
+
+[peers.sso]
+url = "https://{addr}"
+spiffe_id = "{SSO_SPIFFE_ID}"
+"#
+        ),
+    )
+    .unwrap();
+    (identity_toml.to_str().unwrap().to_string(), seen)
 }
 
 /// Build an [`AppState`] with a chosen set of auth providers, optionally wired to
-/// a mock IdP base URL. No models/keys needed for auth tests.
+/// a mock IdP through the identity file [`mock_idp`] returned. No models/keys
+/// needed for auth tests.
 async fn setup_auth(
     providers: Vec<yb_core::config::AuthProvider>,
-    sso_base: Option<String>,
+    sso_identity_config: Option<String>,
 ) -> AppState {
-    setup_auth_ts(providers, sso_base, None).await
+    setup_auth_ts(providers, sso_identity_config, None).await
 }
 
 /// As [`setup_auth`], with an optional Turnstile sitekey on the sso config.
 async fn setup_auth_ts(
     providers: Vec<yb_core::config::AuthProvider>,
-    sso_base: Option<String>,
+    sso_identity_config: Option<String>,
     turnstile_sitekey: Option<&str>,
 ) -> AppState {
     use yb_core::config::{AuthConfig, SsoAuthConfig};
@@ -358,24 +518,31 @@ async fn setup_auth_ts(
     let store = Arc::new(SqliteStore::connect(path.to_str().unwrap()).await.unwrap());
     store.migrate().await.unwrap();
 
-    let sso_cfg = sso_base.as_ref().map(|base| SsoAuthConfig {
-        base_url: base.clone(),
-        client_id: "gateway".into(),
-        client_secret: "s3cret".into(),
-        callback_base: "https://gateway.test".into(),
-        turnstile_sitekey: turnstile_sitekey.map(str::to_string),
-        session_cookie: Some("lzr_session".into()),
-        session_cookie_domain: Some("lzrlab.dev".into()),
-    });
+    let sso_cfg = sso_identity_config
+        .as_ref()
+        .map(|identity_config| SsoAuthConfig {
+            identity_config: identity_config.clone(),
+            client_id: "gateway".into(),
+            callback_base: "https://gateway.test".into(),
+            turnstile_sitekey: turnstile_sitekey.map(str::to_string),
+            session_cookie: Some("lzr_session".into()),
+            session_cookie_domain: Some("lzrlab.dev".into()),
+        });
     let auth = Arc::new(AuthConfig {
         providers,
         sso: sso_cfg.clone(),
         saml: None,
     });
-    let sso = sso_cfg
-        .as_ref()
-        .and_then(yb_server::sso::SsoClient::from_config)
-        .map(Arc::new);
+    // The same constructor the binary uses: loads the identity file, starts
+    // the SVID runtime, binds the client to the `sso` peer.
+    let (identity, sso) = match &sso_cfg {
+        Some(cfg) => yb_server::sso::SsoClient::connect(cfg)
+            .await
+            .expect("sso identity starts")
+            .map(|(identity, client)| (Some(Arc::new(identity)), Some(Arc::new(client))))
+            .expect("sso config is complete"),
+        None => (None, None),
+    };
 
     let router = Arc::new(DeploymentRouter::from_models(
         vec![],
@@ -402,6 +569,7 @@ async fn setup_auth_ts(
         mode: DeploymentMode::Selfhosted,
         auth,
         sso,
+        identity,
         budgets_enabled: false,
         ratelimit_enabled: false,
         request_log: Arc::new(NullLogger),
@@ -554,6 +722,148 @@ async fn sso_wrong_code_is_401() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn sso_requests_carry_the_svid_and_client_id_and_no_secret() {
+    use yb_core::config::AuthProvider::Sso;
+    let (idp, seen) = mock_idp_recording(SSO_SPIFFE_ID).await;
+    let state = setup_auth(vec![Sso], Some(idp)).await;
+    let app = build_router(state);
+
+    // Drive every relying-party call the gateway makes: start, code, then
+    // introspect (via the shared cookie) and invite (as the signed-in admin).
+    let resp = post_json(
+        &app,
+        "/admin/v1/auth/sso/start",
+        json!({"email":"admin@example.com"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = post_json(
+        &app,
+        "/admin/v1/auth/sso/code",
+        json!({"email":"admin@example.com","code":"123456"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/v1/auth/me")
+                .header("cookie", "lzr_session=SHARED-SESSION-TOKEN")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The mock admitted each only because it arrived over mTLS from the
+    // gateway's SPIFFE id; what it saw in the bodies is the whole client side
+    // of the contract: `client_id`, and never a `client_secret`.
+    let seen = seen.lock().unwrap();
+    let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
+    assert!(paths.contains(&"/api/login/start"), "{paths:?}");
+    assert!(paths.contains(&"/api/login/code"), "{paths:?}");
+    assert!(paths.contains(&"/api/session/introspect"), "{paths:?}");
+    for (path, body) in seen.iter() {
+        assert_eq!(body["client_id"], "gateway", "{path}: {body}");
+        assert!(
+            body.get("client_secret").is_none(),
+            "{path} carried a client_secret: {body}"
+        );
+        // The bodies' other keys are the endpoint's own.
+        match path.as_str() {
+            "/api/login/start" => {
+                assert_eq!(body["email"], "admin@example.com");
+                assert_eq!(body["callback_base"], "https://gateway.test");
+            }
+            "/api/login/code" => assert_eq!(body["code"], "123456"),
+            "/api/session/introspect" => assert_eq!(body["session"], "SHARED-SESSION-TOKEN"),
+            other => panic!("unexpected call {other}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn sso_server_with_the_wrong_spiffe_id_is_a_transport_error() {
+    use yb_core::config::AuthProvider::Sso;
+    // The IdP's certificate is valid under the shared CA but names another
+    // service: the gateway must refuse the handshake, not talk to it.
+    let (idp, seen) = mock_idp_recording("spiffe://lzrlab.test/service/impostor").await;
+    let state = setup_auth(vec![Sso], Some(idp)).await;
+    let app = build_router(state);
+
+    let resp = post_json(
+        &app,
+        "/admin/v1/auth/sso/start",
+        json!({"email":"admin@example.com"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let v: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], "upstream_error");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("sso unreachable"),
+        "{v}"
+    );
+    // Nothing reached the impostor's handlers.
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sso_identity_file_that_cannot_load_is_a_startup_error() {
+    use yb_core::config::SsoAuthConfig;
+    let cfg = SsoAuthConfig {
+        identity_config: "/nonexistent/greater-spire/gateway/identity.toml".into(),
+        client_id: "gateway".into(),
+        callback_base: "https://gateway.test".into(),
+        ..Default::default()
+    };
+    let err = yb_server::sso::SsoClient::connect(&cfg)
+        .await
+        .expect_err("a missing identity file fails closed");
+    assert!(matches!(err, yb_core::Error::Config(_)), "{err}");
+    assert!(err.to_string().contains("identity_config"), "{err}");
+
+    // While an incomplete table is simply "no sso", as before.
+    let cfg = SsoAuthConfig {
+        client_id: "gateway".into(),
+        ..Default::default()
+    };
+    assert!(yb_server::sso::SsoClient::connect(&cfg)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn sso_identity_shutdown_invalidates_the_client() {
+    use yb_core::config::AuthProvider::Sso;
+    let idp = mock_idp().await;
+    let state = setup_auth(vec![Sso], Some(idp)).await;
+    let identity = state.identity.clone().expect("identity started");
+    assert!(identity.status().usable);
+    let app = build_router(state);
+
+    identity.shutdown().await;
+    assert!(!identity.status().usable);
+    // Idempotent.
+    identity.shutdown().await;
+
+    let resp = post_json(
+        &app,
+        "/admin/v1/auth/sso/start",
+        json!({"email":"admin@example.com"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test]

@@ -33,20 +33,30 @@ path = "./gateway.db"           # sqlite file (when backend = "sqlite")
 
 # Admin-console login methods. `providers` may list any of: local (the gateway's own
 # username/password users), sso (an external identity provider spoken over its
-# client-authenticated server-to-server JSON API — the "direct", non-SAML flow),
-# and saml (backend seam; not yet wired). Defaults to ["local"]. `yb_` API keys
-# are separate and unaffected. The gateway owns authorization: sso proves the email,
-# the gateway decides the role. New sso users default to member; grant admin with
+# server-to-server JSON API — the "direct", non-SAML flow), and saml (backend
+# seam; not yet wired). Defaults to ["local"]. `yb_` API keys are separate and
+# unaffected. The gateway owns authorization: sso proves the email, the gateway
+# decides the role. New sso users default to member; grant admin with
 # `gateway set-role <email> admin` (creates the user if needed, so you can assign
 # a role before their first login) or in the console.
+#
+# The sso provider reaches the IdP over SPIFFE mTLS only: the gateway presents
+# its X.509-SVID, the IdP maps that SPIFFE id to a service name which must equal
+# `client_id`, and the gateway in turn requires the IdP to present the SPIFFE id
+# named in the identity file. There is no shared secret. The transport side — the
+# gateway's SVID, where the IdP listens and which id it must present — lives in a
+# separate greater-spire identity file so credential rotation never touches this
+# one (see the README, "SSO login"). The former `base_url` and `client_secret`
+# keys are refused at startup with a message saying so.
 [auth]
 providers = ["local"]
 # [auth.sso]
-# base_url = "http://127.0.0.1:1411"          # IdP backend, reached server-to-server
-# client_id = "gateway"
-# client_secret = "…"                          # kept server-side; never sent to the browser
+# identity_config = "/etc/greater-spire/gateway/identity.toml"  # the gateway's SVID + [peers.sso] (IdP mTLS url, SPIFFE id)
+# client_id = "gateway"                         # must be the service the IdP maps our SPIFFE id to
 # callback_base = "https://gateway.example.com" # origin the IdP embeds in the magic link
 # turnstile_sitekey = "0x4AAA..."             # Cloudflare Turnstile sitekey (public) → login shows a bot-check widget; the IdP validates the token
+# session_cookie = "lzr_session"              # unified cross-app session cookie name (default)
+# session_cookie_domain = "example.com"       # set ⇒ cross-app SSO on: the shared cookie is set and introspected
 
 [reqlog]
 # Full request/response capture to DuckDB (WAL -> compressed parquet shards) for
