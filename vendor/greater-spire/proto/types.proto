@@ -1,0 +1,81 @@
+syntax = "proto3";
+package spire.api.types;
+
+message SPIFFEID {
+  string trust_domain = 1;
+  string path = 2;
+}
+message Selector {
+  string type = 1;
+  string value = 2;
+}
+
+message AttestationData {
+  string type = 1;
+  bytes payload = 2;
+}
+
+message X509SVID {
+  repeated bytes cert_chain = 1;
+  SPIFFEID id = 2;
+  int64 expires_at = 3;
+  string hint = 4;
+}
+
+message X509Certificate {
+  bytes asn1 = 1;
+  bool tainted = 2;
+}
+
+message Bundle {
+  string trust_domain = 1;
+  repeated X509Certificate x509_authorities = 2;
+  int64 refresh_hint = 4;
+  uint64 sequence_number = 5;
+}
+
+message BundleMask {
+  bool x509_authorities = 2;
+  bool refresh_hint = 4;
+  bool sequence_number = 5;
+}
+
+message Entry {
+  string id = 1;
+  SPIFFEID spiffe_id = 2;
+  SPIFFEID parent_id = 3;
+  repeated Selector selectors = 4;
+  int32 x509_svid_ttl = 5;
+  repeated string federates_with = 6;
+  bool admin = 7;
+  bool downstream = 8;
+  int64 expires_at = 9;
+  repeated string dns_names = 10;
+  int64 revision_number = 11;
+  bool store_svid = 12;
+  int32 jwt_svid_ttl = 13;
+  string hint = 14;
+  int64 created_at = 15;
+}
+
+message EntryMask {
+  bool spiffe_id = 2;
+  bool parent_id = 3;
+  bool selectors = 4;
+  bool x509_svid_ttl = 5;
+  bool federates_with = 6;
+  bool admin = 7;
+  bool downstream = 8;
+  bool expires_at = 9;
+  bool dns_names = 10;
+  bool revision_number = 11;
+  bool store_svid = 12;
+  bool jwt_svid_ttl = 13;
+  bool hint = 14;
+  bool created_at = 15;
+}
+
+message Status {
+  int32 code = 1;
+  string message = 2;
+}

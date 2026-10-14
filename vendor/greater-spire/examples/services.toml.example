@@ -1,0 +1,11 @@
+[[services]]
+name = "product-server-a"
+spiffe_id = "spiffe://internal/service/product-server-a"
+may_delegate_user = true
+may_sync_acls = true
+
+[[services]]
+name = "analytics-worker"
+spiffe_id = "spiffe://internal/service/analytics-worker"
+may_delegate_user = false
+may_sync_acls = false
