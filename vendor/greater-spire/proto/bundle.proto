@@ -1,0 +1,14 @@
+syntax = "proto3";
+package spire.api.server.bundle.v1;
+
+import "types.proto";
+
+service Bundle {
+  rpc GetBundle(GetBundleRequest) returns (spire.api.types.Bundle);
+  rpc GetFederatedBundle(GetFederatedBundleRequest) returns (spire.api.types.Bundle);
+}
+message GetBundleRequest { spire.api.types.BundleMask output_mask = 1; }
+message GetFederatedBundleRequest {
+  string trust_domain = 1;
+  spire.api.types.BundleMask output_mask = 2;
+}

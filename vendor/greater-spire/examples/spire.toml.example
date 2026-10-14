@@ -1,0 +1,24 @@
+version = 1
+
+[identity]
+spiffe_id = "spiffe://fleet.test/service/nexis"
+
+[identity.source]
+kind = "embedded_spire"
+server_address = "spire-server.identity.svc.cluster.local:8081"
+bootstrap_bundle_path = "/etc/greater-spire/bootstrap.pem"
+state_dir = "/var/lib/greater-spire/nexis-agent"
+# One-use secret; may be removed after agent state is persisted.
+join_token_file = "/run/secrets/spire/join-token"
+sync_interval_secs = 30
+rotate_before_secs = 300
+rpc_timeout_secs = 30
+
+[transport]
+handshake_timeout_secs = 10
+max_connection_age_secs = 300
+request_timeout_secs = 30
+
+[peers.vkg]
+url = "https://vkg.default.svc.cluster.local:8443"
+spiffe_id = "spiffe://fleet.test/service/vkg"
