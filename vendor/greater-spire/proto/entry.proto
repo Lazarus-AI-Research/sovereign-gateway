@@ -1,0 +1,11 @@
+syntax = "proto3";
+package spire.api.server.entry.v1;
+
+import "types.proto";
+
+service Entry {
+  rpc GetAuthorizedEntries(GetAuthorizedEntriesRequest) returns (GetAuthorizedEntriesResponse);
+}
+
+message GetAuthorizedEntriesRequest { spire.api.types.EntryMask output_mask = 1; }
+message GetAuthorizedEntriesResponse { repeated spire.api.types.Entry entries = 1; }
