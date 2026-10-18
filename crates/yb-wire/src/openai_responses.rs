@@ -770,7 +770,7 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
         Some("response.function_call_arguments.delta") => vec![StreamEvent::ToolUseDelta {
             partial_json: opt_str(&v, "delta").unwrap_or_default().to_string(),
         }],
-        Some("response.completed") | Some("response.incomplete") => {
+        Some("response.completed") | Some("response.incomplete") | Some("response.failed") => {
             let mut out = Vec::new();
             // An interim `response.*` event can carry `"usage": null`; parsing
             // that would push an all-zero delta over a real one.
@@ -783,9 +783,22 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
                     usage: parse_usage(Some(u)),
                 });
             }
-            out.push(StreamEvent::Done {
-                stop_reason: state.stop_reason.take().unwrap_or(StopReason::EndTurn),
-            });
+            let stop_reason = if opt_str(&v, "type") == Some("response.incomplete") {
+                let reason = v
+                    .get("response")
+                    .and_then(|r| r.get("incomplete_details"))
+                    .and_then(|d| opt_str(d, "reason"));
+                match reason {
+                    Some("max_output_tokens") => StopReason::MaxTokens,
+                    Some(other) => StopReason::Other(other.to_string()),
+                    None => StopReason::Other("incomplete".into()),
+                }
+            } else if opt_str(&v, "type") == Some("response.failed") {
+                StopReason::Other(opt_str(&v, "type").unwrap_or("response.failed").to_string())
+            } else {
+                state.stop_reason.take().unwrap_or(StopReason::EndTurn)
+            };
+            out.push(StreamEvent::Done { stop_reason });
             out
         }
         _ => vec![],
@@ -818,6 +831,7 @@ pub struct EmitState {
     /// `response.completed` there would publish `usage: null` and lose the
     /// counts, which is what a metering client reads.
     pending_completed: bool,
+    terminal_status: Option<&'static str>,
 }
 
 impl EmitState {
@@ -966,7 +980,12 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
                     write_completed(&mut out, state);
                 }
             }
-            StreamEvent::Done { .. } => {
+            StreamEvent::Done { stop_reason } => {
+                state.terminal_status = Some(match stop_reason {
+                    StopReason::MaxTokens => "incomplete",
+                    StopReason::Other(reason) if reason == "response.failed" => "failed",
+                    _ => "completed",
+                });
                 // Close any open item now; only the terminal event waits.
                 close_open(&mut out, state);
                 if state.usage.is_some() {
@@ -980,15 +999,16 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// Write the terminal `response.completed` event.
+/// Write the terminal event matching the outcome represented by the IR.
 fn write_completed(out: &mut String, state: &mut EmitState) {
-    let resp = state.response_obj("completed", json!(state.done_items.clone()));
-    write_event(
-        out,
-        state,
-        "response.completed",
-        json!({"type": "response.completed", "response": resp}),
-    );
+    let status = state.terminal_status.unwrap_or("completed");
+    let event = match status {
+        "incomplete" => "response.incomplete",
+        "failed" => "response.failed",
+        _ => "response.completed",
+    };
+    let resp = state.response_obj(status, json!(state.done_items.clone()));
+    write_event(out, state, event, json!({"type": event, "response": resp}));
 }
 
 impl EmitState {
@@ -1020,8 +1040,27 @@ impl EmitState {
                     })
             })
             .unwrap_or(Value::Null);
-        let mut resp = json!({"id": self.resp_id, "object": "response", "status": status,
-               "model": self.model, "output": output, "usage": usage});
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let mut resp = json!({
+            "id": self.resp_id, "object": "response", "status": status,
+            "created_at": now,
+            "completed_at": if status == "completed" { json!(now) } else { Value::Null },
+            "error": if status == "failed" {
+                json!({"code": "server_error", "message": "The upstream response failed."})
+            } else { Value::Null },
+            "incomplete_details": if status == "incomplete" {
+                json!({"reason": "max_output_tokens"})
+            } else { Value::Null },
+            "model": self.model, "output": output, "usage": usage,
+            "instructions": null, "max_output_tokens": null,
+            "previous_response_id": null, "reasoning_effort": null,
+            "store": false, "temperature": 1, "top_p": 1,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto", "tools": [], "truncation": "disabled",
+            "user": null, "metadata": {}, "parallel_tool_calls": true,
+        });
         if let (Some(obj), Some(key)) = (resp.as_object_mut(), &self.prompt_cache_key) {
             obj.insert("prompt_cache_key".into(), json!(key));
             let retention = self.prompt_cache_retention.as_deref().unwrap_or("24h");
@@ -1325,6 +1364,49 @@ mod tests {
         let back = emit_request(&chat_req, &EmitOptions::default()).unwrap();
         let back: Value = serde_json::from_slice(&back.0).unwrap();
         assert_eq!(back["tools"][0]["strict"], true);
+    }
+
+    #[test]
+    fn incomplete_sse_keeps_max_tokens_stop_reason() {
+        let mut state = SseState::default();
+        let terminal = json!({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 42, "output_tokens": 64}
+            }
+        });
+        let events = decode_sse(&format!("data: {terminal}"), &mut state);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Done {
+                stop_reason: StopReason::MaxTokens
+            }
+        )));
+    }
+
+    #[test]
+    fn max_tokens_ir_emits_documented_incomplete_terminal() {
+        let mut state = EmitState::default();
+        let bytes = encode_sse(
+            &[
+                StreamEvent::MessageStart {
+                    model: "test".into(),
+                },
+                StreamEvent::Done {
+                    stop_reason: StopReason::MaxTokens,
+                },
+                StreamEvent::UsageDelta {
+                    usage: Usage::default(),
+                },
+            ],
+            &mut state,
+        );
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("event: response.incomplete"));
+        assert!(!text.contains("event: response.completed"));
+        assert!(text.contains("\"reason\":\"max_output_tokens\""));
     }
 
     #[test]
