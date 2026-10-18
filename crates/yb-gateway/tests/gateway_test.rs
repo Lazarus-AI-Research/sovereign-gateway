@@ -340,6 +340,61 @@ fn test_router() -> DeploymentRouter {
     DeploymentRouter::from_models(models, HashMap::new(), HashMap::new(), Strategy::Simple)
 }
 
+#[tokio::test]
+async fn responses_route_replays_request_body_except_routing_fields() {
+    let models = vec![ModelConfig {
+        model_name: "client-alias".into(),
+        aliases: vec![],
+        deployments: vec![DeploymentConfig {
+            provider: "fake".into(),
+            upstream_model: "upstream-model".into(),
+            api_base: None,
+            api_key: None,
+            upstream_format: WireFormat::OpenaiResponses.into(),
+            weight: 1,
+            pricing: None,
+            health_check: Default::default(),
+            health_path: None,
+            extra: Default::default(),
+        }],
+    }];
+    let router =
+        DeploymentRouter::from_models(models, HashMap::new(), HashMap::new(), Strategy::Simple);
+    let mock = MockClient::json(
+        serde_json::to_vec(&json!({
+            "id": "resp_1", "model": "upstream-model", "status": "completed",
+            "output": [], "usage": {"input_tokens": 3, "output_tokens": 1}
+        }))
+        .unwrap(),
+    );
+    let gateway = Gateway::new(
+        Arc::new(mock.clone()),
+        Arc::new(router),
+        Arc::new(RecordingStore::default()),
+        Arc::new(NullLogger),
+    );
+    let original = json!({
+        "model": "client-alias", "stream": false, "input": "test",
+        "max_output_tokens": 64,
+        "reasoning": {"effort": "max", "summary": "detailed"},
+        "provider_extension": {"retain": true}
+    });
+    gateway
+        .handle(
+            WireFormat::OpenaiResponses,
+            &serde_json::to_vec(&original).unwrap(),
+            RequestCtx::new(),
+        )
+        .await
+        .unwrap();
+    let sent = mock.last_request().expect("one upstream call");
+    let actual: Value = serde_json::from_slice(&sent.body).unwrap();
+    let mut expected = original;
+    expected["model"] = json!("upstream-model");
+    expected["stream"] = json!(true);
+    assert_eq!(actual, expected);
+}
+
 /// A request context carrying a key + its owner user and team, so the test can
 /// assert telemetry/rollups are keyed by key/user/team.
 fn ctx_with_identity() -> RequestCtx {
