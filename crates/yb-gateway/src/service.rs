@@ -1365,7 +1365,7 @@ fn translate_stream(
         surface,
     };
 
-    let s = stream::unfold(init, |mut st| async move {
+    let s = stream::unfold(init, move |mut st| async move {
         loop {
             if st.done {
                 if !st.recorded {
@@ -1409,14 +1409,9 @@ fn translate_stream(
                                 Ok(None) => {}
                                 Err(e) => {
                                     st.done = true;
+                                    let ir = st.ir_json();
                                     st.rctx
-                                        .finish(
-                                            st.usage,
-                                            st.status,
-                                            true,
-                                            st.ir_json(),
-                                            st.response_bytes,
-                                        )
+                                        .finish(st.usage, st.status, true, ir, st.response_bytes)
                                         .await;
                                     st.recorded = true;
                                     return Some((Err(e), st));
