@@ -376,6 +376,26 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     Ok((bytes, headers))
 }
 
+/// Relay a Responses request to a Responses upstream without discarding
+/// provider-supported fields that the shared IR does not yet model. Routing
+/// owns only the upstream model name and the streaming transport choice.
+pub fn emit_same_shape_request(
+    bytes: &[u8],
+    target_model: &str,
+    stream: bool,
+) -> Result<EmittedRequest> {
+    let mut request: Value = serde_json::from_slice(bytes)?;
+    let body = request
+        .as_object_mut()
+        .ok_or_else(|| WireError::InvalidRequest("body is not a JSON object".into()))?;
+    body.insert("model".into(), json!(target_model));
+    body.insert("stream".into(), json!(stream));
+    Ok((
+        serde_json::to_vec(&request)?,
+        vec![("content-type".to_string(), "application/json".to_string())],
+    ))
+}
+
 fn response_text_parts(blocks: &[ContentBlock]) -> Vec<Value> {
     blocks
         .iter()
@@ -1315,6 +1335,29 @@ mod tests {
         let emitted = emit_request(&req, &EmitOptions::default()).unwrap();
         let output: Value = serde_json::from_slice(&emitted.0).unwrap();
         assert_eq!(output["max_output_tokens"], 32768);
+    }
+
+    #[test]
+    fn same_shape_request_preserves_fields_unknown_to_the_ir() {
+        let body = json!({
+            "model": "client-alias", "stream": false,
+            "input": [{"role": "user", "content": "hi"}],
+            "max_output_tokens": 64,
+            "reasoning": {"effort": "max", "summary": "detailed"},
+            "tools": [{"type": "function", "name": "submit", "strict": true,
+                "parameters": {"type": "object", "additionalProperties": false}}],
+            "tool_choice": "required",
+            "provider_extension": {"nested": [1, true, "keep"]}
+        });
+        let emitted =
+            emit_same_shape_request(body.to_string().as_bytes(), "upstream-model", true).unwrap();
+        let mut expected = body;
+        expected["model"] = json!("upstream-model");
+        expected["stream"] = json!(true);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&emitted.0).unwrap(),
+            expected
+        );
     }
 
     #[test]
