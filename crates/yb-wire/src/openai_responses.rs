@@ -351,8 +351,7 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     if let Some(tc) = &req.tool_choice {
         body.insert("tool_choice".into(), emit_tool_choice(tc));
     }
-    // NOTE: `max_output_tokens` is intentionally not emitted — some gateway
-    // backends reject it as an unsupported parameter.
+    insert_opt(&mut body, "max_output_tokens", req.max_tokens);
     insert_opt(&mut body, "temperature", req.temperature);
     insert_opt(&mut body, "top_p", req.top_p);
     if opts.stream {
@@ -375,6 +374,26 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     let bytes = serde_json::to_vec(&Value::Object(body))?;
     let headers = vec![("content-type".to_string(), "application/json".to_string())];
     Ok((bytes, headers))
+}
+
+/// Relay a Responses request to a Responses upstream without discarding
+/// provider-supported fields that the shared IR does not yet model. Routing
+/// owns only the upstream model name and the streaming transport choice.
+pub fn emit_same_shape_request(
+    bytes: &[u8],
+    target_model: &str,
+    stream: bool,
+) -> Result<EmittedRequest> {
+    let mut request: Value = serde_json::from_slice(bytes)?;
+    let body = request
+        .as_object_mut()
+        .ok_or_else(|| WireError::InvalidRequest("body is not a JSON object".into()))?;
+    body.insert("model".into(), json!(target_model));
+    body.insert("stream".into(), json!(stream));
+    Ok((
+        serde_json::to_vec(&request)?,
+        vec![("content-type".to_string(), "application/json".to_string())],
+    ))
 }
 
 fn response_text_parts(blocks: &[ContentBlock]) -> Vec<Value> {
@@ -1306,6 +1325,39 @@ mod tests {
         let back = emit_request(&chat_req, &EmitOptions::default()).unwrap();
         let back: Value = serde_json::from_slice(&back.0).unwrap();
         assert_eq!(back["tools"][0]["strict"], true);
+    }
+
+    #[test]
+    fn output_token_limit_survives_anthropic_to_responses_translation() {
+        let body = json!({"model": "m", "max_tokens": 32768,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let req = crate::anthropic::parse_request(body.to_string().as_bytes()).unwrap();
+        let emitted = emit_request(&req, &EmitOptions::default()).unwrap();
+        let output: Value = serde_json::from_slice(&emitted.0).unwrap();
+        assert_eq!(output["max_output_tokens"], 32768);
+    }
+
+    #[test]
+    fn same_shape_request_preserves_fields_unknown_to_the_ir() {
+        let body = json!({
+            "model": "client-alias", "stream": false,
+            "input": [{"role": "user", "content": "hi"}],
+            "max_output_tokens": 64,
+            "reasoning": {"effort": "max", "summary": "detailed"},
+            "tools": [{"type": "function", "name": "submit", "strict": true,
+                "parameters": {"type": "object", "additionalProperties": false}}],
+            "tool_choice": "required",
+            "provider_extension": {"nested": [1, true, "keep"]}
+        });
+        let emitted =
+            emit_same_shape_request(body.to_string().as_bytes(), "upstream-model", true).unwrap();
+        let mut expected = body;
+        expected["model"] = json!("upstream-model");
+        expected["stream"] = json!(true);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&emitted.0).unwrap(),
+            expected
+        );
     }
 
     #[test]
