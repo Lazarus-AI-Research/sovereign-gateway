@@ -751,7 +751,7 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
         Some("response.function_call_arguments.delta") => vec![StreamEvent::ToolUseDelta {
             partial_json: opt_str(&v, "delta").unwrap_or_default().to_string(),
         }],
-        Some("response.completed") | Some("response.incomplete") => {
+        Some("response.completed") | Some("response.incomplete") | Some("response.failed") => {
             let mut out = Vec::new();
             // An interim `response.*` event can carry `"usage": null`; parsing
             // that would push an all-zero delta over a real one.
@@ -764,9 +764,22 @@ pub fn decode_sse(line: &str, state: &mut SseState) -> Vec<StreamEvent> {
                     usage: parse_usage(Some(u)),
                 });
             }
-            out.push(StreamEvent::Done {
-                stop_reason: state.stop_reason.take().unwrap_or(StopReason::EndTurn),
-            });
+            let stop_reason = if opt_str(&v, "type") == Some("response.incomplete") {
+                let reason = v
+                    .get("response")
+                    .and_then(|r| r.get("incomplete_details"))
+                    .and_then(|d| opt_str(d, "reason"));
+                match reason {
+                    Some("max_output_tokens") => StopReason::MaxTokens,
+                    Some(other) => StopReason::Other(other.to_string()),
+                    None => StopReason::Other("incomplete".into()),
+                }
+            } else if opt_str(&v, "type") == Some("response.failed") {
+                StopReason::Other(opt_str(&v, "type").unwrap_or("response.failed").to_string())
+            } else {
+                state.stop_reason.take().unwrap_or(StopReason::EndTurn)
+            };
+            out.push(StreamEvent::Done { stop_reason });
             out
         }
         _ => vec![],
@@ -1306,6 +1319,26 @@ mod tests {
         let back = emit_request(&chat_req, &EmitOptions::default()).unwrap();
         let back: Value = serde_json::from_slice(&back.0).unwrap();
         assert_eq!(back["tools"][0]["strict"], true);
+    }
+
+    #[test]
+    fn incomplete_sse_keeps_max_tokens_stop_reason() {
+        let mut state = SseState::default();
+        let terminal = json!({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 42, "output_tokens": 64}
+            }
+        });
+        let events = decode_sse(&format!("data: {terminal}"), &mut state);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Done {
+                stop_reason: StopReason::MaxTokens
+            }
+        )));
     }
 
     #[test]

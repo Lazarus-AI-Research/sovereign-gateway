@@ -340,6 +340,117 @@ fn test_router() -> DeploymentRouter {
     DeploymentRouter::from_models(models, HashMap::new(), HashMap::new(), Strategy::Simple)
 }
 
+fn responses_router() -> DeploymentRouter {
+    let models = vec![ModelConfig {
+        model_name: "fake-responses".into(),
+        aliases: vec![],
+        deployments: vec![DeploymentConfig {
+            provider: "fake".into(),
+            upstream_model: "fake-upstream".into(),
+            api_base: None,
+            api_key: None,
+            upstream_format: WireFormat::OpenaiResponses.into(),
+            weight: 1,
+            pricing: None,
+            health_check: Default::default(),
+            health_path: None,
+            extra: Default::default(),
+        }],
+    }];
+    DeploymentRouter::from_models(models, HashMap::new(), HashMap::new(), Strategy::Simple)
+}
+
+#[tokio::test]
+async fn same_shape_responses_preserves_incomplete_and_failed_terminal_events() {
+    use futures::StreamExt;
+
+    for (terminal_type, response_status) in [
+        ("response.incomplete", "incomplete"),
+        ("response.failed", "failed"),
+    ] {
+        let (incomplete_details, error) = if terminal_type == "response.incomplete" {
+            (
+                json!({"reason": "max_output_tokens"}),
+                serde_json::Value::Null,
+            )
+        } else {
+            (
+                serde_json::Value::Null,
+                json!({"code": "server_error", "message": "fake failure"}),
+            )
+        };
+        let terminal = json!({
+            "type": terminal_type,
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_fake", "object": "response", "model": "fake-upstream", "output": [], "status": response_status,
+                "incomplete_details": incomplete_details,
+                "error": error,
+                "usage": {"input_tokens": 42, "output_tokens": 64}
+            }
+        });
+        let chunks = vec![
+            format!("event: {terminal_type}\ndata: {terminal}\n"),
+            "\n".to_string(),
+        ];
+        let expected = chunks.concat();
+        let store = Arc::new(RecordingStore::default());
+        let gateway = Gateway::new(
+            Arc::new(MockClient::sse(chunks)),
+            Arc::new(responses_router()),
+            store.clone(),
+            Arc::new(NullLogger),
+        );
+        let body = serde_json::to_vec(&json!({
+            "model": "fake-responses", "stream": true, "input": "test"
+        }))
+        .unwrap();
+        let GatewayResponse::Stream { mut stream, .. } = gateway
+            .handle(WireFormat::OpenaiResponses, &body, RequestCtx::new())
+            .await
+            .unwrap()
+        else {
+            panic!("expected Responses SSE stream")
+        };
+        let mut actual = String::new();
+        while let Some(chunk) = stream.next().await {
+            actual.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        }
+        assert_eq!(actual, expected);
+        let telemetry = store.telemetry();
+        assert_eq!(telemetry.len(), 1);
+        assert_eq!(telemetry[0].output_tokens, 64);
+        assert!(telemetry[0].is_error);
+    }
+}
+
+#[tokio::test]
+async fn native_responses_eof_without_terminal_is_a_stream_error() {
+    use futures::StreamExt;
+
+    let gateway = Gateway::new(
+        Arc::new(MockClient::sse(vec![
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\",\"sequence_number\":1}\n\n".to_string(),
+        ])),
+        Arc::new(responses_router()),
+        Arc::new(RecordingStore::default()),
+        Arc::new(NullLogger),
+    );
+    let body = serde_json::to_vec(&json!({
+        "model": "fake-responses", "stream": true, "input": "test"
+    }))
+    .unwrap();
+    let GatewayResponse::Stream { mut stream, .. } = gateway
+        .handle(WireFormat::OpenaiResponses, &body, RequestCtx::new())
+        .await
+        .unwrap()
+    else {
+        panic!("expected Responses SSE stream")
+    };
+    assert!(stream.next().await.unwrap().is_ok());
+    assert!(stream.next().await.unwrap().is_err());
+}
+
 /// A request context carrying a key + its owner user and team, so the test can
 /// assert telemetry/rollups are keyed by key/user/team.
 fn ctx_with_identity() -> RequestCtx {
