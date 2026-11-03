@@ -295,6 +295,19 @@ fn responses_stream_to_openai() {
     run("responses_stream_to_openai");
 }
 
+/// An Anthropic upstream's cached prompt counts into the client's prompt
+/// tokens: Anthropic's `input_tokens` is only the uncached remainder, and
+/// passed through as is it reported `prompt_tokens: 2` for a 43-token prompt.
+#[test]
+fn anthropic_cached_usage_to_openai_stream() {
+    run("anthropic_cached_usage_to_openai_stream");
+}
+
+#[test]
+fn anthropic_cached_usage_to_responses_stream() {
+    run("anthropic_cached_usage_to_responses_stream");
+}
+
 // --------------------------------------------------------------------------
 // Direct assertions beyond the generic runner
 // --------------------------------------------------------------------------
