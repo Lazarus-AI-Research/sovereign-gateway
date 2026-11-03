@@ -1,0 +1,96 @@
+{
+  "_comment": "Pins 18c4ef1 (#29, Translate strict tools and explicit cache controls). An OpenAI Agents SDK turn on the Responses surface, relayed to a Chat Completions upstream. The tool's `strict: true` had no place in the IR and was dropped, so the upstream stopped enforcing the schema and the client got arguments its parser rejects. It must arrive as function.strict.",
+  "inbound_format": "openai_responses",
+  "inbound_body": {
+    "model": "gpt-5",
+    "stream": true,
+    "store": false,
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "File a ticket: the login page 500s."
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "name": "create_ticket",
+        "description": "Open a ticket in the tracker.",
+        "strict": true,
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string"
+            },
+            "severity": {
+              "type": "string",
+              "enum": [
+                "low",
+                "high"
+              ]
+            }
+          },
+          "required": [
+            "title",
+            "severity"
+          ],
+          "additionalProperties": false
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  },
+  "target_format": "openai_chat",
+  "target_model": "Qwen/Qwen3-32B",
+  "expected_upstream_body": {
+    "messages": [
+      {
+        "content": "File a ticket: the login page 500s.",
+        "role": "user"
+      }
+    ],
+    "model": "Qwen/Qwen3-32B",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "function": {
+          "description": "Open a ticket in the tracker.",
+          "name": "create_ticket",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "severity": {
+                "enum": [
+                  "low",
+                  "high"
+                ],
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "title",
+              "severity"
+            ],
+            "type": "object"
+          },
+          "strict": true
+        },
+        "type": "function"
+      }
+    ]
+  }
+}
