@@ -8,7 +8,8 @@
 //!   "target_format": "...",  "target_model": "...",
 //!   "expected_upstream_body": { ... },
 //!   "upstream_sse": ["data: ...", ...],
-//!   "client_format": "...",  "expected_client_sse": "event: ...\n..."
+//!   "client_format": "...",  "expected_client_sse": "event: ...\n...",
+//!   "expected_client_body": { ... }
 //! }
 //! ```
 //!
@@ -21,13 +22,20 @@
 //!    events, re-encode them into `client_format`, and compare to
 //!    `expected_client_sse` *semantically* (parsed per-event, so formatting is
 //!    irrelevant).
+//! 3. **Buffered answer** — for a non-streaming client, decode `upstream_sse`,
+//!    fold the events with [`Aggregator`] as the gateway does (it always
+//!    streams upstream), emit the response in `client_format`, and compare to
+//!    `expected_client_body` as parsed JSON.
 //!
 //! A [`record`] helper can regenerate a request cassette from live inputs, but
 //! all committed fixtures run offline.
 
 use serde_json::Value;
 use yb_wire::ir::StreamEvent;
-use yb_wire::{anthropic, gemini, openai_chat, openai_responses, ChatRequest, EmitOptions};
+use yb_wire::{
+    anthropic, gemini, openai_chat, openai_responses, Aggregator, ChatRequest, ChatResponse,
+    EmitOptions,
+};
 
 // --------------------------------------------------------------------------
 // Format dispatch
@@ -118,6 +126,18 @@ fn encode_stream(format: &str, events: &[StreamEvent], include_usage: bool) -> V
         "gemini" => gemini::encode_sse(events, &mut gemini::EmitState::default()),
         other => panic!("unknown client format {other}"),
     }
+}
+
+/// Emit an aggregated response as a buffered (non-streaming) client body.
+fn emit_response(format: &str, resp: &ChatResponse) -> Vec<u8> {
+    let r = match format {
+        "anthropic" => anthropic::emit_response(resp),
+        "openai_chat" => openai_chat::emit_response(resp),
+        "openai_responses" => openai_responses::emit_response(resp),
+        "gemini" => gemini::emit_response(resp),
+        other => panic!("unknown client format {other}"),
+    };
+    r.unwrap_or_else(|e| panic!("emit_response({format}) failed: {e}"))
 }
 
 // --------------------------------------------------------------------------
@@ -220,6 +240,35 @@ fn run(name: &str) {
             parse_sse(&got),
             parse_sse(expected_sse),
             "[{name}] stream {target_format} -> {client_format} mismatch\n got: {got}",
+        );
+    }
+
+    // 3. Buffered answer: what a non-streaming client gets once the gateway has
+    //    folded the upstream stream.
+    if let (Some(upstream_sse), Some(expected)) = (
+        c.get("upstream_sse").and_then(Value::as_array),
+        c.get("expected_client_body"),
+    ) {
+        let target_format = c.get("target_format").and_then(Value::as_str).unwrap();
+        let client_format = c
+            .get("client_format")
+            .and_then(Value::as_str)
+            .or_else(|| c.get("inbound_format").and_then(Value::as_str))
+            .unwrap();
+        let lines: Vec<String> = upstream_sse
+            .iter()
+            .map(|l| l.as_str().unwrap().to_string())
+            .collect();
+        let mut agg = Aggregator::new();
+        agg.push_all(&decode_stream(target_format, &lines));
+        let resp = agg.into_response("resp_cassette");
+        let got: Value = serde_json::from_slice(&emit_response(client_format, &resp)).unwrap();
+        assert_eq!(
+            &got,
+            expected,
+            "[{name}] buffered {target_format} -> {client_format} mismatch\n got: {}\nwant: {}",
+            serde_json::to_string_pretty(&got).unwrap(),
+            serde_json::to_string_pretty(expected).unwrap(),
         );
     }
 }
@@ -362,6 +411,26 @@ fn anthropic_thinking_to_chat() {
 #[test]
 fn chat_reasoning_history_same_shape() {
     run("chat_reasoning_history_same_shape");
+}
+
+/// A Chat-to-Chat relay forwards the request as the client sent it.
+///
+/// From f6772a9 (in #21). `response_format`, `seed`, the penalties,
+/// `logprobs`, `user`, a message's `name` and vLLM's `top_k`,
+/// `repetition_penalty` and `chat_template_kwargs` were all dropped; a
+/// structured-output client got prose back.
+#[test]
+fn chat_structured_output_same_shape() {
+    run("chat_structured_output_same_shape");
+}
+
+/// A non-streaming Chat answer keeps the reasoning the stream carried.
+///
+/// From f6772a9 (in #21). The gateway folds the upstream stream for a
+/// buffered client, and the folded reasoning was dropped from the answer.
+#[test]
+fn vllm_reasoning_buffered_answer() {
+    run("vllm_reasoning_buffered_answer");
 }
 
 // --------------------------------------------------------------------------

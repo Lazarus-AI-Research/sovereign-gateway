@@ -1,0 +1,127 @@
+{
+  "_comment": "Pins f6772a9 (in #21, Relay OpenAI Chat to an OpenAI-compatible upstream as the client sent it). An OpenAI SDK structured-output request relayed Chat to Chat (vLLM). Rebuilding it from the IR dropped every field the IR does not model: response_format, seed, the penalties, logprobs, user, parallel_tool_calls, a message's name, and vLLM's own top_k, repetition_penalty and chat_template_kwargs. A client that loses response_format gets prose back with nothing to notice. Only the model and the usage the gateway bills from may change.",
+  "inbound_format": "openai_chat",
+  "inbound_body": {
+    "model": "assistant",
+    "stream": true,
+    "messages": [
+      {
+        "role": "system",
+        "content": "Extract the invoice fields."
+      },
+      {
+        "role": "user",
+        "name": "ap-bot",
+        "content": "Invoice 4471 from Acme GmbH, due 2026-11-30, total EUR 1,240.00"
+      }
+    ],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "invoice",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "number": {
+              "type": "string"
+            },
+            "vendor": {
+              "type": "string"
+            },
+            "due": {
+              "type": "string"
+            },
+            "total": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "number",
+            "vendor",
+            "due",
+            "total"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "temperature": 0,
+    "seed": 7,
+    "presence_penalty": 0.5,
+    "frequency_penalty": 0.25,
+    "logprobs": true,
+    "top_logprobs": 2,
+    "user": "tenant-42",
+    "parallel_tool_calls": false,
+    "top_k": 20,
+    "repetition_penalty": 1.05,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "target_format": "openai_chat",
+  "target_model": "Qwen/Qwen3-32B",
+  "expected_upstream_body": {
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "frequency_penalty": 0.25,
+    "logprobs": true,
+    "messages": [
+      {
+        "content": "Extract the invoice fields.",
+        "role": "system"
+      },
+      {
+        "content": "Invoice 4471 from Acme GmbH, due 2026-11-30, total EUR 1,240.00",
+        "name": "ap-bot",
+        "role": "user"
+      }
+    ],
+    "model": "Qwen/Qwen3-32B",
+    "parallel_tool_calls": false,
+    "presence_penalty": 0.5,
+    "repetition_penalty": 1.05,
+    "response_format": {
+      "json_schema": {
+        "name": "invoice",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "due": {
+              "type": "string"
+            },
+            "number": {
+              "type": "string"
+            },
+            "total": {
+              "type": "number"
+            },
+            "vendor": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "number",
+            "vendor",
+            "due",
+            "total"
+          ],
+          "type": "object"
+        },
+        "strict": true
+      },
+      "type": "json_schema"
+    },
+    "seed": 7,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "temperature": 0,
+    "top_k": 20,
+    "top_logprobs": 2,
+    "user": "tenant-42"
+  }
+}
