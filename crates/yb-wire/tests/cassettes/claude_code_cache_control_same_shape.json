@@ -1,0 +1,134 @@
+{
+  "_comment": "Pins 18c4ef1 (#29, Translate strict tools and explicit cache controls). A Claude Code turn relayed Anthropic to Anthropic. Every cache_control breakpoint, on the system prompt (with its 1h ttl), on text, on an image and on the last tool definition, was normalized away, so the upstream cached nothing and every turn paid full price for the whole prefix. A same-shape relay must keep each one where the client put it.",
+  "inbound_format": "anthropic",
+  "inbound_body": {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 32000,
+    "stream": true,
+    "system": [
+      {
+        "type": "text",
+        "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "cache_control": {
+          "type": "ephemeral",
+          "ttl": "1h"
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+            },
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "<system-reminder>CLAUDE.md: run cargo fmt before committing.</system-reminder>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "Why does this screenshot show a 500?"
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "name": "Read",
+        "description": "Reads a file from the local filesystem.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "file_path"
+          ]
+        },
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ]
+  },
+  "target_format": "anthropic",
+  "target_model": "claude-sonnet-4-5",
+  "expected_upstream_body": {
+    "max_tokens": 32000,
+    "messages": [
+      {
+        "content": [
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "source": {
+              "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+              "media_type": "image/png",
+              "type": "base64"
+            },
+            "type": "image"
+          },
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "text": "<system-reminder>CLAUDE.md: run cargo fmt before committing.</system-reminder>",
+            "type": "text"
+          },
+          {
+            "text": "Why does this screenshot show a 500?",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-sonnet-4-5",
+    "stream": true,
+    "system": [
+      {
+        "cache_control": {
+          "ttl": "1h",
+          "type": "ephemeral"
+        },
+        "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "type": "text"
+      }
+    ],
+    "tools": [
+      {
+        "cache_control": {
+          "type": "ephemeral"
+        },
+        "description": "Reads a file from the local filesystem.",
+        "input_schema": {
+          "properties": {
+            "file_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "file_path"
+          ],
+          "type": "object"
+        },
+        "name": "Read"
+      }
+    ]
+  }
+}

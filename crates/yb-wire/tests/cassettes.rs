@@ -488,6 +488,33 @@ fn vllm_reasoning_buffered_answer() {
     run("vllm_reasoning_buffered_answer");
 }
 
+/// A strict tool stays strict across Responses to Chat.
+///
+/// From 18c4ef1 (#29). `strict` had no place in the IR, so the upstream
+/// stopped enforcing the tool schema.
+#[test]
+fn responses_strict_tool_to_chat() {
+    run("responses_strict_tool_to_chat");
+}
+
+/// An Anthropic-to-Anthropic relay keeps every `cache_control` breakpoint.
+///
+/// From 18c4ef1 (#29). Breakpoints on the system prompt (with its ttl), text,
+/// an image and a tool definition were normalized away, so nothing cached.
+#[test]
+fn claude_code_cache_control_same_shape() {
+    run("claude_code_cache_control_same_shape");
+}
+
+/// Anthropic cache breakpoints become explicit Responses breakpoints.
+///
+/// From 18c4ef1 (#29). They were dropped, and a marked system prompt was
+/// flattened into `instructions`, where no breakpoint can sit.
+#[test]
+fn claude_code_cache_control_to_responses() {
+    run("claude_code_cache_control_to_responses");
+}
+
 // --------------------------------------------------------------------------
 // Direct assertions beyond the generic runner
 // --------------------------------------------------------------------------
