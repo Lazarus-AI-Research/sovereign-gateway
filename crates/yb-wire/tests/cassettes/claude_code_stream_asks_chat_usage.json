@@ -1,0 +1,46 @@
+{
+  "_comment": "Pins 637343f (Report upstream token usage instead of silently billing zero). The gateway always streams upstream, and an OpenAI-compatible server (vLLM, llama.cpp) sends no usage at all on a stream unless stream_options.include_usage is set. The field appeared nowhere, so every turn through a Chat Completions upstream billed input=0 output=0. A streaming Anthropic request translated to Chat must ask for usage.",
+  "inbound_format": "anthropic",
+  "inbound_body": {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 1024,
+    "stream": true,
+    "system": [
+      {
+        "type": "text",
+        "text": "You are Claude Code, Anthropic's official CLI for Claude."
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What does `git status` show?"
+          }
+        ]
+      }
+    ]
+  },
+  "target_format": "openai_chat",
+  "target_model": "Qwen/Qwen3-32B",
+  "expected_upstream_body": {
+    "max_tokens": 1024,
+    "messages": [
+      {
+        "content": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "role": "system"
+      },
+      {
+        "content": "What does `git status` show?",
+        "role": "user"
+      }
+    ],
+    "model": "Qwen/Qwen3-32B",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  }
+}

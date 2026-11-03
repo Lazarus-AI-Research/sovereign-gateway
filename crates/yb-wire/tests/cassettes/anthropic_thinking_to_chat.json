@@ -1,0 +1,129 @@
+{
+  "_comment": "Pins 33563ce (#14, Make same-shape relays lossless). A Claude Code turn with extended thinking and a tool call, relayed Anthropic to a Chat Completions upstream (vLLM serving a reasoning model). The assistant's prior thinking was dropped on the way to Chat, so a reasoning model lost its own earlier reasoning; it must ride as `reasoning_content`. The Anthropic-only `redacted_thinking` block, which used to fail the parse outright, must parse and must not leak to a provider that cannot read it.",
+  "inbound_format": "anthropic",
+  "inbound_body": {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 16000,
+    "stream": true,
+    "thinking": {
+      "type": "enabled",
+      "budget_tokens": 10000
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "How many lines are in words.txt?"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "I should count the lines with wc -l.",
+            "signature": "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxsfP5XmFwPpRlJcRAiMHo+R2Vk5TfQq4bOzNlU8cA=="
+          },
+          {
+            "type": "redacted_thinking",
+            "data": "EmwKAhgBEgy3va3pzix/LafPsn4aDFIT2Xlxh0L5L8rLVyIwxtE3rAFBa8cr3qpPkNRj2YfWXGmKDxH4mPnZ5sQ7vB5URj"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_01A09q90qw90lq917835lq9",
+            "name": "Bash",
+            "input": {
+              "command": "wc -l words.txt"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_01A09q90qw90lq917835lq9",
+            "content": "3 words.txt"
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "name": "Bash",
+        "description": "Executes a bash command.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      }
+    ]
+  },
+  "target_format": "openai_chat",
+  "target_model": "Qwen/Qwen3-32B",
+  "expected_upstream_body": {
+    "max_tokens": 16000,
+    "messages": [
+      {
+        "content": "How many lines are in words.txt?",
+        "role": "user"
+      },
+      {
+        "content": null,
+        "reasoning_content": "I should count the lines with wc -l.",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"command\":\"wc -l words.txt\"}",
+              "name": "Bash"
+            },
+            "id": "toolu_01A09q90qw90lq917835lq9",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "3 words.txt",
+        "role": "tool",
+        "tool_call_id": "toolu_01A09q90qw90lq917835lq9"
+      }
+    ],
+    "model": "Qwen/Qwen3-32B",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "tools": [
+      {
+        "function": {
+          "description": "Executes a bash command.",
+          "name": "Bash",
+          "parameters": {
+            "properties": {
+              "command": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  }
+}

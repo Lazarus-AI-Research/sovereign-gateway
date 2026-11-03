@@ -152,3 +152,13 @@ fn voyage_to_cohere_images() {
 fn openai_to_ollama() {
     run("openai_to_ollama");
 }
+
+/// llama.cpp's multimodal embedding shape — one vector per `content` array of
+/// text, image_url and input_audio parts — must parse and go upstream as sent.
+///
+/// It used to 400 at parse: the OpenAI dialect only knew strings and Jina's
+/// `{text}` / `{image}` objects, and could not emit an input of several parts.
+#[test]
+fn openai_content_parts_to_llamacpp() {
+    run("openai_content_parts_to_llamacpp");
+}

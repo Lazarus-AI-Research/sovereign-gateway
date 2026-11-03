@@ -1,0 +1,38 @@
+{
+  "_comment": "Pins 637343f (Report upstream token usage instead of silently billing zero). Anthropic reports input tokens once on message_start and output tokens on message_delta, whose usage carries no input_tokens. The Responses encoder folded each usage delta by assignment, so the message_delta report (input 0) overwrote the message_start one and response.completed told the client input_tokens: 0. Usage deltas must merge field-wise.",
+  "inbound_format": "openai_responses",
+  "inbound_body": {
+    "model": "kimi-k3",
+    "stream": true,
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Reply with the single word: ok"
+          }
+        ]
+      }
+    ]
+  },
+  "target_format": "anthropic",
+  "target_model": "kimi-k3",
+  "upstream_sse": [
+    "event: message_start",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01XFDUDYJgAACzvnptvVoYEL\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"kimi-k3\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}",
+    "event: content_block_start",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+    "event: content_block_delta",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}",
+    "event: content_block_stop",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}",
+    "event: message_delta",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":15}}",
+    "event: message_stop",
+    "data: {\"type\":\"message_stop\"}"
+  ],
+  "client_format": "openai_responses",
+  "expected_client_sse": "event: response.created\ndata: {\"response\":{\"id\":\"resp_stream\",\"model\":\"kimi-k3\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\",\"usage\":null},\"sequence_number\":0,\"type\":\"response.created\"}\n\nevent: response.in_progress\ndata: {\"response\":{\"id\":\"resp_stream\",\"model\":\"kimi-k3\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\",\"usage\":null},\"sequence_number\":1,\"type\":\"response.in_progress\"}\n\nevent: response.output_item.added\ndata: {\"item\":{\"content\":[],\"id\":\"msg_0\",\"role\":\"assistant\",\"status\":\"in_progress\",\"type\":\"message\"},\"output_index\":0,\"sequence_number\":2,\"type\":\"response.output_item.added\"}\n\nevent: response.content_part.added\ndata: {\"content_index\":0,\"item_id\":\"msg_0\",\"output_index\":0,\"part\":{\"annotations\":[],\"logprobs\":[],\"text\":\"\",\"type\":\"output_text\"},\"sequence_number\":3,\"type\":\"response.content_part.added\"}\n\nevent: response.output_text.delta\ndata: {\"content_index\":0,\"delta\":\"ok\",\"item_id\":\"msg_0\",\"logprobs\":[],\"output_index\":0,\"sequence_number\":4,\"type\":\"response.output_text.delta\"}\n\nevent: response.output_text.done\ndata: {\"content_index\":0,\"item_id\":\"msg_0\",\"logprobs\":[],\"output_index\":0,\"sequence_number\":5,\"text\":\"ok\",\"type\":\"response.output_text.done\"}\n\nevent: response.content_part.done\ndata: {\"content_index\":0,\"item_id\":\"msg_0\",\"output_index\":0,\"part\":{\"annotations\":[],\"text\":\"ok\",\"type\":\"output_text\"},\"sequence_number\":6,\"type\":\"response.content_part.done\"}\n\nevent: response.output_item.done\ndata: {\"item\":{\"content\":[{\"annotations\":[],\"text\":\"ok\",\"type\":\"output_text\"}],\"id\":\"msg_0\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"},\"output_index\":0,\"sequence_number\":7,\"type\":\"response.output_item.done\"}\n\nevent: response.completed\ndata: {\"response\":{\"id\":\"resp_stream\",\"model\":\"kimi-k3\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"ok\",\"type\":\"output_text\"}],\"id\":\"msg_0\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\",\"usage\":{\"input_tokens\":25,\"input_tokens_details\":{\"cache_write_tokens\":0,\"cached_tokens\":0},\"output_tokens\":15,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":40}},\"sequence_number\":8,\"type\":\"response.completed\"}\n\n"
+}
