@@ -295,6 +295,27 @@ fn responses_stream_to_openai() {
     run("responses_stream_to_openai");
 }
 
+/// A streaming turn to a Chat Completions upstream must ask for usage.
+///
+/// From 637343f. An OpenAI-compatible server (vLLM, llama.cpp) sends no usage
+/// on a stream unless `stream_options.include_usage` is set, and the gateway
+/// always streams upstream, so every turn through one billed zero.
+#[test]
+fn claude_code_stream_asks_chat_usage() {
+    run("claude_code_stream_asks_chat_usage");
+}
+
+/// Usage deltas merge; a later one cannot erase an earlier count.
+///
+/// From 637343f. Anthropic reports input tokens on `message_start` and output
+/// tokens on `message_delta`, whose usage has no input count. The Responses
+/// encoder folded deltas by assignment, so `response.completed` reported
+/// `input_tokens: 0`.
+#[test]
+fn anthropic_stream_usage_to_responses() {
+    run("anthropic_stream_usage_to_responses");
+}
+
 // --------------------------------------------------------------------------
 // Direct assertions beyond the generic runner
 // --------------------------------------------------------------------------
