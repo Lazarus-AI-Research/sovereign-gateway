@@ -295,6 +295,29 @@ fn responses_stream_to_openai() {
     run("responses_stream_to_openai");
 }
 
+/// Structured output must reach the upstream across shapes, not only on a
+/// same-shape relay: a lost format comes back as a 200 of prose. Recorded from
+/// the requests that failed against deepseek-v4.1-flash-1017-sakura.
+#[test]
+fn openai_json_schema_to_anthropic() {
+    run("openai_json_schema_to_anthropic");
+}
+
+#[test]
+fn responses_json_schema_to_anthropic() {
+    run("responses_json_schema_to_anthropic");
+}
+
+#[test]
+fn openai_json_object_to_anthropic() {
+    run("openai_json_object_to_anthropic");
+}
+
+#[test]
+fn anthropic_output_config_to_openai() {
+    run("anthropic_output_config_to_openai");
+}
+
 // --------------------------------------------------------------------------
 // Direct assertions beyond the generic runner
 // --------------------------------------------------------------------------

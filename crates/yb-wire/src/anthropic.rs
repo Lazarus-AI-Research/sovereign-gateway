@@ -99,6 +99,20 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
     // an Anthropic→Anthropic route preserves them and no other emitter sees them.
     req.context_management = v.get("context_management").cloned();
     req.output_config = v.get("output_config").cloned();
+    // Structured output, also modeled so it reaches other shapes: GA
+    // `output_config.format`, else the beta top-level `output_format`.
+    req.response_format = v
+        .pointer("/output_config/format")
+        .or_else(|| v.get("output_format"))
+        .and_then(|f| match opt_str(f, "type")? {
+            "json_schema" => Some(ResponseFormat::JsonSchema {
+                name: None,
+                schema: f.get("schema").cloned().unwrap_or(json!({})),
+                strict: None,
+            }),
+            "json_object" => Some(ResponseFormat::JsonObject),
+            _ => None,
+        });
 
     Ok(req)
 }
@@ -185,6 +199,17 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     }
     if let Some(oc) = &req.output_config {
         body.insert("output_config".into(), oc.clone());
+    } else if let Some(rf) = &req.response_format {
+        // Anthropic structured output is a JSON schema only; any JSON object
+        // is the schema that says so.
+        let schema = match rf {
+            ResponseFormat::JsonObject => json!({"type": "object"}),
+            ResponseFormat::JsonSchema { schema, .. } => schema.clone(),
+        };
+        body.insert(
+            "output_config".into(),
+            json!({"format": {"type": "json_schema", "schema": schema}}),
+        );
     }
 
     let bytes = serde_json::to_vec(&Value::Object(body))?;
