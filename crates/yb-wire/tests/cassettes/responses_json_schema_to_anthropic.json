@@ -1,0 +1,81 @@
+{
+  "_comment": "As openai_json_schema_to_anthropic, from the Responses shape: text.format was never read, so the schema was lost on every route, Responses->Responses included.",
+  "inbound_format": "openai_responses",
+  "inbound_body": {
+    "model": "deepseek-v4.1-flash-1017-sakura",
+    "max_output_tokens": 4000,
+    "input": "Tell me about Tokyo.",
+    "text": {
+      "format": {
+        "type": "json_schema",
+        "name": "city",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "population_millions": {
+              "type": "number"
+            },
+            "landmarks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 3
+            }
+          },
+          "required": [
+            "city",
+            "population_millions",
+            "landmarks"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  },
+  "target_format": "anthropic",
+  "target_model": "DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8",
+  "expected_upstream_body": {
+    "model": "DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8",
+    "max_tokens": 4000,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Tell me about Tokyo."
+      }
+    ],
+    "output_config": {
+      "format": {
+        "type": "json_schema",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "population_millions": {
+              "type": "number"
+            },
+            "landmarks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 3
+            }
+          },
+          "required": [
+            "city",
+            "population_millions",
+            "landmarks"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  }
+}
