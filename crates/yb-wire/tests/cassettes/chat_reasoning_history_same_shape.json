@@ -1,0 +1,47 @@
+{
+  "_comment": "Pins 33563ce (#14, Make same-shape relays lossless). An OpenAI SDK client resending a reasoning model's history, relayed Chat to Chat (vLLM). The assistant message's `reasoning_content` was dropped from a resent history, though the stream path already relayed it, so the model lost its own prior reasoning. It must reach the upstream.",
+  "inbound_format": "openai_chat",
+  "inbound_body": {
+    "model": "deepseek-r1",
+    "stream": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Is 1001 prime?"
+      },
+      {
+        "role": "assistant",
+        "content": "No. 1001 = 7 × 11 × 13.",
+        "reasoning_content": "1001 / 7 = 143, and 143 = 11 × 13, so it is composite."
+      },
+      {
+        "role": "user",
+        "content": "And 1009?"
+      }
+    ]
+  },
+  "target_format": "openai_chat",
+  "target_model": "deepseek-ai/DeepSeek-R1",
+  "expected_upstream_body": {
+    "messages": [
+      {
+        "content": "Is 1001 prime?",
+        "role": "user"
+      },
+      {
+        "content": "No. 1001 = 7 × 11 × 13.",
+        "reasoning_content": "1001 / 7 = 143, and 143 = 11 × 13, so it is composite.",
+        "role": "assistant"
+      },
+      {
+        "content": "And 1009?",
+        "role": "user"
+      }
+    ],
+    "model": "deepseek-ai/DeepSeek-R1",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  }
+}

@@ -1,0 +1,139 @@
+{
+  "_comment": "Pins 33563ce (#14, Make same-shape relays lossless). A Claude Code turn with extended thinking and a tool call, relayed Anthropic to Anthropic. `redacted_thinking` was an unknown block type and failed the parse, so the whole turn 400'd; the thinking block's `signature` was dropped, which breaks extended thinking on the next turn. Both must reach the upstream as sent.",
+  "inbound_format": "anthropic",
+  "inbound_body": {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 16000,
+    "stream": true,
+    "thinking": {
+      "type": "enabled",
+      "budget_tokens": 10000
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "How many lines are in words.txt?"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "I should count the lines with wc -l.",
+            "signature": "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxsfP5XmFwPpRlJcRAiMHo+R2Vk5TfQq4bOzNlU8cA=="
+          },
+          {
+            "type": "redacted_thinking",
+            "data": "EmwKAhgBEgy3va3pzix/LafPsn4aDFIT2Xlxh0L5L8rLVyIwxtE3rAFBa8cr3qpPkNRj2YfWXGmKDxH4mPnZ5sQ7vB5URj"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_01A09q90qw90lq917835lq9",
+            "name": "Bash",
+            "input": {
+              "command": "wc -l words.txt"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_01A09q90qw90lq917835lq9",
+            "content": "3 words.txt"
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "name": "Bash",
+        "description": "Executes a bash command.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      }
+    ]
+  },
+  "target_format": "anthropic",
+  "target_model": "claude-sonnet-4-5",
+  "expected_upstream_body": {
+    "max_tokens": 16000,
+    "messages": [
+      {
+        "content": "How many lines are in words.txt?",
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "signature": "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxsfP5XmFwPpRlJcRAiMHo+R2Vk5TfQq4bOzNlU8cA==",
+            "thinking": "I should count the lines with wc -l.",
+            "type": "thinking"
+          },
+          {
+            "data": "EmwKAhgBEgy3va3pzix/LafPsn4aDFIT2Xlxh0L5L8rLVyIwxtE3rAFBa8cr3qpPkNRj2YfWXGmKDxH4mPnZ5sQ7vB5URj",
+            "type": "redacted_thinking"
+          },
+          {
+            "id": "toolu_01A09q90qw90lq917835lq9",
+            "input": {
+              "command": "wc -l words.txt"
+            },
+            "name": "Bash",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "content": "3 words.txt",
+            "tool_use_id": "toolu_01A09q90qw90lq917835lq9",
+            "type": "tool_result"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-sonnet-4-5",
+    "stream": true,
+    "thinking": {
+      "budget_tokens": 10000,
+      "type": "enabled"
+    },
+    "tools": [
+      {
+        "description": "Executes a bash command.",
+        "input_schema": {
+          "properties": {
+            "command": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        "name": "Bash"
+      }
+    ]
+  }
+}

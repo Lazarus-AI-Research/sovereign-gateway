@@ -326,6 +326,44 @@ fn codex_stream_usage_after_finish() {
     run("codex_stream_usage_after_finish");
 }
 
+/// A Responses-to-Responses relay forwards `input` verbatim.
+///
+/// From 33563ce (#14). Rebuilding from the IR dropped `reasoning` items and
+/// their `encrypted_content`, which a reasoning model expects echoed back.
+#[test]
+fn codex_reasoning_items_same_shape() {
+    run("codex_reasoning_items_same_shape");
+}
+
+/// An Anthropic-to-Anthropic relay keeps thinking signatures and
+/// `redacted_thinking`.
+///
+/// From 33563ce (#14). `redacted_thinking` failed the parse and 400'd the
+/// turn; the thinking `signature` was dropped, breaking extended thinking.
+#[test]
+fn anthropic_thinking_same_shape() {
+    run("anthropic_thinking_same_shape");
+}
+
+/// Anthropic thinking reaches a Chat upstream as `reasoning_content`, and
+/// `redacted_thinking` does not leak there.
+///
+/// From 33563ce (#14). Chat emission dropped the assistant's prior thinking,
+/// and the redacted block used to fail the parse outright.
+#[test]
+fn anthropic_thinking_to_chat() {
+    run("anthropic_thinking_to_chat");
+}
+
+/// A resent Chat history keeps the assistant's `reasoning_content`.
+///
+/// From 33563ce (#14). The stream path relayed it; the request path dropped
+/// it, so a reasoning model lost its own prior reasoning.
+#[test]
+fn chat_reasoning_history_same_shape() {
+    run("chat_reasoning_history_same_shape");
+}
+
 // --------------------------------------------------------------------------
 // Direct assertions beyond the generic runner
 // --------------------------------------------------------------------------
