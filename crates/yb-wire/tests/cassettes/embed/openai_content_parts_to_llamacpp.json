@@ -1,0 +1,152 @@
+{
+  "_comment": "Pins 202590c (#35, OpenAI embeddings take content parts with images and audio). The OpenAI SDK shape llama.cpp's multimodal embedding models (EmbeddingGemma 2) and OpenRouter take: one vector per {\"content\": [...]} input of text, image_url and input_audio parts. The parser only knew strings and Jina's {text}/{image} objects, so this request 400'd with \"object inputs must carry `text` or `image`\", and an input of several parts could not be emitted at all. It must parse and go upstream in the same shape.",
+  "inbound_format": "openai_embed",
+  "target_format": "openai_embed",
+  "target_model": "embeddinggemma-2",
+  "inbound_body": {
+    "model": "embed-multimodal",
+    "encoding_format": "float",
+    "input": [
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "a red bicycle"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
+            }
+          }
+        ]
+      },
+      {
+        "content": [
+          {
+            "type": "input_audio",
+            "input_audio": {
+              "data": "UklGRiQAAABXQVZFZm10IBAAAAABAAEA",
+              "format": "wav"
+            }
+          }
+        ]
+      },
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "bicycle bell"
+          }
+        ]
+      }
+    ]
+  },
+  "expected_upstream_body": {
+    "encoding_format": "float",
+    "input": [
+      {
+        "content": [
+          {
+            "text": "a red bicycle",
+            "type": "text"
+          },
+          {
+            "image_url": {
+              "url": "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
+            },
+            "type": "image_url"
+          }
+        ]
+      },
+      {
+        "content": [
+          {
+            "input_audio": {
+              "data": "UklGRiQAAABXQVZFZm10IBAAAAABAAEA",
+              "format": "wav"
+            },
+            "type": "input_audio"
+          }
+        ]
+      },
+      {
+        "content": [
+          {
+            "text": "bicycle bell",
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    "model": "embeddinggemma-2"
+  },
+  "upstream_response_body": {
+    "model": "embeddinggemma-2",
+    "object": "list",
+    "data": [
+      {
+        "object": "embedding",
+        "index": 0,
+        "embedding": [
+          0.125,
+          -0.5
+        ]
+      },
+      {
+        "object": "embedding",
+        "index": 1,
+        "embedding": [
+          0.25,
+          0.75
+        ]
+      },
+      {
+        "object": "embedding",
+        "index": 2,
+        "embedding": [
+          -0.125,
+          0.5
+        ]
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 281,
+      "total_tokens": 281
+    }
+  },
+  "expected_client_body": {
+    "data": [
+      {
+        "embedding": [
+          0.125,
+          -0.5
+        ],
+        "index": 0,
+        "object": "embedding"
+      },
+      {
+        "embedding": [
+          0.25,
+          0.75
+        ],
+        "index": 1,
+        "object": "embedding"
+      },
+      {
+        "embedding": [
+          -0.125,
+          0.5
+        ],
+        "index": 2,
+        "object": "embedding"
+      }
+    ],
+    "model": "embeddinggemma-2",
+    "object": "list",
+    "usage": {
+      "prompt_tokens": 281,
+      "total_tokens": 281
+    }
+  }
+}
