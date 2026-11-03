@@ -98,6 +98,13 @@ pub struct ChatRequest {
     /// Anthropic output configuration. Anthropic-only (see `context_management`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_config: Option<Value>,
+    /// Structured output: the reply must be JSON, matching a schema when one
+    /// is given. Every shape has it (`response_format`, Responses
+    /// `text.format`, Anthropic `output_config.format`), so it is modeled
+    /// rather than left to a same-shape relay: a client whose format is lost
+    /// on a cross-format route gets prose back with nothing to notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
     /// OpenAI prompt-cache affinity key (`prompt_cache_key`), present on both the
     /// Responses and Chat Completions shapes. Round-trips on those two surfaces;
     /// no equivalent elsewhere, so other emitters ignore it.
@@ -110,6 +117,23 @@ pub struct ChatRequest {
     /// Responses caching mode and TTL. Preserved on a Responses relay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_options: Option<Value>,
+}
+
+/// A structured-output request ([`ChatRequest::response_format`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// Any JSON object (OpenAI `json_object`).
+    JsonObject,
+    /// JSON matching `schema`. `name` and `strict` are OpenAI's; Anthropic
+    /// has neither.
+    JsonSchema {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        schema: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
 }
 
 /// A single conversational turn.
@@ -654,5 +678,99 @@ mod passthrough_tests {
             "weighing it"
         );
         assert_eq!(body["choices"][0]["message"]["content"], "answer");
+    }
+
+    /// Structured output reaches the upstream whatever the two shapes are: a
+    /// lost format comes back as prose with nothing to notice.
+    #[test]
+    fn structured_output_crosses_every_shape() {
+        let schema = json!({"type": "object", "properties": {"city": {"type": "string"}},
+                            "required": ["city"], "additionalProperties": false});
+        let msgs = json!([{"role": "user", "content": "Tokyo?"}]);
+        type Parse = fn(&[u8]) -> crate::error::Result<super::ChatRequest>;
+        let clients: [(&str, Value, Parse); 3] = [
+            (
+                "chat",
+                json!({"model": "m", "messages": msgs, "response_format":
+                {"type": "json_schema", "json_schema": {"name": "city", "strict": true, "schema": schema}}}),
+                openai_chat::parse_request,
+            ),
+            (
+                "responses",
+                json!({"model": "m", "input": "Tokyo?", "text":
+                {"format": {"type": "json_schema", "name": "city", "strict": true, "schema": schema}}}),
+                openai_responses::parse_request,
+            ),
+            (
+                "messages",
+                json!({"model": "m", "max_tokens": 64, "messages": msgs, "output_config":
+                {"format": {"type": "json_schema", "schema": schema}}}),
+                anthropic::parse_request,
+            ),
+        ];
+        let opts = EmitOptions::new("up");
+        for (client, body, parse) in clients {
+            let req = parse(&serde_json::to_vec(&body).unwrap()).unwrap();
+            let sent = |b: Vec<u8>| serde_json::from_slice::<Value>(&b).unwrap();
+            let chat = sent(openai_chat::emit_request(&req, &opts).unwrap().0);
+            assert_eq!(
+                chat["response_format"]["type"], "json_schema",
+                "{client} -> chat"
+            );
+            assert_eq!(
+                chat["response_format"]["json_schema"]["schema"], schema,
+                "{client} -> chat"
+            );
+            assert!(
+                chat["response_format"]["json_schema"]["name"].is_string(),
+                "{client} -> chat"
+            );
+            let resp = sent(openai_responses::emit_request(&req, &opts).unwrap().0);
+            assert_eq!(
+                resp["text"]["format"]["type"], "json_schema",
+                "{client} -> responses"
+            );
+            assert_eq!(
+                resp["text"]["format"]["schema"], schema,
+                "{client} -> responses"
+            );
+            assert!(
+                resp["text"]["format"]["name"].is_string(),
+                "{client} -> responses"
+            );
+            let ant = sent(anthropic::emit_request(&req, &opts).unwrap().0);
+            assert_eq!(
+                ant["output_config"]["format"],
+                json!({"type": "json_schema", "schema": schema}),
+                "{client} -> messages"
+            );
+        }
+    }
+
+    /// `json_object` has no Anthropic equivalent: it goes as the schema for
+    /// any object. `text` is no format at all.
+    #[test]
+    fn json_object_and_text_formats() {
+        let opts = EmitOptions::new("up");
+        let chat = |rf: Value| {
+            let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "response_format": rf});
+            openai_chat::parse_request(&serde_json::to_vec(&body).unwrap()).unwrap()
+        };
+        let req = chat(json!({"type": "json_object"}));
+        let ant: Value =
+            serde_json::from_slice(&anthropic::emit_request(&req, &opts).unwrap().0).unwrap();
+        assert_eq!(
+            ant["output_config"]["format"],
+            json!({"type": "json_schema", "schema": {"type": "object"}})
+        );
+        let resp: Value =
+            serde_json::from_slice(&openai_responses::emit_request(&req, &opts).unwrap().0)
+                .unwrap();
+        assert_eq!(resp["text"]["format"], json!({"type": "json_object"}));
+        let req = chat(json!({"type": "text"}));
+        assert!(req.response_format.is_none());
+        let ant: Value =
+            serde_json::from_slice(&anthropic::emit_request(&req, &opts).unwrap().0).unwrap();
+        assert!(ant.get("output_config").is_none());
     }
 }
