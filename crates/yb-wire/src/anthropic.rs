@@ -245,9 +245,12 @@ pub fn emit_response(resp: &ChatResponse) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&body)?)
 }
 
+/// Anthropic's `input_tokens` is the uncached remainder of the prompt; the
+/// IR's (like OpenAI's `prompt_tokens` and Gemini's `promptTokenCount`) is the
+/// whole prompt, cache reads and writes included.
 fn emit_usage(u: &Usage) -> Value {
     json!({
-        "input_tokens": u.input_tokens,
+        "input_tokens": u.input_tokens.saturating_sub(u.cache_read_tokens + u.cache_write_tokens),
         "output_tokens": u.output_tokens,
         "cache_read_input_tokens": u.cache_read_tokens,
         "cache_creation_input_tokens": u.cache_write_tokens,
@@ -256,11 +259,14 @@ fn emit_usage(u: &Usage) -> Value {
 
 fn parse_usage(v: Option<&Value>) -> Usage {
     let Some(v) = v else { return Usage::default() };
+    let cache_read = opt_u32(v, "cache_read_input_tokens").unwrap_or(0);
+    let cache_write = opt_u32(v, "cache_creation_input_tokens").unwrap_or(0);
     Usage {
-        input_tokens: opt_u32(v, "input_tokens").unwrap_or(0),
+        // See `emit_usage`: the IR counts the cached part of the prompt too.
+        input_tokens: opt_u32(v, "input_tokens").unwrap_or(0) + cache_read + cache_write,
         output_tokens: opt_u32(v, "output_tokens").unwrap_or(0),
-        cache_read_tokens: opt_u32(v, "cache_read_input_tokens").unwrap_or(0),
-        cache_write_tokens: opt_u32(v, "cache_creation_input_tokens").unwrap_or(0),
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
         reasoning_tokens: 0,
         ..Usage::default()
     }
