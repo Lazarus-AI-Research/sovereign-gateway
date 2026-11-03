@@ -268,12 +268,6 @@ fn openai_stream_to_anthropic() {
     run("openai_stream_to_anthropic");
 }
 
-/// Usage must survive the relay, not just the decode.
-///
-/// Recorded live from Kimi k3 over OpenAI Chat Completions with
-/// `stream_options.include_usage`. The upstream's trailing choices-less usage
-/// chunk was being decoded, accumulated for billing, and then dropped on the
-/// way out, so a downstream metering proxy saw nothing.
 /// A Codex turn's tool exchange must survive translation to a chat upstream.
 ///
 /// Recorded from the shapes Codex actually sends: `custom_tool_call` /
@@ -285,6 +279,12 @@ fn codex_tool_call_pairing() {
     run("codex_tool_call_pairing");
 }
 
+/// Usage must survive the relay, not just the decode.
+///
+/// Recorded live from Kimi k3 over OpenAI Chat Completions with
+/// `stream_options.include_usage`. The upstream's trailing choices-less usage
+/// chunk was being decoded, accumulated for billing, and then dropped on the
+/// way out, so a downstream metering proxy saw nothing.
 #[test]
 fn openai_stream_usage_relay() {
     run("openai_stream_usage_relay");
