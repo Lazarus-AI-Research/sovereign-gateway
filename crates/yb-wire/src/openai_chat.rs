@@ -104,11 +104,50 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
             budget_tokens: None,
         });
     }
+    req.response_format = parse_response_format(v.get("response_format"));
     req.prompt_cache_key = opt_str(&v, "prompt_cache_key").map(str::to_string);
     req.prompt_cache_retention = opt_str(&v, "prompt_cache_retention").map(str::to_string);
     req.native_request = v.as_object().cloned();
 
     Ok(req)
+}
+
+/// `response_format`: `json_object`, or `json_schema` with the schema under
+/// `json_schema`. `text` and types this gateway does not know are no format
+/// (a Chat→Chat relay still forwards them as sent).
+fn parse_response_format(f: Option<&Value>) -> Option<ResponseFormat> {
+    let f = f?;
+    match opt_str(f, "type")? {
+        "json_object" => Some(ResponseFormat::JsonObject),
+        "json_schema" => {
+            let js = f.get("json_schema").unwrap_or(&Value::Null);
+            Some(ResponseFormat::JsonSchema {
+                name: opt_str(js, "name").map(str::to_string),
+                schema: js.get("schema").cloned().unwrap_or(json!({})),
+                strict: js.get("strict").and_then(Value::as_bool),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The Chat Completions `response_format` for an IR format. OpenAI requires
+/// a schema name; "response" stands in when the client's shape had none.
+fn emit_response_format(rf: &ResponseFormat) -> Value {
+    match rf {
+        ResponseFormat::JsonObject => json!({"type": "json_object"}),
+        ResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        } => {
+            let mut js = Map::new();
+            js.insert("name".into(), json!(name.as_deref().unwrap_or("response")));
+            js.insert("schema".into(), schema.clone());
+            insert_opt(&mut js, "strict", *strict);
+            json!({"type": "json_schema", "json_schema": js})
+        }
+    }
 }
 
 /// A same-shape request: the client's own body with the deployment's model,
@@ -183,6 +222,9 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     insert_opt(&mut body, "top_p", req.top_p);
     if !req.stop.is_empty() {
         body.insert("stop".into(), json!(req.stop));
+    }
+    if let Some(rf) = &req.response_format {
+        body.insert("response_format".into(), emit_response_format(rf));
     }
     if opts.stream {
         body.insert("stream".into(), json!(true));
