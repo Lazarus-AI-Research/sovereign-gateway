@@ -1,0 +1,37 @@
+{
+  "_comment": "Anthropic structured output takes a JSON schema only: json_object goes as the schema for any object.",
+  "inbound_format": "openai_chat",
+  "inbound_body": {
+    "model": "deepseek-v4.1-flash-1017-sakura",
+    "max_tokens": 4000,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Tell me about Tokyo."
+      }
+    ],
+    "response_format": {
+      "type": "json_object"
+    }
+  },
+  "target_format": "anthropic",
+  "target_model": "DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8",
+  "expected_upstream_body": {
+    "model": "DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8",
+    "max_tokens": 4000,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Tell me about Tokyo."
+      }
+    ],
+    "output_config": {
+      "format": {
+        "type": "json_schema",
+        "schema": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "_comment": "The reverse route: an Anthropic client's output_config.format reaches a Chat Completions upstream as response_format (OpenAI requires a schema name; Anthropic has none, so \"response\" stands in).",
+  "inbound_format": "anthropic",
+  "inbound_body": {
+    "model": "glm-5.3",
+    "max_tokens": 4000,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Tell me about Tokyo."
+      }
+    ],
+    "output_config": {
+      "format": {
+        "type": "json_schema",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "population_millions": {
+              "type": "number"
+            },
+            "landmarks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 3
+            }
+          },
+          "required": [
+            "city",
+            "population_millions",
+            "landmarks"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  },
+  "target_format": "openai_chat",
+  "target_model": "zai-org/GLM-5.3",
+  "expected_upstream_body": {
+    "model": "zai-org/GLM-5.3",
+    "max_tokens": 4000,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Tell me about Tokyo."
+      }
+    ],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "response",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "population_millions": {
+              "type": "number"
+            },
+            "landmarks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 3
+            }
+          },
+          "required": [
+            "city",
+            "population_millions",
+            "landmarks"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  }
+}
