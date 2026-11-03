@@ -1,0 +1,47 @@
+{
+  "_comment": "Pins f6772a9 (in #21, keep reasoning in a non-streaming answer). The gateway always streams upstream and folds the stream for a non-streaming client. The stream relayed vLLM's reasoning_content deltas, but the buffered Chat answer dropped the folded reasoning, so a non-streaming client of a reasoning model never saw it. It must come back as message.reasoning_content.",
+  "inbound_format": "openai_chat",
+  "inbound_body": {
+    "model": "qwen3",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Is 1009 prime? Answer yes or no."
+      }
+    ]
+  },
+  "target_format": "openai_chat",
+  "target_model": "Qwen/Qwen3-32B",
+  "upstream_sse": [
+    "data: {\"id\":\"chatcmpl-b3f1c0d2a4e5\",\"object\":\"chat.completion.chunk\",\"created\":1790152311,\"model\":\"Qwen/Qwen3-32B\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"logprobs\":null,\"finish_reason\":null}]}",
+    "data: {\"id\":\"chatcmpl-b3f1c0d2a4e5\",\"object\":\"chat.completion.chunk\",\"created\":1790152311,\"model\":\"Qwen/Qwen3-32B\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"No divisor up to 31\"},\"logprobs\":null,\"finish_reason\":null}]}",
+    "data: {\"id\":\"chatcmpl-b3f1c0d2a4e5\",\"object\":\"chat.completion.chunk\",\"created\":1790152311,\"model\":\"Qwen/Qwen3-32B\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" divides 1009.\"},\"logprobs\":null,\"finish_reason\":null}]}",
+    "data: {\"id\":\"chatcmpl-b3f1c0d2a4e5\",\"object\":\"chat.completion.chunk\",\"created\":1790152311,\"model\":\"Qwen/Qwen3-32B\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"yes\"},\"logprobs\":null,\"finish_reason\":null}]}",
+    "data: {\"id\":\"chatcmpl-b3f1c0d2a4e5\",\"object\":\"chat.completion.chunk\",\"created\":1790152311,\"model\":\"Qwen/Qwen3-32B\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"logprobs\":null,\"finish_reason\":\"stop\",\"stop_reason\":null}]}",
+    "data: {\"id\":\"chatcmpl-b3f1c0d2a4e5\",\"object\":\"chat.completion.chunk\",\"created\":1790152311,\"model\":\"Qwen/Qwen3-32B\",\"choices\":[],\"usage\":{\"prompt_tokens\":19,\"total_tokens\":36,\"completion_tokens\":17}}",
+    "data: [DONE]"
+  ],
+  "client_format": "openai_chat",
+  "expected_client_body": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "content": "yes",
+          "reasoning_content": "No divisor up to 31 divides 1009.",
+          "role": "assistant"
+        }
+      }
+    ],
+    "created": 0,
+    "id": "resp_cassette",
+    "model": "Qwen/Qwen3-32B",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 17,
+      "prompt_tokens": 19,
+      "total_tokens": 36
+    }
+  }
+}
