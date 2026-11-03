@@ -295,6 +295,19 @@ fn responses_stream_to_openai() {
     run("responses_stream_to_openai");
 }
 
+/// An Anthropic upstream's cached prompt counts into the client's prompt
+/// tokens: Anthropic's `input_tokens` is only the uncached remainder, and
+/// passed through as is it reported `prompt_tokens: 2` for a 43-token prompt.
+#[test]
+fn anthropic_cached_usage_to_openai_stream() {
+    run("anthropic_cached_usage_to_openai_stream");
+}
+
+#[test]
+fn anthropic_cached_usage_to_responses_stream() {
+    run("anthropic_cached_usage_to_responses_stream");
+}
+
 // --------------------------------------------------------------------------
 // Direct assertions beyond the generic runner
 // --------------------------------------------------------------------------
@@ -334,6 +347,8 @@ fn gemini_parse_request_shapes_ir() {
 }
 
 /// Usage tokens and stop reasons survive an Anthropic response round-trip.
+/// Anthropic's `input_tokens` excludes the cached part of the prompt; the IR's,
+/// and OpenAI's `prompt_tokens`, include it.
 #[test]
 fn anthropic_response_usage_and_stop_reason() {
     use yb_wire::StopReason;
@@ -354,7 +369,7 @@ fn anthropic_response_usage_and_stop_reason() {
     });
     let resp = anthropic::parse_response(&serde_json::to_vec(&body).unwrap()).unwrap();
     assert_eq!(resp.stop_reason, StopReason::MaxTokens);
-    assert_eq!(resp.usage.input_tokens, 100);
+    assert_eq!(resp.usage.input_tokens, 130);
     assert_eq!(resp.usage.output_tokens, 50);
     assert_eq!(resp.usage.cache_read_tokens, 20);
     assert_eq!(resp.usage.cache_write_tokens, 10);
@@ -362,9 +377,33 @@ fn anthropic_response_usage_and_stop_reason() {
     // Re-emit to OpenAI chat and confirm the token mapping carries across.
     let out = openai_chat::emit_response(&resp).unwrap();
     let v: Value = serde_json::from_slice(&out).unwrap();
-    assert_eq!(v["usage"]["prompt_tokens"], 100);
+    assert_eq!(v["usage"]["prompt_tokens"], 130);
+    assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 20);
     assert_eq!(v["usage"]["completion_tokens"], 50);
     assert_eq!(v["choices"][0]["finish_reason"], "length");
+
+    // And back to Anthropic: the uncached remainder again.
+    let out = anthropic::emit_response(&resp).unwrap();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["usage"], body["usage"]);
+}
+
+/// An Anthropic stream's message_start usage counts the cached prompt into
+/// the IR's input, as the non-streaming path does.
+#[test]
+fn anthropic_stream_usage_includes_cached_prompt() {
+    use yb_wire::StreamEvent;
+
+    let mut state = anthropic::SseState::default();
+    let line = r#"data: {"type":"message_start","message":{"model":"m","usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":41,"cache_creation_input_tokens":0}}}"#;
+    let usage = anthropic::decode_sse(line, &mut state)
+        .into_iter()
+        .find_map(|e| match e {
+            StreamEvent::UsageDelta { usage } => Some(usage),
+            _ => None,
+        })
+        .expect("message_start carries usage");
+    assert_eq!((usage.input_tokens, usage.cache_read_tokens), (43, 41));
 }
 
 /// A regeneration helper: parse an inbound body and emit it to the target
