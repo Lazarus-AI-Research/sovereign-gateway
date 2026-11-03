@@ -371,6 +371,16 @@ fn anthropic_stream_usage_to_responses() {
     run("anthropic_stream_usage_to_responses");
 }
 
+/// `response.completed` waits for usage that trails the finish reason.
+///
+/// From 8169051. A Chat upstream sends usage on the chunk after
+/// `finish_reason`, so the Responses surface wrote its terminal event with
+/// `usage: null` and the stream could not be metered.
+#[test]
+fn codex_stream_usage_after_finish() {
+    run("codex_stream_usage_after_finish");
+}
+
 // --------------------------------------------------------------------------
 // Direct assertions beyond the generic runner
 // --------------------------------------------------------------------------
