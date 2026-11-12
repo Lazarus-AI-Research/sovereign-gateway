@@ -725,6 +725,41 @@ async fn omitting_the_api_key_on_update_keeps_it() {
     );
 }
 
+/// A provider's natively served shapes round-trip, reach its deployments, and
+/// survive an endpoint edit that does not mention them.
+#[tokio::test]
+async fn provider_shapes_round_trip_and_join_onto_deployments() {
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    store
+        .seed_deployment(&new_dep("gpt-4o", "openai"))
+        .await
+        .unwrap();
+    let p = store.get_provider_by_name("openai").await.unwrap().unwrap();
+    assert!(p.shapes.is_empty(), "an existing provider declares no shapes");
+    let shapes = vec![
+        yb_core::ProviderShape {
+            format: yb_core::WireFormat::Anthropic,
+            api_base: Some("https://x.test/anthropic".into()),
+        },
+        yb_core::ProviderShape {
+            format: yb_core::WireFormat::OpenaiChat,
+            api_base: None,
+        },
+    ];
+    let after = store.set_provider_shapes(&p.id, &shapes).await.unwrap();
+    assert_eq!(after.shapes, shapes);
+    let edited = store
+        .update_provider(&p.id, "openai", Some("https://x.test/v1"), None, &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(edited.shapes, shapes, "an endpoint edit keeps the shapes");
+    let deps = store.list_deployments().await.unwrap();
+    assert_eq!(deps[0].shapes, shapes);
+    assert!(store.set_provider_shapes("nope", &shapes).await.is_err());
+}
+
 /// Two deployments of one public name are the load-balancing fan-out: one
 /// model row, two deployments, one shared id.
 #[tokio::test]

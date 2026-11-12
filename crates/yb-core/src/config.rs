@@ -466,6 +466,11 @@ pub struct ProviderConfig {
     /// of this endpoint. The Cloudflare token itself is file-owned, in
     /// `[upstream.cloudflare_access]`; this flag only selects it.
     pub extra: crate::routing::Extra,
+    /// The chat API shapes this endpoint serves natively, e.g.
+    /// `shapes = [{ format = "anthropic" }, { format = "openai_chat" }]`, each
+    /// with an optional `api_base` of its own. Empty: only each deployment's
+    /// own `upstream_format`.
+    pub shapes: Vec<crate::routing::ProviderShape>,
 }
 
 /// and the import file is just a convenient bulk loader.

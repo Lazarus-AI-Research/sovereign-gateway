@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The wire protocol a **chat** surface or upstream speaks. Chat and embedding
 /// formats are disjoint types — there is no translation between them — so this
 /// enum never carries an embedding dialect (see [`EmbedFormat`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireFormat {
     Anthropic,
@@ -26,6 +26,58 @@ impl WireFormat {
             WireFormat::Gemini => "gemini",
         }
     }
+
+    /// Every chat shape, in the order the console lists them.
+    pub const ALL: [WireFormat; 4] = [
+        WireFormat::Anthropic,
+        WireFormat::OpenaiChat,
+        WireFormat::OpenaiResponses,
+        WireFormat::Gemini,
+    ];
+
+    /// Parse a shape name (`anthropic`, `openai_chat`, …).
+    pub fn parse(s: &str) -> Option<WireFormat> {
+        WireFormat::ALL.into_iter().find(|f| f.as_str() == s)
+    }
+}
+
+/// One chat API shape a provider serves natively, with the base URL it is
+/// served under when that differs from the provider's `api_base` (some
+/// servers put `/v1/messages` and `/v1/chat/completions` behind different
+/// prefixes).
+///
+/// A request whose shape the chosen provider serves is relayed to it as the
+/// client sent it — only the model id and the credentials change — rather
+/// than translated through the IR: translation is the fallback for shapes the
+/// provider does not serve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderShape {
+    pub format: WireFormat,
+    /// `None`: the provider's `api_base`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base: Option<String>,
+}
+
+/// Whether `shapes`, or else the deployment's own `upstream_format`, serves
+/// `surface` natively; and if so under which base URL. A deployment always
+/// serves its own format under the provider's `api_base`, which is what keeps
+/// a provider with no declared shapes behaving as it did before shapes
+/// existed.
+pub fn native_base<'a>(
+    shapes: &'a [ProviderShape],
+    upstream_format: UpstreamFormat,
+    api_base: Option<&'a str>,
+    surface: WireFormat,
+) -> Option<Option<&'a str>> {
+    if let Some(s) = shapes.iter().find(|s| s.format == surface) {
+        return Some(
+            s.api_base
+                .as_deref()
+                .filter(|b| !b.trim().is_empty())
+                .or(api_base),
+        );
+    }
+    (upstream_format == UpstreamFormat::Chat(surface)).then_some(api_base)
 }
 
 /// The wire protocol an **embeddings** surface or upstream speaks.
@@ -265,6 +317,11 @@ pub struct ProviderRecord {
     pub api_key: Option<String>,
     #[serde(default)]
     pub extra: Extra,
+    /// The chat API shapes this endpoint serves natively (see
+    /// [`ProviderShape`]). Empty: only each deployment's own
+    /// `upstream_format`, as before shapes existed.
+    #[serde(default)]
+    pub shapes: Vec<ProviderShape>,
     pub created_at: crate::ids::Timestamp,
     pub updated_at: crate::ids::Timestamp,
 }
@@ -325,6 +382,22 @@ pub struct Deployment {
     /// Open-ended per-deployment extras (see [`Extra`]).
     #[serde(default)]
     pub extra: Extra,
+    /// The provider's natively served chat shapes, joined at read time.
+    #[serde(default)]
+    pub shapes: Vec<ProviderShape>,
+}
+
+impl Deployment {
+    /// The base URL to relay a `surface`-shaped request to unchanged, if this
+    /// deployment's provider serves that shape (see [`native_base`]).
+    pub fn native_base(&self, surface: WireFormat) -> Option<Option<&str>> {
+        native_base(
+            &self.shapes,
+            self.upstream_format,
+            self.api_base.as_deref(),
+            surface,
+        )
+    }
 }
 
 /// A persisted deployment row: the live model list lives in the database, so a
@@ -358,6 +431,9 @@ pub struct DeploymentRecord {
     /// Open-ended per-deployment extras (see [`Extra`]).
     #[serde(default)]
     pub extra: Extra,
+    /// The provider's natively served chat shapes, joined at read time.
+    #[serde(default)]
+    pub shapes: Vec<ProviderShape>,
     pub created_at: crate::ids::Timestamp,
     pub updated_at: crate::ids::Timestamp,
     pub deleted_at: Option<crate::ids::Timestamp>,
@@ -380,6 +456,7 @@ impl DeploymentRecord {
             health_check: self.health_check,
             health_path: self.health_path.clone(),
             extra: self.extra.clone(),
+            shapes: self.shapes.clone(),
         }
     }
 }
@@ -422,5 +499,62 @@ pub trait Router: Send + Sync {
     /// say.
     fn serving(&self, _format: UpstreamFormat, _upstream_model: &str) -> Vec<Deployment> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    #[test]
+    fn a_deployment_serves_its_own_format_and_its_providers_shapes() {
+        let own = UpstreamFormat::Chat(WireFormat::OpenaiChat);
+        let base = Some("https://h/v1");
+        // No shapes declared: only the deployment's own format, as before.
+        assert_eq!(
+            native_base(&[], own, base, WireFormat::OpenaiChat),
+            Some(base)
+        );
+        assert_eq!(native_base(&[], own, base, WireFormat::Anthropic), None);
+        let shapes = [
+            ProviderShape {
+                format: WireFormat::Anthropic,
+                api_base: Some("https://h/anthropic".into()),
+            },
+            ProviderShape {
+                format: WireFormat::OpenaiResponses,
+                api_base: Some("  ".into()),
+            },
+        ];
+        assert_eq!(
+            native_base(&shapes, own, base, WireFormat::Anthropic),
+            Some(Some("https://h/anthropic"))
+        );
+        // A blank per-shape base falls back to the provider's.
+        assert_eq!(
+            native_base(&shapes, own, base, WireFormat::OpenaiResponses),
+            Some(base)
+        );
+        assert_eq!(native_base(&shapes, own, base, WireFormat::Gemini), None);
+        // An embeddings deployment serves no chat shape of its own.
+        let embed = UpstreamFormat::Embed(EmbedFormat::OpenaiEmbed);
+        assert_eq!(native_base(&[], embed, base, WireFormat::OpenaiChat), None);
+    }
+
+    #[test]
+    fn shapes_serialize_as_flat_format_names() {
+        let s = ProviderShape {
+            format: WireFormat::OpenaiChat,
+            api_base: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&[s]).unwrap(),
+            r#"[{"format":"openai_chat"}]"#
+        );
+        assert_eq!(
+            WireFormat::parse("openai_responses"),
+            Some(WireFormat::OpenaiResponses)
+        );
+        assert_eq!(WireFormat::parse("openai_embed"), None);
     }
 }

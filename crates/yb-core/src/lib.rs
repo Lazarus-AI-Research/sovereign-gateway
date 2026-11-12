@@ -34,7 +34,7 @@ pub use principal::{KeyAuth, Principal};
 pub use reqlog::{CaptureFilter, CapturedTurn, NullLogger, RequestLogRecord, RequestLogger};
 pub use routing::{
     Decision, Deployment, DeploymentRecord, EmbedFormat, Extra, HealthCheck, HealthRecord,
-    MediaFormat, ModelRecord, NewDeployment, ProviderRecord, RouteRequest, Router, UpstreamFormat,
-    WireFormat,
+    MediaFormat, ModelRecord, NewDeployment, ProviderRecord, ProviderShape, RouteRequest, Router,
+    UpstreamFormat, WireFormat,
 };
 pub use store::{LimitColumns, Store};

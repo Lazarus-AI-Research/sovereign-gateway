@@ -289,6 +289,13 @@ impl Store for RecordingStore {
     ) -> Result<yb_core::ProviderRecord> {
         unimplemented!("RecordingStore only serves the request path")
     }
+    async fn set_provider_shapes(
+        &self,
+        _id: &str,
+        _shapes: &[yb_core::ProviderShape],
+    ) -> Result<yb_core::ProviderRecord> {
+        unimplemented!("RecordingStore only serves the request path")
+    }
     async fn delete_provider(&self, _id: &str) -> Result<()> {
         Ok(())
     }
