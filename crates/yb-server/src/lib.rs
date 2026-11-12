@@ -786,7 +786,8 @@ pub fn parse_traceparent(value: &str) -> Option<(String, String)> {
 /// a request belongs to (`space=…,conversation=…`), kept with its capture.
 /// Keys and values are short plain words; anything else is not a tag.
 pub fn parse_tags(value: &str) -> Option<String> {
-    let mut tags = serde_json::Map::new();
+    // Sorted, so one set of tags is always stored as one string.
+    let mut tags = std::collections::BTreeMap::new();
     for pair in value.split(',').filter(|pair| !pair.trim().is_empty()) {
         let (key, value) = pair.split_once('=')?;
         let (key, value) = (key.trim(), value.trim());
@@ -806,7 +807,7 @@ pub fn parse_tags(value: &str) -> Option<String> {
             serde_json::Value::String(value.to_string()),
         );
     }
-    (!tags.is_empty()).then(|| serde_json::Value::Object(tags).to_string())
+    (!tags.is_empty()).then(|| serde_json::json!(tags).to_string())
 }
 
 /// Read a header as an owned `String`, if present and valid UTF-8.
