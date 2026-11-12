@@ -1196,6 +1196,11 @@ struct StreamState {
     done: bool,
     /// Set once telemetry has been recorded (exactly once).
     recorded: bool,
+    /// A valid HTTP 200 Responses stream can still end unsuccessfully.
+    terminal_failure: bool,
+    responses_terminal_seen: bool,
+    pending_terminal: Option<bool>,
+    native_frame: Vec<u8>,
     /// The client's dialect, which says what ends its answer.
     surface: WireFormat,
 }
@@ -1240,9 +1245,94 @@ fn ends_stream(surface: WireFormat, bytes: &[u8], events: &[StreamEvent]) -> boo
     match surface {
         WireFormat::OpenaiChat => text.contains("data: [DONE]"),
         WireFormat::Anthropic => text.contains("message_stop"),
-        WireFormat::OpenaiResponses => text.contains("response.completed"),
+        WireFormat::OpenaiResponses => events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
         WireFormat::Gemini => events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
     }
+}
+
+/// Check terminal events before relaying a native Responses stream. In
+/// particular, a provider's malformed terminal must not be laundered into a
+/// successful OpenAI response by the gateway.
+fn responses_terminal(line: &str) -> Result<Option<bool>> {
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return Err(Error::ConnectionLost(
+            "non-Responses [DONE] marker in Responses stream".into(),
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(data).map_err(|_| {
+        Error::ConnectionLost("invalid JSON event in upstream Responses stream".into())
+    })?;
+    let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) else {
+        return Err(Error::ConnectionLost(
+            "Responses SSE event has no type".into(),
+        ));
+    };
+    if value
+        .get("sequence_number")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+        || !(kind.starts_with("response.") || kind == "error")
+    {
+        return Err(Error::ConnectionLost(format!(
+            "malformed upstream Responses SSE event: {kind}"
+        )));
+    }
+    let status = match kind {
+        "response.completed" => "completed",
+        "response.incomplete" => "incomplete",
+        "response.failed" => "failed",
+        "response.cancelled" => {
+            return Err(Error::ConnectionLost(
+                "response.cancelled is not a Responses streaming event".into(),
+            ));
+        }
+        _ => return Ok(None),
+    };
+    let response = value.get("response");
+    if response
+        .and_then(|r| r.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+        || response
+            .and_then(|r| r.get("object"))
+            .and_then(serde_json::Value::as_str)
+            != Some("response")
+        || response
+            .and_then(|r| r.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        || response
+            .and_then(|r| r.get("output"))
+            .and_then(serde_json::Value::as_array)
+            .is_none()
+        || response
+            .and_then(|r| r.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some(status)
+        || (kind == "response.incomplete"
+            && response
+                .and_then(|r| r.get("incomplete_details"))
+                .and_then(|d| d.get("reason"))
+                .and_then(serde_json::Value::as_str)
+                .is_none())
+        || (kind == "response.failed"
+            && ["code", "message"].iter().any(|field| {
+                response
+                    .and_then(|r| r.get("error"))
+                    .and_then(|e| e.get(*field))
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+            }))
+    {
+        return Err(Error::ConnectionLost(format!(
+            "malformed upstream Responses terminal event: {kind}"
+        )));
+    }
+    Ok(Some(kind != "response.completed"))
 }
 
 /// Build the client-facing translated SSE stream.
@@ -1260,6 +1350,13 @@ fn translate_stream(
     cache_echo: (Option<String>, Option<String>),
     include_usage: bool,
 ) -> ByteStream {
+    // Responses is already the client's requested wire format. Relaying its
+    // SSE bytes exactly preserves terminal statuses and provider-native event
+    // fields (notably `response.incomplete` and `response.failed`) that the
+    // cross-format IR cannot express. We still decode in parallel for usage,
+    // telemetry, and request-log capture.
+    let passthrough_responses =
+        upstream_fmt == WireFormat::OpenaiResponses && surface == WireFormat::OpenaiResponses;
     let mut encoder = wire::Encoder::new(surface);
     encoder.set_prompt_cache(cache_echo.0, cache_echo.1);
     // What the client asked for on the way in decides whether usage is relayed
@@ -1277,16 +1374,26 @@ fn translate_stream(
         rctx,
         done: false,
         recorded: false,
+        terminal_failure: false,
+        responses_terminal_seen: false,
+        pending_terminal: None,
+        native_frame: Vec::new(),
         surface,
     };
 
-    let s = stream::unfold(init, |mut st| async move {
+    let s = stream::unfold(init, move |mut st| async move {
         loop {
             if st.done {
                 if !st.recorded {
                     let ir = st.ir_json();
                     st.rctx
-                        .finish(st.usage, st.status, false, ir, st.response_bytes)
+                        .finish(
+                            st.usage,
+                            st.status,
+                            st.terminal_failure,
+                            ir,
+                            st.response_bytes,
+                        )
                         .await;
                     // Read by StreamState::drop (suppresses the 499 fallback),
                     // which the unused-assignment lint cannot see.
@@ -1302,10 +1409,31 @@ fn translate_stream(
                 Some(Ok(chunk)) => {
                     st.buf.extend_from_slice(&chunk);
                     let mut events = Vec::new();
+                    let mut native_out = Vec::new();
                     while let Some(pos) = st.buf.iter().position(|&b| b == b'\n') {
                         let line: Vec<u8> = st.buf.drain(..=pos).collect();
+                        if passthrough_responses {
+                            st.native_frame.extend_from_slice(&line);
+                        }
                         let text = String::from_utf8_lossy(&line);
                         let line = text.trim_end_matches(['\r', '\n']);
+                        if passthrough_responses {
+                            match responses_terminal(line) {
+                                Ok(Some(failed)) => {
+                                    st.pending_terminal = Some(failed);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    st.done = true;
+                                    let ir = st.ir_json();
+                                    st.rctx
+                                        .finish(st.usage, st.status, true, ir, st.response_bytes)
+                                        .await;
+                                    st.recorded = true;
+                                    return Some((Err(e), st));
+                                }
+                            }
+                        }
                         let evs = st.decoder.decode_line(line);
                         st.rctx.saw(&evs);
                         for ev in &evs {
@@ -1315,11 +1443,28 @@ fn translate_stream(
                         }
                         st.agg.push_all(&evs);
                         events.extend(evs);
+                        if passthrough_responses && line.is_empty() {
+                            native_out.extend_from_slice(&st.native_frame);
+                            st.native_frame.clear();
+                            if let Some(failed) = st.pending_terminal.take() {
+                                st.responses_terminal_seen = true;
+                                st.terminal_failure |= failed;
+                            }
+                            if st.responses_terminal_seen {
+                                break;
+                            }
+                        }
                     }
-                    if events.is_empty() {
+                    if events.is_empty() && !passthrough_responses
+                        || passthrough_responses && native_out.is_empty()
+                    {
                         continue; // need more bytes before we have output
                     }
-                    let bytes = st.encoder.encode(&events);
+                    let bytes = if passthrough_responses {
+                        native_out
+                    } else {
+                        st.encoder.encode(&events)
+                    };
                     if bytes.is_empty() {
                         continue;
                     }
@@ -1328,12 +1473,24 @@ fn translate_stream(
                     // the upstream closes, and the turn would then read as
                     // abandoned; it is recorded as complete the moment the
                     // end goes out.
-                    if !st.recorded && ends_stream(st.surface, &bytes, &events) {
+                    if !st.recorded
+                        && (passthrough_responses && st.responses_terminal_seen
+                            || !passthrough_responses && ends_stream(st.surface, &bytes, &events))
+                    {
                         let ir = st.ir_json();
                         st.rctx
-                            .finish(st.usage, st.status, false, ir, st.response_bytes)
+                            .finish(
+                                st.usage,
+                                st.status,
+                                st.terminal_failure,
+                                ir,
+                                st.response_bytes,
+                            )
                             .await;
                         st.recorded = true;
+                        // A terminal Responses event ends the stream. Do not
+                        // relay any provider-specific trailer as though it
+                        // were another Responses protocol event.
                         st.done = true;
                     }
                     return Some((Ok(Bytes::from(bytes)), st));
@@ -1344,14 +1501,31 @@ fn translate_stream(
                     // body is torn down and this future may never be polled
                     // again, so the done-poll safety net would not run.
                     st.done = true;
-                    let ir = st.ir_json();
-                    st.rctx
-                        .finish(st.usage, st.status, true, ir, st.response_bytes)
-                        .await;
-                    st.recorded = true;
+                    if !st.recorded {
+                        let ir = st.ir_json();
+                        st.rctx
+                            .finish(st.usage, st.status, true, ir, st.response_bytes)
+                            .await;
+                        st.recorded = true;
+                    }
                     return Some((Err(e), st));
                 }
                 None => {
+                    if passthrough_responses {
+                        st.done = true;
+                        let ir = st.ir_json();
+                        st.rctx
+                            .finish(st.usage, st.status, true, ir, st.response_bytes)
+                            .await;
+                        st.recorded = true;
+                        return Some((
+                            Err(Error::ConnectionLost(
+                                "upstream Responses stream ended without a complete terminal event"
+                                    .into(),
+                            )),
+                            st,
+                        ));
+                    }
                     // Flush any trailing partial line, then record and finish.
                     let mut events = Vec::new();
                     if !st.buf.is_empty() {
@@ -1380,11 +1554,19 @@ fn translate_stream(
                     b.extend(st.encoder.finish());
                     st.response_bytes += b.len() as i64;
                     let bytes = Bytes::from(b);
-                    let ir = st.ir_json();
-                    st.rctx
-                        .finish(st.usage, st.status, false, ir, st.response_bytes)
-                        .await;
-                    st.recorded = true;
+                    if !st.recorded {
+                        let ir = st.ir_json();
+                        st.rctx
+                            .finish(
+                                st.usage,
+                                st.status,
+                                st.terminal_failure,
+                                ir,
+                                st.response_bytes,
+                            )
+                            .await;
+                        st.recorded = true;
+                    }
                     return Some((Ok(bytes), st));
                 }
             }
@@ -1468,5 +1650,60 @@ mod speed_tests {
             speed(&Usage::default(), 800, Some(700), 1, None).generation_ms,
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod responses_terminal_tests {
+    use super::responses_terminal;
+
+    #[test]
+    fn accepts_documented_terminal_statuses() {
+        for (kind, status, failed) in [
+            ("response.completed", "completed", false),
+            ("response.incomplete", "incomplete", true),
+            ("response.failed", "failed", true),
+        ] {
+            let mut response = serde_json::json!({
+                "id": "resp_test", "object": "response", "model": "test", "output": [],
+                "status": status,
+                "incomplete_details": null, "error": null,
+            });
+            if kind == "response.incomplete" {
+                response["incomplete_details"] = serde_json::json!({"reason": "max_output_tokens"});
+            }
+            if kind == "response.failed" {
+                response["error"] =
+                    serde_json::json!({"code": "server_error", "message": "failed"});
+            }
+            let event = serde_json::json!({
+                "type": kind, "sequence_number": 1, "response": response,
+            });
+            assert_eq!(
+                responses_terminal(&format!("data: {event}")).unwrap(),
+                Some(failed)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_and_non_responses_terminals() {
+        for data in [
+            "[DONE]".to_string(),
+            "{bad json".to_string(),
+            serde_json::json!({
+                "type": "response.completed", "sequence_number": 1,
+                "response": {"object": "response", "status": "incomplete"}
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "response.incomplete", "sequence_number": 1,
+                "response": {"object": "response", "status": "incomplete"}
+            })
+            .to_string(),
+        ] {
+            assert!(responses_terminal(&format!("data: {data}")).is_err());
+        }
+        assert!(responses_terminal("data: {\"type\":\"response.cancelled\"}").is_err());
     }
 }
