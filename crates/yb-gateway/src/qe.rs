@@ -315,6 +315,63 @@ impl ResponseItems for View<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// Responses relayed to a provider that keeps them itself
+// ---------------------------------------------------------------------------
+
+/// Where a relayed Responses answer lives: the provider keeps it (and its
+/// conversation), so `GET` / `DELETE` / `cancel` / `input_items` of its id go
+/// back there, and a `previous_response_id` naming it is routed there first.
+#[derive(Debug, Clone)]
+pub struct Relayed {
+    /// The provider's Responses endpoint (`…/v1/responses`).
+    pub url: String,
+    /// The credentials and edge headers the turn was sent with.
+    pub headers: Vec<(String, String)>,
+    pub owner: Option<String>,
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+/// Relayed Responses ids, newest kept (bounded like the store).
+pub struct RelayedResponses {
+    inner: Mutex<(HashMap<String, Relayed>, VecDeque<String>)>,
+    cap: usize,
+}
+
+impl Default for RelayedResponses {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(Default::default()),
+            cap: 16384,
+        }
+    }
+}
+
+impl RelayedResponses {
+    pub fn insert(&self, id: &str, r: Relayed) {
+        let mut g = self.inner.lock().unwrap();
+        if g.0.insert(id.to_string(), r).is_none() {
+            g.1.push_back(id.to_string());
+        }
+        while g.0.len() > self.cap {
+            let Some(old) = g.1.pop_front() else { break };
+            g.0.remove(&old);
+        }
+    }
+
+    /// The relayed response `id`, if `owner` made it.
+    pub fn get(&self, id: &str, owner: Option<&str>) -> Option<Relayed> {
+        self.inner
+            .lock()
+            .unwrap()
+            .0
+            .get(id)
+            .filter(|r| r.owner.as_deref() == owner)
+            .cloned()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // One translated turn
 // ---------------------------------------------------------------------------
 
@@ -330,7 +387,7 @@ pub(crate) enum Reply {
         ctx: Arc<ResponsesCtx>,
         /// This turn's conversation, stored with the reply appended.
         history: Vec<Value>,
-        /// The request (item references resolved), for its input items.
+        /// The request as sent, for its input items.
         request: Value,
         store: bool,
         background: bool,
@@ -379,7 +436,9 @@ pub(crate) fn translate(
                     "background: background responses need the response store (store=true)".into(),
                 ));
             }
-            let ctx = ResponsesCtx::new(&t.request, sampling_defaults(extra), keep, background);
+            // QE echoes, and lists as input items, the request as sent (item
+            // references unresolved).
+            let ctx = ResponsesCtx::new(&v, sampling_defaults(extra), keep, background);
             (
                 t.body,
                 Reply::Responses {
@@ -387,7 +446,7 @@ pub(crate) fn translate(
                     created: now_secs(),
                     ctx: Arc::new(ctx),
                     history: t.history,
-                    request: t.request,
+                    request: v.clone(),
                     store: keep,
                     background,
                     owner: owner.map(str::to_string),

@@ -753,18 +753,13 @@ async fn run_call(state: AppState, headers: HeaderMap, call: Call) -> Response {
         }
         Call::Video(id, lookup) => state.gateway.handle_video(&id, lookup, ctx).await,
         Call::Response(id, lookup) => {
-            let g = &state.gateway;
-            match lookup {
-                ResponseLookup::Get => g.get_response(&id, &ctx),
-                ResponseLookup::Delete => g.delete_response(&id, &ctx),
-                ResponseLookup::Cancel => g.cancel_response(&id, &ctx),
-                ResponseLookup::InputItems(q) => g.response_input_items(&id, &q, &ctx),
-            }
-            .map(|v| GatewayResponse::Full {
-                status: 200,
-                headers: vec![("content-type".into(), "application/json".into())],
-                body: serde_json::to_vec(&v).unwrap_or_default(),
-            })
+            let op = match lookup {
+                ResponseLookup::Get => yb_gateway::service::ResponseOp::Get,
+                ResponseLookup::Delete => yb_gateway::service::ResponseOp::Delete,
+                ResponseLookup::Cancel => yb_gateway::service::ResponseOp::Cancel,
+                ResponseLookup::InputItems(q) => yb_gateway::service::ResponseOp::InputItems(q),
+            };
+            state.gateway.response_op(&id, op, &ctx).await
         }
     };
     match result {
