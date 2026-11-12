@@ -1,0 +1,129 @@
+{
+ "name": "anthropic tool_choice none",
+ "shape": "anthropic",
+ "inbound_body": {
+  "seed": 7,
+  "max_tokens": 2048,
+  "messages": [
+   {
+    "role": "user",
+    "content": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+   }
+  ],
+  "stream": false,
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Weather for a city",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "zone": {
+       "type": "string"
+      },
+      "city": {
+       "type": "string"
+      },
+      "units": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city",
+      "units"
+     ]
+    }
+   },
+   {
+    "name": "get_time",
+    "description": "Time in a zone",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "zone": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "zone"
+     ]
+    }
+   }
+  ],
+  "tool_choice": {
+   "type": "none"
+  },
+  "model": "DeepSeek-V4.1-Flash"
+ },
+ "expected_chat_body": {
+  "model": "DeepSeek-V4.1-Flash",
+  "messages": [
+   {
+    "role": "user",
+    "content": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Weather for a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "units": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "zone": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city",
+       "units"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_time",
+     "description": "Time in a zone",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "zone": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "zone"
+      ]
+     }
+    }
+   }
+  ],
+  "tool_choice": "none",
+  "max_tokens": 2048,
+  "seed": 7,
+  "stream": false
+ },
+ "stream": false,
+ "chat_answer": "{\"id\":\"chatcmpl-2e7393e60ac700093f\",\"object\":\"chat.completion\",\"created\":1794454050,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\\n\\n<｜DSML｜ calls>\\n<｜DSML｜ invoke name=\\\"get_weather\\\">\\n<｜DSML｜ parameter name=\\\"city\\\" string=\\\"true\\\">Paris</｜DSML｜ parameter>\\n</｜DSML｜ invoke>\\n</｜DSML｜ calls>\",\"refusal\":null,\"annotations\":[]},\"finish_reason\":\"stop\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":68,\"completion_tokens\":39,\"total_tokens\":107,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0}}}",
+ "native_answer": "{\"id\":\"msg_2e738ef6aaeb00093e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"DeepSeek-V4.1-Flash\",\"content\":[{\"type\":\"text\",\"text\":\"\\n\\n<｜DSML｜ calls>\\n<｜DSML｜ invoke name=\\\"get_weather\\\">\\n<｜DSML｜ parameter name=\\\"city\\\" string=\\\"true\\\">Paris</｜DSML｜ parameter>\\n</｜DSML｜ invoke>\\n</｜DSML｜ calls>\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":68,\"output_tokens\":39,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens_details\":{\"reasoning_tokens\":0,\"thinking_tokens\":0}}}",
+ "tags": [],
+ "dump_equal": true
+}

@@ -1,0 +1,143 @@
+{
+ "name": "responses allowed_tools",
+ "shape": "responses",
+ "inbound_body": {
+  "seed": 7,
+  "max_output_tokens": 2048,
+  "store": false,
+  "input": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+  "stream": false,
+  "tools": [
+   {
+    "type": "function",
+    "name": "get_weather",
+    "description": "Weather for a city",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "zone": {
+       "type": "string"
+      },
+      "city": {
+       "type": "string"
+      },
+      "units": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city",
+      "units"
+     ]
+    }
+   },
+   {
+    "type": "function",
+    "name": "get_time",
+    "description": "Time in a zone",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "zone": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "zone"
+     ]
+    }
+   }
+  ],
+  "tool_choice": {
+   "type": "allowed_tools",
+   "mode": "auto",
+   "tools": [
+    {
+     "type": "function",
+     "name": "get_weather"
+    }
+   ]
+  },
+  "model": "DeepSeek-V4.1-Flash"
+ },
+ "expected_chat_body": {
+  "model": "DeepSeek-V4.1-Flash",
+  "messages": [
+   {
+    "role": "user",
+    "content": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Weather for a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "zone": {
+        "type": "string"
+       },
+       "city": {
+        "type": "string"
+       },
+       "units": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city",
+       "units"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_time",
+     "description": "Time in a zone",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "zone": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "zone"
+      ]
+     }
+    }
+   }
+  ],
+  "tool_choice": {
+   "type": "allowed_tools",
+   "mode": "auto",
+   "tools": [
+    {
+     "type": "function",
+     "name": "get_weather"
+    }
+   ]
+  },
+  "max_tokens": 2048,
+  "seed": 7,
+  "stream": false
+ },
+ "stream": false,
+ "chat_answer": "{\"id\":\"chatcmpl-2e752689f7f80009a6\",\"object\":\"chat.completion\",\"created\":1794454057,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"refusal\":null,\"annotations\":[],\"tool_calls\":[{\"id\":\"call_chatcmpl-2e752689f7f80009a6_0_0\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\": \\\"Paris\\\", \\\"units\\\": \\\"c\\\"}\"}}]},\"finish_reason\":\"tool_calls\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":400,\"completion_tokens\":58,\"total_tokens\":458,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0}}}",
+ "native_answer": "{\"id\":\"resp_2e752073f6ea0009a5\",\"object\":\"response\",\"created_at\":1794454057,\"model\":\"DeepSeek-V4.1-Flash\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_resp_2e752073f6ea0009a5_0\",\"call_id\":\"call_resp_2e752073f6ea0009a5_0\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\": \\\"Paris\\\", \\\"units\\\": \\\"c\\\"}\",\"status\":\"completed\"}],\"error\":null,\"incomplete_details\":null,\"usage\":{\"input_tokens\":400,\"output_tokens\":58,\"total_tokens\":458,\"input_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":0}},\"background\":false,\"previous_response_id\":null,\"prompt\":null,\"service_tier\":\"default\",\"top_logprobs\":0,\"max_tool_calls\":null,\"user\":null,\"metadata\":null,\"presence_penalty\":0.0,\"frequency_penalty\":0.0,\"instructions\":null,\"tools\":[{\"type\":\"function\",\"name\":\"get_weather\",\"description\":\"Weather for a city\",\"parameters\":{\"type\":\"object\",\"properties\":{\"zone\":{\"type\":\"string\"},\"city\":{\"type\":\"string\"},\"units\":{\"type\":\"string\",\"enum\":[\"c\",\"f\"]}},\"required\":[\"city\",\"units\"]}},{\"type\":\"function\",\"name\":\"get_time\",\"description\":\"Time in a zone\",\"parameters\":{\"type\":\"object\",\"properties\":{\"zone\":{\"type\":\"string\"}},\"required\":[\"zone\"]}}],\"tool_choice\":{\"type\":\"allowed_tools\",\"mode\":\"auto\",\"tools\":[{\"type\":\"function\",\"name\":\"get_weather\"}]},\"parallel_tool_calls\":true,\"temperature\":1.0,\"top_p\":0.949999988079071,\"max_output_tokens\":2048,\"reasoning\":null,\"text\":{\"format\":{\"type\":\"text\"}},\"truncation\":\"disabled\",\"store\":false,\"prompt_cache_key\":null,\"safety_identifier\":null}",
+ "tags": [],
+ "dump_equal": true
+}

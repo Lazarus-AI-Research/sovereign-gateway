@@ -1,0 +1,44 @@
+{
+ "name": "anthropic text",
+ "shape": "anthropic",
+ "inbound_body": {
+  "seed": 7,
+  "max_tokens": 2048,
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "stream": false,
+  "system": "Be brief.",
+  "temperature": 0.3,
+  "top_k": 20,
+  "top_p": 0.9,
+  "model": "DeepSeek-V4.1-Flash"
+ },
+ "expected_chat_body": {
+  "model": "DeepSeek-V4.1-Flash",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "max_tokens": 2048,
+  "temperature": 0.3,
+  "top_p": 0.9,
+  "top_k": 20,
+  "seed": 7,
+  "stream": false
+ },
+ "stream": false,
+ "chat_answer": "{\"id\":\"chatcmpl-2e72550caf7e0008eb\",\"object\":\"chat.completion\",\"created\":1794454045,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"What is the weather in Paris?\",\"refusal\":null,\"annotations\":[]},\"finish_reason\":\"stop\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":8,\"total_tokens\":48,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0}}}",
+ "native_answer": "{\"id\":\"msg_2e7250330fb30008ea\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"DeepSeek-V4.1-Flash\",\"content\":[{\"type\":\"text\",\"text\":\"What is the weather in Paris?\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":40,\"output_tokens\":8,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens_details\":{\"reasoning_tokens\":0,\"thinking_tokens\":0}}}",
+ "tags": [],
+ "dump_equal": true
+}
