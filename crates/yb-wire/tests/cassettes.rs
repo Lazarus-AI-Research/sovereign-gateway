@@ -125,6 +125,24 @@ fn encode_stream(format: &str, events: &[StreamEvent], include_usage: bool) -> V
 // --------------------------------------------------------------------------
 
 /// Parse an SSE stream into `(event_name, data_json)` pairs, skipping `[DONE]`.
+/// Wall-clock times the encoders stamp (Responses `created_at` /
+/// `completed_at`) differ on every run; compare them as 0.
+fn zero_timestamps(v: &mut Value) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m.iter_mut() {
+                if (k == "created_at" || k == "completed_at") && x.is_number() {
+                    *x = Value::from(0);
+                } else {
+                    zero_timestamps(x);
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(zero_timestamps),
+        _ => {}
+    }
+}
+
 fn parse_sse(s: &str) -> Vec<(Option<String>, Value)> {
     let mut out = Vec::new();
     let mut event_name: Option<String> = None;
@@ -141,8 +159,9 @@ fn parse_sse(s: &str) -> Vec<(Option<String>, Value)> {
             if data == "[DONE]" {
                 continue;
             }
-            let v: Value = serde_json::from_str(data)
+            let mut v: Value = serde_json::from_str(data)
                 .unwrap_or_else(|e| panic!("bad SSE data line {data:?}: {e}"));
+            zero_timestamps(&mut v);
             out.push((event_name.clone(), v));
         }
     }
