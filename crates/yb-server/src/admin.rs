@@ -938,9 +938,28 @@ struct ProviderBody {
     /// through this API — only the flag selecting it can.
     #[serde(default)]
     extra: yb_core::Extra,
+    /// The chat shapes the endpoint serves natively,
+    /// `[{"format": "anthropic", "api_base": "…"}, {"format": "openai_chat"}]`.
+    /// Omit to leave them as they are.
+    #[serde(default)]
+    shapes: Option<Vec<yb_core::ProviderShape>>,
 }
 
 /// Render a provider without ever disclosing its credential.
+/// A shape is listed at most once: two entries could only disagree on its base.
+fn validate_shapes(shapes: Option<&[yb_core::ProviderShape]>) -> std::result::Result<(), Response> {
+    let shapes = shapes.unwrap_or_default();
+    for (i, s) in shapes.iter().enumerate() {
+        if shapes[..i].iter().any(|t| t.format == s.format) {
+            return Err(error_response(&Error::BadRequest(format!(
+                "shape {} is listed twice",
+                s.format.as_str()
+            ))));
+        }
+    }
+    Ok(())
+}
+
 fn provider_json(p: &yb_core::ProviderRecord) -> serde_json::Value {
     json!({
         "id": p.id,
@@ -950,6 +969,7 @@ fn provider_json(p: &yb_core::ProviderRecord) -> serde_json::Value {
         // know whether one is set.
         "has_api_key": p.api_key.as_deref().is_some_and(|k| !k.is_empty()),
         "extra": p.extra,
+        "shapes": p.shapes,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
     })
@@ -993,6 +1013,9 @@ async fn create_provider(
         Ok(n) => n,
         Err(r) => return r,
     };
+    if let Err(r) = validate_shapes(body.shapes.as_deref()) {
+        return r;
+    }
     if let Ok(Some(_)) = state.store.get_provider_by_name(&name).await {
         return error_response(&Error::Conflict(format!(
             "provider \"{name}\" already exists"
@@ -1015,6 +1038,13 @@ async fn create_provider(
     {
         Ok(p) => p,
         Err(e) => return error_response(&e),
+    };
+    let updated = match &body.shapes {
+        Some(shapes) => match state.store.set_provider_shapes(&updated.id, shapes).await {
+            Ok(p) => p,
+            Err(e) => return error_response(&e),
+        },
+        None => updated,
     };
     if let Err(e) = state.reload_models().await {
         return error_response(&e);
@@ -1042,6 +1072,9 @@ async fn update_provider(
     if let Ok(None) = state.store.get_provider(&id).await {
         return error_response(&Error::NotFound("provider".into()));
     }
+    if let Err(r) = validate_shapes(body.shapes.as_deref()) {
+        return r;
+    }
     let updated = match state
         .store
         .update_provider(
@@ -1055,6 +1088,13 @@ async fn update_provider(
     {
         Ok(p) => p,
         Err(e) => return error_response(&e),
+    };
+    let updated = match &body.shapes {
+        Some(shapes) => match state.store.set_provider_shapes(&updated.id, shapes).await {
+            Ok(p) => p,
+            Err(e) => return error_response(&e),
+        },
+        None => updated,
     };
     if let Err(e) = state.reload_models().await {
         return error_response(&e);

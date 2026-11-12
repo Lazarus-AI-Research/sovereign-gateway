@@ -1662,6 +1662,51 @@ async fn deployments_read_their_providers_endpoint() {
     assert_eq!(deps[0].api_key.as_deref(), Some("sk-shared"));
 }
 
+/// The shapes a provider serves natively are set through the API, read back,
+/// joined onto its deployments, and left alone by an edit that omits them.
+#[tokio::test]
+async fn provider_shapes_are_edited_through_the_api() {
+    let (state, _token) = setup().await;
+    let store = state.store.clone();
+    seed_dep(store.as_ref(), "glm", "qe").await;
+    let id = provider_id(store.as_ref(), "qe").await;
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state);
+
+    let shapes = json!([{"format": "anthropic"},
+                        {"format": "openai_responses", "api_base": "https://qe.example/r/v1"}]);
+    let (status, body) = put_json(
+        &app,
+        &format!("/admin/v1/providers/{id}"),
+        &cookie,
+        json!({ "name": "qe", "api_base": "https://qe.example/v1", "shapes": shapes }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["shapes"], shapes);
+    let deps = store.list_deployments().await.unwrap();
+    assert_eq!(deps[0].shapes.len(), 2);
+
+    let (status, body) = put_json(
+        &app,
+        &format!("/admin/v1/providers/{id}"),
+        &cookie,
+        json!({ "name": "qe", "api_base": "https://qe.example/v1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["shapes"], shapes, "omitting shapes keeps them");
+
+    let (status, _) = put_json(
+        &app,
+        &format!("/admin/v1/providers/{id}"),
+        &cookie,
+        json!({ "name": "qe", "shapes": [{"format": "anthropic"}, {"format": "anthropic"}] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a shape is listed once");
+}
+
 #[tokio::test]
 async fn rename_rejects_bad_input_and_non_admins() {
     let (state, _token) = setup().await;

@@ -528,10 +528,24 @@ function HealthDot({ rec, busy }: { rec: any; busy?: boolean }) {
   );
 }
 
+/** The chat API shapes a provider can serve natively. A request in a shape
+ *  the provider serves is relayed unchanged; any other is translated to the
+ *  deployment's upstream format. */
+const SHAPES: [string, string][] = [
+  ['anthropic', 'Anthropic Messages'],
+  ['openai_chat', 'OpenAI Chat Completions'],
+  ['openai_responses', 'OpenAI Responses'],
+  ['gemini', 'Gemini generateContent'],
+];
+
+/** `[{format, api_base?}]` as the form holds it: format → base ('' = the provider's). */
+const shapeForm = (shapes: any[] | undefined): Record<string, string> =>
+  Object.fromEntries((shapes || []).map((s) => [s.format, s.api_base || '']));
+
 function Providers({ admin, data, error, reload }: {
   admin: boolean; data: any[] | null; error: string; reload: () => void;
 }) {
-  const blank = { name: '', api_base: '', api_key: '', extra: { cloudflare_access: false } };
+  const blank = { name: '', api_base: '', api_key: '', extra: { cloudflare_access: false }, shapes: {} };
   const [f, setF] = useState<any>(blank);
   const [editing, setEditing] = useState<string>('');
   const [msg, setMsg] = useState('');
@@ -539,7 +553,7 @@ function Providers({ admin, data, error, reload }: {
 
   const edit = (p: any) => {
     // api_key is intentionally blank: it is never sent to the browser.
-    setF({ name: p.name, api_base: p.api_base || '', api_key: '', extra: p.extra || {} });
+    setF({ name: p.name, api_base: p.api_base || '', api_key: '', extra: p.extra || {}, shapes: shapeForm(p.shapes) });
     setEditing(p.id); setMsg(''); setOpen(true);
   };
   const add = () => { setF(blank); setEditing(''); setMsg(''); setOpen(true); };
@@ -548,6 +562,10 @@ function Providers({ admin, data, error, reload }: {
     const body: any = { name: f.name.trim(), extra: f.extra };
     body.api_base = f.api_base.trim() || null;
     if (f.api_key.trim()) body.api_key = f.api_key.trim();
+    body.shapes = SHAPES.filter(([k]) => k in f.shapes).map(([k]) => {
+      const base = (f.shapes[k] || '').trim();
+      return base ? { format: k, api_base: base } : { format: k };
+    });
     try {
       if (editing) await api('/providers/' + encodeURIComponent(editing), { method: 'PUT', body });
       else await api('/providers', { method: 'POST', body });
@@ -572,11 +590,19 @@ function Providers({ admin, data, error, reload }: {
           : (
             <div class="tablewrap">
               <table style="margin-top:10px">
-                <thead><tr><th>name</th><th>api_base</th><th>credential</th><th>edge</th><th>deployments</th>{admin && <th></th>}</tr></thead>
+                <thead><tr><th>name</th><th>api_base</th><th>serves</th><th>credential</th><th>edge</th><th>deployments</th>{admin && <th></th>}</tr></thead>
                 <tbody>{data.map((p) => (
                   <tr key={p.id}>
                     <td class="nowrap">{p.name}</td>
                     <td class="mono mut">{p.api_base || <span class="mut">format default</span>}</td>
+                    <td>
+                      <div class="pills">
+                        {(p.shapes || []).map((sh: any) => (
+                          <span class="pill mono" title={sh.api_base || 'at the provider api_base'}>{sh.format}</span>))}
+                        {!(p.shapes || []).length
+                          && <span class="mut" title="Each deployment's own upstream format">deployment format</span>}
+                      </div>
+                    </td>
                     <td>{p.has_api_key
                           ? <span class="pill">key set</span>
                           : <span class="mut">none</span>}</td>
@@ -621,6 +647,27 @@ function Providers({ admin, data, error, reload }: {
             <span>Behind Cloudflare Access
               <span class="mut"> — send the service token from <span class="mono">[upstream.cloudflare_access]</span></span></span>
           </label>
+          <div style="margin-top:12px">
+            <div class="mut">Serves natively <span class="mut">— requests in these shapes are relayed unchanged;
+              others are translated to the deployment's format. None ticked: each deployment's own format.</span></div>
+            {SHAPES.map(([k, label]) => (
+              <div class="row" style="margin-top:6px;gap:8px;flex-wrap:nowrap">
+                <label class="row" style="gap:6px;cursor:pointer;flex:none;min-width:220px;flex-wrap:nowrap">
+                  <input type="checkbox" checked={k in f.shapes}
+                         onChange={(e: any) => setF((s: any) => {
+                           const shapes = { ...s.shapes };
+                           if (e.target.checked) shapes[k] = shapes[k] || ''; else delete shapes[k];
+                           return { ...s, shapes };
+                         })} />
+                  <span>{label} <span class="mono mut">{k}</span></span>
+                </label>
+                {k in f.shapes && (
+                  <input style="flex:1" placeholder="api_base for this shape (blank = provider api_base)"
+                         value={f.shapes[k]}
+                         onInput={(e: any) => setF((s: any) => ({ ...s, shapes: { ...s.shapes, [k]: e.target.value } }))} />)}
+              </div>
+            ))}
+          </div>
           <div class="row" style="margin-top:12px">
             <button class="btn" onClick={save}>{editing ? 'Save provider' : 'Add provider'}</button>
             {msg && <span class="err">{msg}</span>}

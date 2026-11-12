@@ -469,8 +469,8 @@ pub struct ProviderConfig {
     /// The chat API shapes this endpoint serves natively, e.g.
     /// `shapes = [{ format = "anthropic" }, { format = "openai_chat" }]`, each
     /// with an optional `api_base` of its own. Empty: only each deployment's
-    /// own `upstream_format`.
-    pub shapes: Vec<crate::routing::ProviderShape>,
+    /// own `upstream_format`. Absent: an import leaves the stored shapes alone.
+    pub shapes: Option<Vec<crate::routing::ProviderShape>>,
 }
 
 /// and the import file is just a convenient bulk loader.
