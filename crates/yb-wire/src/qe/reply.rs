@@ -301,6 +301,16 @@ impl ChatEvents {
             self.emit(Ev::Logprobs(lp.clone()), &mut out);
         }
         if let Some(f) = ch.get("finish_reason").and_then(|f| f.as_str()) {
+            // A call the output cap cut off is dropped by QE (it never ends);
+            // a complete call's arguments are whole JSON.
+            if f == "length"
+                && self
+                    .call
+                    .as_ref()
+                    .is_some_and(|(_, _, a)| serde_json::from_str::<Value>(a).is_err())
+            {
+                self.call = None;
+            }
             self.close_call(&mut out);
             self.collected.length = f == "length";
             self.finished = true;
