@@ -248,6 +248,9 @@ pub struct Gateway {
     /// applied to deployments whose `extra` sets `cloudflare_access`.
     /// File-owned and immutable for the process lifetime.
     pub(crate) cf_access: Option<Arc<CloudflareAccessConfig>>,
+    /// Responses translated for a QE provider, kept for
+    /// `previous_response_id` and the `/v1/responses/{id}` endpoints.
+    pub(crate) responses: Arc<crate::qe::ResponseStore>,
 }
 
 impl Gateway {
@@ -277,6 +280,7 @@ impl Gateway {
             logger,
             observer,
             cf_access: None,
+            responses: Arc::new(crate::qe::ResponseStore::default()),
         }
     }
 
@@ -466,7 +470,41 @@ impl Gateway {
                 && surface == WireFormat::OpenaiChat
                 && stream_requested
                 && !chat.include_usage;
-            let emitted = if relay {
+            // A QE provider's Chat surface is QE's own request form: a shape
+            // it does not serve natively is translated with QE's rules, not
+            // through the IR (see crate::qe).
+            let qe_reply = if !relay
+                && upstream_fmt == WireFormat::OpenaiChat
+                && crate::qe::is_qe(&deployment.extra)
+                && matches!(surface, WireFormat::Anthropic | WireFormat::OpenaiResponses)
+            {
+                match crate::qe::translate(
+                    surface,
+                    body,
+                    &deployment.upstream_model,
+                    &deployment.extra,
+                    &self.responses,
+                    ctx.user_id.as_deref(),
+                ) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        guard.fail(e.http_status()).await;
+                        return Err(e);
+                    }
+                }
+            } else {
+                None
+            };
+            let up_stream = match &qe_reply {
+                Some((_, stream, _)) => *stream,
+                None => up_stream,
+            };
+            let emitted = if let Some((bytes, _, _)) = &qe_reply {
+                Ok((
+                    bytes.clone(),
+                    vec![("content-type".to_string(), "application/json".to_string())],
+                ))
+            } else if relay {
                 crate::relay::relay_body(surface, body, &deployment.upstream_model, drop_usage).map(
                     |b| {
                         (
@@ -581,6 +619,18 @@ impl Gateway {
                 chat.prompt_cache_retention.clone(),
             );
             let upstream_fmt = wire_fmt;
+            if let Some((_, client_stream, reply)) = qe_reply {
+                return self
+                    .qe_answer(
+                        resp,
+                        client_stream,
+                        reply,
+                        &deployment.upstream_model,
+                        rctx,
+                        status,
+                    )
+                    .await;
+            }
             return match (stream_requested, resp.body) {
                 (false, ResponseBody::Full(bytes)) if relay => {
                     relay_full(bytes, surface, resp.headers, rctx, status).await
@@ -767,6 +817,112 @@ impl Gateway {
     }
 }
 
+impl Gateway {
+    /// QE's Chat answer, written in the client's shape (see [`crate::qe`]).
+    async fn qe_answer(
+        &self,
+        resp: yb_providers::UpstreamResponse,
+        client_stream: bool,
+        reply: crate::qe::Reply,
+        model: &str,
+        rctx: RecordCtx,
+        status: u16,
+    ) -> Result<GatewayResponse> {
+        let background = matches!(
+            &reply,
+            crate::qe::Reply::Responses {
+                background: true,
+                ..
+            }
+        );
+        if background && !client_stream {
+            let (up, upstream_stream): (ByteStream, bool) = match resp.body {
+                ResponseBody::Stream(s) => (s, true),
+                ResponseBody::Full(b) => (
+                    Box::pin(stream::once(async move { Ok(Bytes::from(b)) })),
+                    false,
+                ),
+            };
+            let body = crate::qe::background(
+                up,
+                upstream_stream,
+                reply,
+                model.to_string(),
+                self.responses.clone(),
+                rctx,
+                status,
+            );
+            return Ok(GatewayResponse::Full {
+                status,
+                headers: json_headers(WireFormat::OpenaiResponses),
+                body,
+            });
+        }
+        match resp.body {
+            ResponseBody::Stream(up) if client_stream => Ok(GatewayResponse::Stream {
+                status,
+                headers: sse_headers(),
+                stream: crate::qe::stream(
+                    up,
+                    reply,
+                    model.to_string(),
+                    self.responses.clone(),
+                    rctx,
+                    status,
+                ),
+            }),
+            ResponseBody::Full(bytes) if !client_stream => {
+                let (status, body) =
+                    crate::qe::full(bytes, reply, model, &self.responses, rctx, status).await?;
+                Ok(GatewayResponse::Full {
+                    status,
+                    headers: json_headers(WireFormat::OpenaiResponses),
+                    body,
+                })
+            }
+            _ => Err(Error::Upstream {
+                provider: "qe".into(),
+                status: 502,
+                message: "QE answered in the other stream mode than asked".into(),
+            }),
+        }
+    }
+
+    /// `GET /v1/responses/{id}`: a response translated for a QE provider.
+    pub fn get_response(&self, id: &str, ctx: &RequestCtx) -> Result<serde_json::Value> {
+        self.responses
+            .get(id, ctx.user_id.as_deref())
+            .ok_or_else(|| Error::NotFound(format!("No response found with id '{id}'.")))
+    }
+
+    /// `DELETE /v1/responses/{id}`.
+    pub fn delete_response(&self, id: &str, ctx: &RequestCtx) -> Result<serde_json::Value> {
+        if self.responses.delete(id, ctx.user_id.as_deref()) {
+            Ok(serde_json::json!({"id": id, "object": "response", "deleted": true}))
+        } else {
+            Err(Error::NotFound(format!(
+                "No response found with id '{id}'."
+            )))
+        }
+    }
+
+    /// `POST /v1/responses/{id}/cancel`.
+    pub fn cancel_response(&self, id: &str, ctx: &RequestCtx) -> Result<serde_json::Value> {
+        self.responses.cancel(id, ctx.user_id.as_deref())
+    }
+
+    /// `GET /v1/responses/{id}/input_items`.
+    pub fn response_input_items(
+        &self,
+        id: &str,
+        query: &std::collections::HashMap<String, String>,
+        ctx: &RequestCtx,
+    ) -> Result<serde_json::Value> {
+        self.responses
+            .input_items(id, ctx.user_id.as_deref(), query)
+    }
+}
+
 /// A crude input-size estimate (≈ 4 chars/token over all message text) used only
 /// as routing signal; never billed.
 fn estimate_tokens(chat: &ChatRequest) -> u32 {
@@ -911,6 +1067,11 @@ fn speed(
 }
 
 impl RecordCtx {
+    /// Notes that the turn's first token arrived (if it is the first).
+    pub(crate) fn first_token(&self) {
+        self.first_token.get_or_init(Instant::now);
+    }
+
     /// Notes the turn's first token among events read from the upstream.
     pub(crate) fn saw(&self, events: &[StreamEvent]) {
         if events.iter().any(is_output) {
