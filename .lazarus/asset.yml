@@ -1,0 +1,8 @@
+schema: v1
+component: gateway
+product: sovereign
+type: svc
+owner:
+  jira_project: LP
+  team: team-applied-ai
+deployments: []
