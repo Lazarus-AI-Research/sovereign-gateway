@@ -652,10 +652,19 @@ pub struct EmitState {
 /// Encode IR events into Anthropic-native client SSE bytes.
 pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
     let mut out = String::new();
-    for ev in events {
+    for (i, ev) in events.iter().enumerate() {
         match ev {
             StreamEvent::MessageStart { model } => {
                 state.model = model.clone();
+                // An Anthropic upstream's message_start carries the input
+                // usage, decoded as UsageDeltas right after this event: fold
+                // them in first so the client's message_start reports it too.
+                for e in &events[i + 1..] {
+                    let StreamEvent::UsageDelta { usage } = e else {
+                        break;
+                    };
+                    state.usage.merge(usage);
+                }
                 emit_message_start(&mut out, state);
             }
             StreamEvent::TextDelta { text } => {
@@ -705,17 +714,12 @@ pub fn encode_sse(events: &[StreamEvent], state: &mut EmitState) -> Vec<u8> {
             StreamEvent::Done { stop_reason } => {
                 ensure_started(&mut out, state);
                 close_open(&mut out, state);
-                let mut usage = json!({"output_tokens": state.usage.output_tokens});
-                if state.usage.reasoning_tokens > 0 {
-                    usage["output_tokens_details"] =
-                        json!({"thinking_tokens": state.usage.reasoning_tokens});
-                }
                 write_event(
                     &mut out,
                     "message_delta",
                     &json!({"type": "message_delta",
                             "delta": {"stop_reason": stop_reason_str(stop_reason), "stop_sequence": Value::Null},
-                            "usage": usage}),
+                            "usage": emit_usage(&state.usage)}),
                 );
                 write_event(&mut out, "message_stop", &json!({"type": "message_stop"}));
             }
@@ -737,7 +741,8 @@ fn emit_message_start(out: &mut String, state: &mut EmitState) {
             "content": [],
             "stop_reason": Value::Null,
             "stop_sequence": Value::Null,
-            "usage": {"input_tokens": 0, "output_tokens": 0}
+            // Input usage known so far; output is reported on message_delta.
+            "usage": emit_usage(&Usage { output_tokens: 0, ..state.usage })
         }}),
     );
 }
@@ -881,5 +886,59 @@ mod extension_field_tests {
                 "Responses body must not carry Anthropic-only `{k}`"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_usage_tests {
+    use super::{decode_sse, encode_sse, EmitState, SseState};
+    use serde_json::Value;
+
+    /// Relays an Anthropic stream line by line, as the gateway does, and
+    /// returns the client's events by type.
+    fn relay(lines: &[&str]) -> Vec<Value> {
+        let (mut dec, mut enc, mut out) = (SseState::default(), EmitState::default(), Vec::new());
+        for line in lines {
+            out.extend(encode_sse(&decode_sse(line, &mut dec), &mut enc));
+        }
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str(d).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn input_and_cache_usage_reach_the_client_stream() {
+        let events = relay(&[
+            r#"data: {"type":"message_start","message":{"model":"m","usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":31,"cache_creation_input_tokens":4}}}"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":2,"output_tokens":42,"cache_read_input_tokens":31,"cache_creation_input_tokens":4}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]);
+        let start = &events[0]["message"]["usage"];
+        assert_eq!(
+            (
+                start["input_tokens"].as_u64(),
+                start["cache_read_input_tokens"].as_u64(),
+                start["cache_creation_input_tokens"].as_u64(),
+                start["output_tokens"].as_u64()
+            ),
+            (Some(2), Some(31), Some(4), Some(0))
+        );
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(
+            (
+                delta["usage"]["input_tokens"].as_u64(),
+                delta["usage"]["cache_read_input_tokens"].as_u64(),
+                delta["usage"]["output_tokens"].as_u64()
+            ),
+            (Some(2), Some(31), Some(42))
+        );
     }
 }
