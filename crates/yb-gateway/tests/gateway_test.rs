@@ -1559,3 +1559,150 @@ async fn a_deployment_serving_the_clients_shape_is_tried_first() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// QE dialect: a shape the provider does not serve is translated with QE's
+// rules, and Responses state lives in the gateway.
+// ---------------------------------------------------------------------------
+
+fn qe_router() -> DeploymentRouter {
+    let mut extra = yb_core::Extra::default();
+    extra.rest.insert("dialect".into(), json!("qe"));
+    let rec = yb_core::DeploymentRecord {
+        id: "d1".into(),
+        model_id: "m1".into(),
+        model_name: "glm".into(),
+        provider_id: "p1".into(),
+        provider: "qe".into(),
+        upstream_model: "glm-up".into(),
+        api_base: Some("http://qe.test/v1".into()),
+        api_key: None,
+        upstream_format: WireFormat::OpenaiChat.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+        extra,
+        shapes: Vec::new(),
+        created_at: now(),
+        updated_at: now(),
+        deleted_at: None,
+    };
+    DeploymentRouter::from_deployments(&[rec], Strategy::Simple, HashMap::new(), HashMap::new())
+}
+
+fn qe_chat_answer(text: &str, calls: Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({"id": "chatcmpl-1", "object": "chat.completion", "model": "glm-up",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text, "tool_calls": calls},
+                     "finish_reason": if calls.is_null() { "stop" } else { "tool_calls" }}],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 4, "total_tokens": 24,
+                  "prompt_tokens_details": {"cached_tokens": 8, "cache_write_tokens": 2},
+                  "completion_tokens_details": {"reasoning_tokens": 0}}}))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_qe_provider_gets_the_qe_chat_spelling_of_an_anthropic_request() {
+    let mock = MockClient::json(qe_chat_answer("hi", Value::Null));
+    let store = Arc::new(RecordingStore::default());
+    let gateway = Gateway::new(
+        Arc::new(mock.clone()),
+        Arc::new(qe_router()),
+        store.clone(),
+        Arc::new(NullLogger),
+    );
+    let body = json!({"model": "glm", "max_tokens": 64, "seed": 1,
+        "thinking": {"type": "enabled", "budget_tokens": 500}, "output_config": {"effort": "max"},
+        "messages": [{"role": "user", "content": "x"}]});
+    let resp = gateway
+        .handle(
+            WireFormat::Anthropic,
+            &serde_json::to_vec(&body).unwrap(),
+            RequestCtx::new(),
+        )
+        .await
+        .unwrap();
+    let out: Value = serde_json::from_slice(&collect(resp).await).unwrap();
+    let sent: Value = serde_json::from_slice(&mock.last_request().unwrap().body).unwrap();
+    assert_eq!(sent["reasoning_effort"], "xhigh");
+    assert_eq!(sent["thinking_token_budget"], 500);
+    assert_eq!(sent["model"], "glm-up");
+    assert!(
+        !mock.last_request().unwrap().stream,
+        "the client's stream choice is kept"
+    );
+    assert_eq!(out["content"][0], json!({"type": "text", "text": "hi"}));
+    assert_eq!(out["usage"]["input_tokens"], 10, "uncached remainder");
+    assert_eq!(store.telemetry()[0].input_tokens, 20);
+}
+
+#[tokio::test]
+async fn previous_response_id_continues_a_translated_conversation() {
+    let mock = MockClient::json(qe_chat_answer(
+        "",
+        json!([{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{\"a\":1}"}}]),
+    ));
+    let gateway = Gateway::new(
+        Arc::new(mock.clone()),
+        Arc::new(qe_router()),
+        Arc::new(RecordingStore::default()),
+        Arc::new(NullLogger),
+    );
+    let mut ctx = RequestCtx::new();
+    ctx.user_id = Some("u1".into());
+    let tools = json!([{"type": "function", "name": "f", "parameters": {"type": "object"}}]);
+    let first = json!({"model": "glm", "instructions": "sys", "input": "go", "tools": tools});
+    let r1: Value = serde_json::from_slice(
+        &collect(
+            gateway
+                .handle(
+                    WireFormat::OpenaiResponses,
+                    &serde_json::to_vec(&first).unwrap(),
+                    ctx.clone(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await,
+    )
+    .unwrap();
+    let id = r1["id"].as_str().unwrap().to_string();
+    let call_id = r1["output"][0]["call_id"].as_str().unwrap().to_string();
+    assert_eq!(call_id, format!("call_{id}_0"));
+    let second = json!({"model": "glm", "instructions": "sys", "previous_response_id": id, "tools": tools,
+        "input": [{"type": "function_call_output", "call_id": call_id, "output": "ok"}]});
+    gateway
+        .handle(
+            WireFormat::OpenaiResponses,
+            &serde_json::to_vec(&second).unwrap(),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+    let sent: Value = serde_json::from_slice(&mock.last_request().unwrap().body).unwrap();
+    let roles: Vec<&str> = sent["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        ["system", "user", "assistant", "tool"],
+        "instructions, then the stored turn, then the new input"
+    );
+    assert_eq!(sent["messages"][2]["tool_calls"][0]["id"], call_id);
+    // The stored response is the owner's alone.
+    let got = gateway
+        .response_op(&id, yb_gateway::service::ResponseOp::Get, &ctx)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&collect(got).await).unwrap();
+    assert_eq!(v["id"], id);
+    let mut other = RequestCtx::new();
+    other.user_id = Some("u2".into());
+    assert!(gateway
+        .response_op(&id, yb_gateway::service::ResponseOp::Get, &other)
+        .await
+        .is_err());
+}

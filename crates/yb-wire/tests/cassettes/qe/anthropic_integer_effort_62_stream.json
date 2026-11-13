@@ -1,0 +1,37 @@
+{
+ "name": "anthropic integer effort 62 stream",
+ "shape": "anthropic",
+ "inbound_body": {
+  "seed": 7,
+  "max_tokens": 2048,
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "stream": true,
+  "reasoning_effort": 62,
+  "model": "DeepSeek-V4.1-Flash"
+ },
+ "expected_chat_body": {
+  "model": "DeepSeek-V4.1-Flash",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "max_tokens": 2048,
+  "chat_template_kwargs": {
+   "reasoning_effort": 62
+  },
+  "seed": 7,
+  "stream": true
+ },
+ "stream": true,
+ "chat_answer": "data: {\"id\":\"chatcmpl-2e766e8014a60009f7\",\"object\":\"chat.completion.chunk\",\"created\":1794454062,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-2e766e8014a60009f7\",\"object\":\"chat.completion.chunk\",\"created\":1794454062,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"What\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-2e766e8014a60009f7\",\"object\":\"chat.completion.chunk\",\"created\":1794454062,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" is the weather in Paris?\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-2e766e8014a60009f7\",\"object\":\"chat.completion.chunk\",\"created\":1794454062,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"chatcmpl-2e766e8014a60009f7\",\"object\":\"chat.completion.chunk\",\"created\":1794454062,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[],\"usage\":{\"prompt_tokens\":37,\"completion_tokens\":8,\"total_tokens\":45,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0}}}\n\ndata: [DONE]\n\n",
+ "native_answer": "event: message_start\ndata: {\"message\":{\"id\":\"msg_2e766962c78d0009f6\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"DeepSeek-V4.1-Flash\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":37,\"output_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens_details\":{\"reasoning_tokens\":0,\"thinking_tokens\":0}}},\"type\":\"message_start\"}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\nevent: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"},\"type\":\"content_block_start\"}\n\nevent: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"What is the weather in Paris?\"},\"type\":\"content_block_delta\"}\n\nevent: content_block_stop\ndata: {\"index\":0,\"type\":\"content_block_stop\"}\n\nevent: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":37,\"output_tokens\":8,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens_details\":{\"reasoning_tokens\":0,\"thinking_tokens\":0}},\"type\":\"message_delta\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+ "tags": [],
+ "dump_equal": true
+}

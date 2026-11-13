@@ -65,6 +65,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/chat/completions", post(openai_chat))
         .route("/v1/responses", post(openai_responses))
+        .route(
+            "/v1/responses/:id",
+            get(response_get).delete(response_delete),
+        )
+        .route("/v1/responses/:id/cancel", post(response_cancel))
+        .route("/v1/responses/:id/input_items", get(response_input_items))
         .route("/v1/embeddings", post(openai_embeddings))
         .route("/v1/multimodalembeddings", post(voyage_embeddings))
         .route("/v2/embed", post(cohere_embed))
@@ -84,6 +90,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/anthropic/v1/models", get(models_anthropic))
         .route("/openai/v1/chat/completions", post(openai_chat))
         .route("/openai/v1/responses", post(openai_responses))
+        .route(
+            "/openai/v1/responses/:id",
+            get(response_get).delete(response_delete),
+        )
+        .route("/openai/v1/responses/:id/cancel", post(response_cancel))
+        .route(
+            "/openai/v1/responses/:id/input_items",
+            get(response_input_items),
+        )
         .route("/openai/v1/embeddings", post(openai_embeddings))
         .route("/openai/v1/images/generations", post(openai_images))
         .route("/openai/v1/audio/speech", post(openai_speech))
@@ -461,6 +476,54 @@ async fn video_status(
     run_call(state, headers, Call::Video(id, VideoLookup::Status)).await
 }
 
+/// `GET /v1/responses/{id}` — a stored Responses answer.
+async fn response_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if q.get("stream").is_some_and(|v| v == "true") {
+        return error_response(&Error::BadRequest(
+            "stream: resuming a response stream is not supported (poll GET without stream)".into(),
+        ));
+    }
+    run_call(state, headers, Call::Response(id, ResponseLookup::Get)).await
+}
+
+/// `DELETE /v1/responses/{id}`.
+async fn response_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    run_call(state, headers, Call::Response(id, ResponseLookup::Delete)).await
+}
+
+/// `POST /v1/responses/{id}/cancel` — stop a background response.
+async fn response_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    run_call(state, headers, Call::Response(id, ResponseLookup::Cancel)).await
+}
+
+/// `GET /v1/responses/{id}/input_items`.
+async fn response_input_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    run_call(
+        state,
+        headers,
+        Call::Response(id, ResponseLookup::InputItems(q)),
+    )
+    .await
+}
+
 /// `GET /v1/videos/{id}/content` — the finished video's file.
 async fn video_content(
     State(state): State<AppState>,
@@ -572,6 +635,16 @@ async fn run_inference(
 enum Call {
     Turn(UpstreamFormat, Bytes),
     Video(String, VideoLookup),
+    /// A stored Responses answer (one the gateway translated for a QE
+    /// provider and keeps): read, deleted, cancelled, or its input listed.
+    Response(String, ResponseLookup),
+}
+
+enum ResponseLookup {
+    Get,
+    Delete,
+    Cancel,
+    InputItems(std::collections::HashMap<String, String>),
 }
 
 async fn run_call(state: AppState, headers: HeaderMap, call: Call) -> Response {
@@ -679,6 +752,15 @@ async fn run_call(state: AppState, headers: HeaderMap, call: Call) -> Response {
                 .await
         }
         Call::Video(id, lookup) => state.gateway.handle_video(&id, lookup, ctx).await,
+        Call::Response(id, lookup) => {
+            let op = match lookup {
+                ResponseLookup::Get => yb_gateway::service::ResponseOp::Get,
+                ResponseLookup::Delete => yb_gateway::service::ResponseOp::Delete,
+                ResponseLookup::Cancel => yb_gateway::service::ResponseOp::Cancel,
+                ResponseLookup::InputItems(q) => yb_gateway::service::ResponseOp::InputItems(q),
+            };
+            state.gateway.response_op(&id, op, &ctx).await
+        }
     };
     match result {
         Ok(resp) => gateway_response_into_axum(resp),
@@ -786,7 +868,8 @@ pub fn parse_traceparent(value: &str) -> Option<(String, String)> {
 /// a request belongs to (`space=…,conversation=…`), kept with its capture.
 /// Keys and values are short plain words; anything else is not a tag.
 pub fn parse_tags(value: &str) -> Option<String> {
-    let mut tags = serde_json::Map::new();
+    // Sorted, so one set of tags is always stored as one string.
+    let mut tags = std::collections::BTreeMap::new();
     for pair in value.split(',').filter(|pair| !pair.trim().is_empty()) {
         let (key, value) = pair.split_once('=')?;
         let (key, value) = (key.trim(), value.trim());
@@ -806,7 +889,7 @@ pub fn parse_tags(value: &str) -> Option<String> {
             serde_json::Value::String(value.to_string()),
         );
     }
-    (!tags.is_empty()).then(|| serde_json::Value::Object(tags).to_string())
+    (!tags.is_empty()).then(|| serde_json::json!(tags).to_string())
 }
 
 /// Read a header as an owned `String`, if present and valid UTF-8.

@@ -1,0 +1,33 @@
+{
+ "name": "anthropic max_tokens cut stream",
+ "shape": "anthropic",
+ "inbound_body": {
+  "seed": 7,
+  "max_tokens": 3,
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "stream": true,
+  "model": "DeepSeek-V4.1-Flash"
+ },
+ "expected_chat_body": {
+  "model": "DeepSeek-V4.1-Flash",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "max_tokens": 3,
+  "seed": 7,
+  "stream": true
+ },
+ "stream": true,
+ "chat_answer": "data: {\"id\":\"chatcmpl-2e7763445be6000a34\",\"object\":\"chat.completion.chunk\",\"created\":1794454066,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-2e7763445be6000a34\",\"object\":\"chat.completion.chunk\",\"created\":1794454066,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"What\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-2e7763445be6000a34\",\"object\":\"chat.completion.chunk\",\"created\":1794454066,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" is\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-2e7763445be6000a34\",\"object\":\"chat.completion.chunk\",\"created\":1794454066,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: {\"id\":\"chatcmpl-2e7763445be6000a34\",\"object\":\"chat.completion.chunk\",\"created\":1794454066,\"model\":\"DeepSeek-V4.1-Flash\",\"system_fingerprint\":\"fp_stub_unknown\",\"service_tier\":\"default\",\"choices\":[],\"usage\":{\"prompt_tokens\":37,\"completion_tokens\":3,\"total_tokens\":40,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0}}}\n\ndata: [DONE]\n\n",
+ "native_answer": "event: message_start\ndata: {\"message\":{\"id\":\"msg_2e775ddd5b91000a33\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"DeepSeek-V4.1-Flash\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":37,\"output_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens_details\":{\"reasoning_tokens\":0,\"thinking_tokens\":0}}},\"type\":\"message_start\"}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\nevent: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"},\"type\":\"content_block_start\"}\n\nevent: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"What is\"},\"type\":\"content_block_delta\"}\n\nevent: content_block_stop\ndata: {\"index\":0,\"type\":\"content_block_stop\"}\n\nevent: message_delta\ndata: {\"delta\":{\"stop_reason\":\"max_tokens\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":37,\"output_tokens\":3,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens_details\":{\"reasoning_tokens\":0,\"thinking_tokens\":0}},\"type\":\"message_delta\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+ "tags": [],
+ "dump_equal": true
+}

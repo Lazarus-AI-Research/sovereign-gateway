@@ -100,6 +100,17 @@ shapes = [
   # { format = "gemini", api_base = "https://qe.example.com/gemini/v1beta" },
 ]
 
+# A QE server can also be declared with `dialect = "qe"` in its `extra`: a
+# request in a shape the provider does not serve natively is then translated
+# with QE's own rules to QE's Chat Completions (instead of through the generic
+# IR), which QE prepares exactly as its native endpoint for that shape would
+# (same prompt tokens, effort, thinking budget, grammar, tools, stops, …), and
+# QE's Chat answer is written back as QE's own encoder for the client's shape
+# writes it. `qe_sampling` is QE's model default temperature / top_p, which a
+# Responses object echoes when the request does not set them:
+#
+#   extra = { dialect = "qe", qe_sampling = { temperature = 1.0, top_p = 0.95 } }
+
 [[model]]
 model_name = "glm-5"
   [[model.deployments]]
