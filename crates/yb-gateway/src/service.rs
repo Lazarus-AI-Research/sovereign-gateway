@@ -449,7 +449,23 @@ impl Gateway {
                 force_reasoning_effort: None,
                 stream: true,
             };
-            let (up_body, mut headers) = match wire::emit_request(upstream_fmt, &chat, &opts) {
+            // A Responses-to-Responses route should not strip request fields
+            // merely because the cross-provider IR has not modeled them yet.
+            // Only the routed model id and the gateway's streaming transport
+            // choice differ from the client's request.
+            let emitted = if surface == WireFormat::OpenaiResponses
+                && upstream_fmt == WireFormat::OpenaiResponses
+            {
+                yb_wire::openai_responses::emit_same_shape_request(
+                    body,
+                    &deployment.upstream_model,
+                    true,
+                )
+                .map_err(wire::wire_err)
+            } else {
+                wire::emit_request(upstream_fmt, &chat, &opts)
+            };
+            let (up_body, mut headers) = match emitted {
                 Ok(v) => v,
                 Err(e) => {
                     guard.fail(e.http_status()).await;
