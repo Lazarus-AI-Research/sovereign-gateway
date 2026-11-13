@@ -1,0 +1,42 @@
+syntax = "proto3";
+package spire.api.server.agent.v1;
+
+import "types.proto";
+
+service Agent {
+  rpc AttestAgent(stream AttestAgentRequest) returns (stream AttestAgentResponse);
+  rpc RenewAgent(RenewAgentRequest) returns (RenewAgentResponse);
+  rpc PostStatus(PostStatusRequest) returns (PostStatusResponse);
+}
+
+message AgentX509SVIDParams { bytes csr = 1; }
+
+message AttestAgentRequest {
+  message Params {
+    spire.api.types.AttestationData data = 1;
+    AgentX509SVIDParams params = 2;
+  }
+  oneof step {
+    Params params = 1;
+    bytes challenge_response = 2;
+  }
+}
+
+message AttestAgentResponse {
+  message Result {
+    spire.api.types.X509SVID svid = 1;
+    bool reattestable = 2;
+  }
+  oneof step {
+    Result result = 1;
+    bytes challenge = 2;
+  }
+}
+
+message RenewAgentRequest { AgentX509SVIDParams params = 1; }
+message RenewAgentResponse { spire.api.types.X509SVID svid = 1; }
+message PostStatusRequest {
+  uint64 current_bundle_serial = 1;
+  string agent_version = 2;
+}
+message PostStatusResponse {}

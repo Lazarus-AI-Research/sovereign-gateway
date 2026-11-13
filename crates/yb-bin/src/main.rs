@@ -452,21 +452,44 @@ async fn run_serve(
     let mode = cfg.server.deployment_mode;
 
     // Admin-console auth: the enabled login providers, plus an IdP client built
-    // once when `sso` is configured. A misconfigured/unavailable sso config
-    // yields `None` (the provider is simply not offered).
+    // once when `sso` is configured. The client speaks mTLS with the gateway's
+    // own SPIFFE identity, whose runtime is started here and lives until the
+    // listener has stopped. An incomplete `[auth.sso]` yields `None` (the
+    // provider is simply not offered); an identity file that cannot be loaded
+    // is a startup error, since the operator asked for sso and it cannot work.
     let auth = Arc::new(cfg.auth.clone());
-    let sso = auth
-        .sso
-        .as_ref()
-        .filter(|_| auth.has(yb_core::config::AuthProvider::Sso))
-        .and_then(yb_server::sso::SsoClient::from_config)
-        .map(Arc::new);
-    if auth.has(yb_core::config::AuthProvider::Sso) {
-        tracing::info!(
-            configured = sso.is_some(),
-            "admin auth: sso provider enabled"
-        );
-    }
+    let sso_enabled = auth.has(yb_core::config::AuthProvider::Sso);
+    let (identity, sso) = match auth.sso.as_ref().filter(|_| sso_enabled) {
+        Some(sso_cfg) => match yb_server::sso::SsoClient::connect(sso_cfg).await? {
+            Some((identity, client)) => {
+                let status = identity.status();
+                tracing::info!(
+                    identity_config = %sso_cfg.identity_config,
+                    client_id = %sso_cfg.client_id,
+                    usable = status.usable,
+                    valid_until_unix = status.valid_until_unix,
+                    "admin auth: sso provider enabled (SPIFFE mTLS)"
+                );
+                (Some(Arc::new(identity)), Some(Arc::new(client)))
+            }
+            None => {
+                tracing::warn!(
+                    "admin auth: sso provider enabled but [auth.sso] lacks identity_config \
+                     or client_id; sso login will not be offered"
+                );
+                (None, None)
+            }
+        },
+        None => {
+            if sso_enabled {
+                tracing::warn!(
+                    "admin auth: sso provider enabled without an [auth.sso] table; \
+                     sso login will not be offered"
+                );
+            }
+            (None, None)
+        }
+    };
 
     let state = AppState {
         store,
@@ -479,6 +502,7 @@ async fn run_serve(
         mode,
         auth,
         sso,
+        identity: identity.clone(),
         budgets_enabled: cfg.features.budgets_enabled,
         ratelimit_enabled: cfg.features.ratelimit_enabled,
         request_log: logger.clone(),
@@ -489,8 +513,40 @@ async fn run_serve(
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&cfg.server.bind).await?;
     tracing::info!(addr = %cfg.server.bind, mode = ?mode, "gateway listening");
-    axum::serve(listener, app).await?;
+    // Serve until SIGINT/SIGTERM, then let in-flight requests finish before the
+    // identity runtime — which every outbound SSO connection depends on — is
+    // shut down. Shutting it down first would fail requests still draining.
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+    if let Some(identity) = identity {
+        identity.shutdown().await;
+    }
+    served?;
     Ok(())
+}
+
+/// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM — what systemd sends.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutdown signal received; draining");
 }
 
 // ---- config ----------------------------------------------------------------

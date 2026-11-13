@@ -12,6 +12,9 @@ members = [
     "crates/yb-server",
     "crates/yb-bin",
 ]
+# The vendored SPIFFE mTLS library is built as a path dependency of yb-server
+# but kept out of the workspace, so `cargo test`/`cargo fmt` here leave it alone.
+exclude = ["vendor/greater-spire"]
 
 [workspace.package]
 version = "0.1.0"
@@ -31,6 +34,8 @@ yb-redact = { path = "crates/yb-redact" }
 yb-otel = { path = "crates/yb-otel" }
 yb-gateway = { path = "crates/yb-gateway" }
 yb-server = { path = "crates/yb-server" }
+# SPIFFE mTLS (X.509-SVID) client for the lair SSO, vendored (pure Rust).
+greater-spire = { path = "vendor/greater-spire" }
 
 # shared external
 serde = { version = "1", features = ["derive"] }

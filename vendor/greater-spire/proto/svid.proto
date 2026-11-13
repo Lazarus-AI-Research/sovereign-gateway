@@ -1,0 +1,21 @@
+syntax = "proto3";
+package spire.api.server.svid.v1;
+
+import "types.proto";
+
+service SVID {
+  rpc BatchNewX509SVID(BatchNewX509SVIDRequest) returns (BatchNewX509SVIDResponse);
+}
+message NewX509SVIDParams {
+  string entry_id = 1;
+  bytes csr = 2;
+}
+
+message BatchNewX509SVIDRequest { repeated NewX509SVIDParams params = 1; }
+message BatchNewX509SVIDResponse {
+  message Result {
+    spire.api.types.Status status = 1;
+    spire.api.types.X509SVID svid = 2;
+  }
+  repeated Result results = 1;
+}

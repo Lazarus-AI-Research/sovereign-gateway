@@ -1,0 +1,18 @@
+# Compatibility target: stock SPIRE Server v1.15.3.
+server_address = "127.0.0.1:8081"
+trust_domain = "internal"
+bootstrap_bundle_path = "/etc/greater-spire/bundle.pem"
+state_dir = "/var/lib/greater-spire/product-server-a"
+
+# One-use bootstrap secret. Omit after agent-state.json has been persisted.
+# Prefer constructing AgentConfig from a secret provider instead of storing this value.
+join_token = "replace-with-a-short-lived-join-token"
+
+workload_spiffe_id = "spiffe://internal/service/product-server-a"
+sync_interval_secs = 30
+rotate_before_secs = 300
+rpc_timeout_secs = 30
+
+[[expected_selectors]]
+type = "unix"
+value = "uid:1000"

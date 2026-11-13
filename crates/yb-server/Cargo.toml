@@ -23,12 +23,24 @@ tower.workspace = true
 tower-http.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
+# The SSO is reached over SPIFFE mTLS: greater-spire owns the identity runtime
+# and the pinned-peer HTTP client; http/http-body-util name its request/response types.
+greater-spire.workspace = true
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
 
 [dev-dependencies]
 yb-store.workspace = true
 yb-providers.workspace = true
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }
+# The SSO tests run a real mTLS mock IdP: `static-ca` mints a throwaway trust
+# domain, `test-utils` is the documented dev pairing. Neither reaches the binary
+# (dev-dependencies only).
+greater-spire = { workspace = true, features = ["static-ca", "test-utils"] }
+hyper-util = { version = "0.1", features = ["service"] }
+tokio-util = "0.7"
 
 # Build-time only: bundles the TSX admin UI (frontend/src) into a single ES
 # module embedded via include_str!. NOT a runtime dependency — does not ship in
