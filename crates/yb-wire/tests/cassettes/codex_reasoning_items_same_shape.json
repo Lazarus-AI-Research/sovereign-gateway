@@ -1,0 +1,140 @@
+{
+  "_comment": "Pins 33563ce (#14, Make same-shape relays lossless). A Codex turn relayed Responses to Responses. Rebuilding the request from the IR dropped every item the IR does not model, above all the `reasoning` item with its encrypted_content, which a reasoning model expects echoed back on the next turn; dropping it degraded multi-turn quality silently. On a same-shape relay the client's `input` must reach the upstream verbatim.",
+  "inbound_format": "openai_responses",
+  "inbound_body": {
+    "model": "gpt-5-codex",
+    "instructions": "You are Codex, a coding agent.",
+    "stream": true,
+    "store": false,
+    "reasoning": {
+      "effort": "medium"
+    },
+    "tool_choice": "auto",
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "count the lines in words.txt"
+          }
+        ]
+      },
+      {
+        "type": "reasoning",
+        "id": "rs_68c1f0a2d4e88190b1f2a9c3e7d40e5a",
+        "summary": [
+          {
+            "type": "summary_text",
+            "text": "**Counting lines**\n\nI'll run wc -l on the file."
+          }
+        ],
+        "encrypted_content": "gAAAAABowfCiENCRYPTED-REASONING-BLOB=="
+      },
+      {
+        "type": "function_call",
+        "id": "fc_68c1f0a3a1b48190a7d2e5f6c3b9e1d0",
+        "call_id": "call_Qm3XbV9yTn2LpK8sR4dW",
+        "name": "shell",
+        "arguments": "{\"command\":[\"wc\",\"-l\",\"words.txt\"]}"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call_Qm3XbV9yTn2LpK8sR4dW",
+        "output": "{\"output\":\"3 words.txt\\n\",\"metadata\":{\"exit_code\":0,\"duration_seconds\":0.0}}"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "name": "shell",
+        "description": "Runs a shell command and returns its output.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "additionalProperties": false
+        }
+      }
+    ]
+  },
+  "target_format": "openai_responses",
+  "target_model": "gpt-5-codex",
+  "expected_upstream_body": {
+    "input": [
+      {
+        "content": [
+          {
+            "text": "count the lines in words.txt",
+            "type": "input_text"
+          }
+        ],
+        "role": "user",
+        "type": "message"
+      },
+      {
+        "encrypted_content": "gAAAAABowfCiENCRYPTED-REASONING-BLOB==",
+        "id": "rs_68c1f0a2d4e88190b1f2a9c3e7d40e5a",
+        "summary": [
+          {
+            "text": "**Counting lines**\n\nI'll run wc -l on the file.",
+            "type": "summary_text"
+          }
+        ],
+        "type": "reasoning"
+      },
+      {
+        "arguments": "{\"command\":[\"wc\",\"-l\",\"words.txt\"]}",
+        "call_id": "call_Qm3XbV9yTn2LpK8sR4dW",
+        "id": "fc_68c1f0a3a1b48190a7d2e5f6c3b9e1d0",
+        "name": "shell",
+        "type": "function_call"
+      },
+      {
+        "call_id": "call_Qm3XbV9yTn2LpK8sR4dW",
+        "output": "{\"output\":\"3 words.txt\\n\",\"metadata\":{\"exit_code\":0,\"duration_seconds\":0.0}}",
+        "type": "function_call_output"
+      }
+    ],
+    "instructions": "You are Codex, a coding agent.",
+    "model": "gpt-5-codex",
+    "reasoning": {
+      "effort": "medium"
+    },
+    "store": false,
+    "stream": true,
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "description": "Runs a shell command and returns its output.",
+        "name": "shell",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        "type": "function"
+      }
+    ]
+  }
+}
