@@ -76,6 +76,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<ChatRequest> {
             budget_tokens: None,
         });
     }
+    req.response_format = v.pointer("/text/format").and_then(parse_text_format);
     req.prompt_cache_key = opt_str(&v, "prompt_cache_key").map(str::to_string);
     req.prompt_cache_retention = opt_str(&v, "prompt_cache_retention").map(str::to_string);
     req.prompt_cache_options = v.get("prompt_cache_options").cloned();
@@ -273,6 +274,40 @@ fn parse_content_parts(v: Option<&Value>) -> Vec<ContentBlock> {
 }
 
 /// Emit an IR request as an OpenAI Responses request body plus headers.
+/// `text.format`: `json_object`, or `json_schema` with its name, schema and
+/// strict flag inline. `text` and unknown types are no format.
+fn parse_text_format(f: &Value) -> Option<ResponseFormat> {
+    match opt_str(f, "type")? {
+        "json_object" => Some(ResponseFormat::JsonObject),
+        "json_schema" => Some(ResponseFormat::JsonSchema {
+            name: opt_str(f, "name").map(str::to_string),
+            schema: f.get("schema").cloned().unwrap_or(json!({})),
+            strict: f.get("strict").and_then(Value::as_bool),
+        }),
+        _ => None,
+    }
+}
+
+/// The Responses `text.format` for an IR format (the name is required, as on
+/// Chat Completions).
+fn emit_text_format(rf: &ResponseFormat) -> Value {
+    match rf {
+        ResponseFormat::JsonObject => json!({"type": "json_object"}),
+        ResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        } => {
+            let mut f = Map::new();
+            f.insert("type".into(), json!("json_schema"));
+            f.insert("name".into(), json!(name.as_deref().unwrap_or("response")));
+            f.insert("schema".into(), schema.clone());
+            insert_opt(&mut f, "strict", *strict);
+            Value::Object(f)
+        }
+    }
+}
+
 pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequest> {
     let mut body = Map::new();
     let model = if opts.target_model.is_empty() {
@@ -354,6 +389,9 @@ pub fn emit_request(req: &ChatRequest, opts: &EmitOptions) -> Result<EmittedRequ
     insert_opt(&mut body, "max_output_tokens", req.max_tokens);
     insert_opt(&mut body, "temperature", req.temperature);
     insert_opt(&mut body, "top_p", req.top_p);
+    if let Some(rf) = &req.response_format {
+        body.insert("text".into(), json!({"format": emit_text_format(rf)}));
+    }
     if opts.stream {
         body.insert("stream".into(), json!(true));
     }
