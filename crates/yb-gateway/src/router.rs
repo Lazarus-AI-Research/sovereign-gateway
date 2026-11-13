@@ -138,6 +138,7 @@ impl DeploymentRouter {
                     health_check: dc.health_check,
                     health_path: dc.health_path,
                     extra: dc.extra.clone(),
+                    shapes: Vec::new(),
                 })
             })
             .collect();
@@ -514,6 +515,7 @@ mod tests {
             health_check: Default::default(),
             health_path: None,
             extra: Default::default(),
+            shapes: Vec::new(),
             created_at: yb_core::now(),
             updated_at: yb_core::now(),
             deleted_at: None,

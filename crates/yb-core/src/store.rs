@@ -161,6 +161,12 @@ pub trait Store: Send + Sync {
         api_key: Option<&str>,
         extra: &crate::routing::Extra,
     ) -> crate::Result<ProviderRecord>;
+    /// Replace the chat API shapes a provider serves natively.
+    async fn set_provider_shapes(
+        &self,
+        id: &str,
+        shapes: &[crate::routing::ProviderShape],
+    ) -> crate::Result<ProviderRecord>;
     /// Delete a provider. `Conflict` if any live deployment still uses it.
     async fn delete_provider(&self, id: &str) -> crate::Result<()>;
 

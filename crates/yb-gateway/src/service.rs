@@ -421,7 +421,7 @@ impl Gateway {
                 return Err(e);
             }
         };
-        let candidates = self.filter_access(decision.candidates, &ctx);
+        let candidates = prefer_native(self.filter_access(decision.candidates, &ctx), surface);
         if candidates.is_empty() {
             let e = Error::NoEligibleProvider(chat.model.clone());
             guard.fail(e.http_status()).await;
@@ -444,25 +444,43 @@ impl Gateway {
                 yb_core::UpstreamFormat::Embed(_) | yb_core::UpstreamFormat::Media(_) => continue,
             };
             saw_embed_only = false;
-            let opts = EmitOptions {
-                target_model: deployment.upstream_model.clone(),
-                force_reasoning_effort: None,
-                stream: true,
+            // The client's own shape, when this deployment's provider serves
+            // it: relayed as the client sent it (model id and credentials
+            // aside) and answered as the provider answered. Otherwise the
+            // request is translated to the deployment's upstream format.
+            let native = deployment
+                .native_base(surface)
+                .map(|b| b.map(str::to_string));
+            let relay = native.is_some();
+            let (wire_fmt, base) = match native {
+                Some(base) => (surface, base),
+                None => (upstream_fmt, deployment.api_base.clone()),
             };
-            // A Responses-to-Responses route should not strip request fields
-            // merely because the cross-provider IR has not modeled them yet.
-            // Only the routed model id and the gateway's streaming transport
-            // choice differ from the client's request.
-            let emitted = if surface == WireFormat::OpenaiResponses
-                && upstream_fmt == WireFormat::OpenaiResponses
-            {
-                yb_wire::openai_responses::emit_same_shape_request(
-                    body,
-                    &deployment.upstream_model,
-                    true,
+            // A relay keeps the client's stream choice, so a buffered answer
+            // is the provider's own body. A translation always streams: it
+            // lets one path either stream through or aggregate.
+            let up_stream = if relay { stream_requested } else { true };
+            // A relayed Chat stream asks for usage on the client's behalf
+            // (to meter the turn) and drops the usage chunk again.
+            let drop_usage = relay
+                && surface == WireFormat::OpenaiChat
+                && stream_requested
+                && !chat.include_usage;
+            let emitted = if relay {
+                crate::relay::relay_body(surface, body, &deployment.upstream_model, drop_usage).map(
+                    |b| {
+                        (
+                            b,
+                            vec![("content-type".to_string(), "application/json".to_string())],
+                        )
+                    },
                 )
-                .map_err(wire::wire_err)
             } else {
+                let opts = EmitOptions {
+                    target_model: deployment.upstream_model.clone(),
+                    force_reasoning_effort: None,
+                    stream: true,
+                };
                 wire::emit_request(upstream_fmt, &chat, &opts)
             };
             let (up_body, mut headers) = match emitted {
@@ -474,16 +492,16 @@ impl Gateway {
             };
             // The upstream credential is the deployment's literal `api_key`.
             let api_key = deployment.api_key.clone().unwrap_or_default();
-            headers.extend(auth_headers(upstream_fmt, &api_key));
+            headers.extend(auth_headers(wire_fmt, &api_key));
             append_headers(
                 &mut headers,
                 self.extra_headers(&deployment.extra, &deployment.model_name),
             );
             let url = build_url(
-                upstream_fmt,
-                deployment.api_base.as_deref(),
+                wire_fmt,
+                base.as_deref(),
                 &deployment.upstream_model,
-                true,
+                up_stream,
             );
 
             let ureq = UpstreamRequest {
@@ -491,7 +509,7 @@ impl Gateway {
                 method: Default::default(),
                 headers,
                 body: up_body,
-                stream: true,
+                stream: up_stream,
             };
 
             let resp = match self.client.send(ureq).await {
@@ -562,7 +580,28 @@ impl Gateway {
                 chat.prompt_cache_key.clone(),
                 chat.prompt_cache_retention.clone(),
             );
+            let upstream_fmt = wire_fmt;
             return match (stream_requested, resp.body) {
+                (false, ResponseBody::Full(bytes)) if relay => {
+                    relay_full(bytes, surface, resp.headers, rctx, status).await
+                }
+                (true, ResponseBody::Stream(up)) if relay => {
+                    let stream = translate_stream(
+                        up,
+                        upstream_fmt,
+                        surface,
+                        rctx,
+                        status,
+                        (None, None),
+                        true,
+                        Some(Relay { drop_usage }),
+                    );
+                    Ok(GatewayResponse::Stream {
+                        status,
+                        headers: sse_headers(),
+                        stream,
+                    })
+                }
                 (false, ResponseBody::Stream(up)) => {
                     aggregate_stream(up, upstream_fmt, surface, rctx, status, cache_echo).await
                 }
@@ -580,6 +619,7 @@ impl Gateway {
                         status,
                         cache_echo,
                         chat.include_usage,
+                        None,
                     );
                     Ok(GatewayResponse::Stream {
                         status,
@@ -1335,12 +1375,74 @@ fn responses_terminal(line: &str) -> Result<Option<bool>> {
     Ok(Some(kind != "response.completed"))
 }
 
+/// How a same-shape relay treats the provider's stream.
+#[derive(Debug, Clone, Copy)]
+struct Relay {
+    /// Drop the trailing usage-only Chat chunk the gateway asked for on the
+    /// client's behalf (see [`crate::relay::relay_body`]).
+    drop_usage: bool,
+}
+
+/// Candidates whose provider serves the client's shape natively first, within
+/// each model's own deployments: a model's fallbacks still come after it, and
+/// the router's order is kept within each group.
+fn prefer_native(candidates: Vec<Deployment>, surface: WireFormat) -> Vec<Deployment> {
+    let mut models: Vec<String> = Vec::new();
+    let mut keyed: Vec<(usize, bool, usize, Deployment)> = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let group = match models.iter().position(|m| m == &d.model_id) {
+                Some(g) => g,
+                None => {
+                    models.push(d.model_id.clone());
+                    models.len() - 1
+                }
+            };
+            (group, d.native_base(surface).is_none(), i, d)
+        })
+        .collect();
+    keyed.sort_by_key(|(g, translated, i, _)| (*g, *translated, *i));
+    keyed.into_iter().map(|(_, _, _, d)| d).collect()
+}
+
+/// Hand a relayed buffered answer to the client as the provider sent it,
+/// metering its usage from the provider's own shape.
+async fn relay_full(
+    bytes: Vec<u8>,
+    surface: WireFormat,
+    upstream_headers: Vec<(String, String)>,
+    rctx: RecordCtx,
+    status: u16,
+) -> Result<GatewayResponse> {
+    let (usage, ir_json) = match wire::parse_response(surface, &bytes) {
+        Ok(resp) => (resp.usage, serde_json::to_vec(&resp).unwrap_or_default()),
+        Err(e) => {
+            tracing::warn!(error = %e, "relayed answer did not parse; usage unknown");
+            (Usage::default(), Vec::new())
+        }
+    };
+    let n = bytes.len() as i64;
+    rctx.finish(usage, status, false, ir_json, n).await;
+    let content_type = upstream_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| wire::full_content_type(surface).to_string());
+    Ok(GatewayResponse::Full {
+        status,
+        headers: vec![("content-type".to_string(), content_type)],
+        body: bytes,
+    })
+}
+
 /// Build the client-facing translated SSE stream.
 ///
 /// Upstream bytes are buffered and split on `\n`; each line is decoded into IR
 /// [`StreamEvent`]s, which are re-encoded into the surface's native SSE dialect
 /// and yielded. Token usage is accumulated as it streams; when the upstream
 /// ends, telemetry / rollup / reqlog are written exactly once.
+#[allow(clippy::too_many_arguments)]
 fn translate_stream(
     upstream: ByteStream,
     upstream_fmt: WireFormat,
@@ -1349,14 +1451,17 @@ fn translate_stream(
     status: u16,
     cache_echo: (Option<String>, Option<String>),
     include_usage: bool,
+    relay: Option<Relay>,
 ) -> ByteStream {
-    // Responses is already the client's requested wire format. Relaying its
-    // SSE bytes exactly preserves terminal statuses and provider-native event
-    // fields (notably `response.incomplete` and `response.failed`) that the
-    // cross-format IR cannot express. We still decode in parallel for usage,
-    // telemetry, and request-log capture.
-    let passthrough_responses =
-        upstream_fmt == WireFormat::OpenaiResponses && surface == WireFormat::OpenaiResponses;
+    // A relay hands the client the provider's own SSE frames, byte for byte:
+    // they are already in the client's shape, and carry provider-native fields
+    // (Responses `response.incomplete` / `response.failed`, for instance) the
+    // cross-format IR cannot express. They are still decoded in parallel for
+    // usage, first-token timing, telemetry and request-log capture.
+    let drop_usage = relay.is_some_and(|r| r.drop_usage);
+    let relay = relay.is_some();
+    // A relayed Responses stream must also end in a well-formed terminal event.
+    let responses_checks = relay && surface == WireFormat::OpenaiResponses;
     let mut encoder = wire::Encoder::new(surface);
     encoder.set_prompt_cache(cache_echo.0, cache_echo.1);
     // What the client asked for on the way in decides whether usage is relayed
@@ -1412,12 +1517,12 @@ fn translate_stream(
                     let mut native_out = Vec::new();
                     while let Some(pos) = st.buf.iter().position(|&b| b == b'\n') {
                         let line: Vec<u8> = st.buf.drain(..=pos).collect();
-                        if passthrough_responses {
+                        if relay {
                             st.native_frame.extend_from_slice(&line);
                         }
                         let text = String::from_utf8_lossy(&line);
                         let line = text.trim_end_matches(['\r', '\n']);
-                        if passthrough_responses {
+                        if responses_checks {
                             match responses_terminal(line) {
                                 Ok(Some(failed)) => {
                                     st.pending_terminal = Some(failed);
@@ -1443,9 +1548,11 @@ fn translate_stream(
                         }
                         st.agg.push_all(&evs);
                         events.extend(evs);
-                        if passthrough_responses && line.is_empty() {
-                            native_out.extend_from_slice(&st.native_frame);
-                            st.native_frame.clear();
+                        if relay && line.is_empty() {
+                            let frame = std::mem::take(&mut st.native_frame);
+                            if !(drop_usage && crate::relay::is_usage_only_chunk(&frame)) {
+                                native_out.extend_from_slice(&frame);
+                            }
                             if let Some(failed) = st.pending_terminal.take() {
                                 st.responses_terminal_seen = true;
                                 st.terminal_failure |= failed;
@@ -1455,12 +1562,10 @@ fn translate_stream(
                             }
                         }
                     }
-                    if events.is_empty() && !passthrough_responses
-                        || passthrough_responses && native_out.is_empty()
-                    {
+                    if events.is_empty() && !relay || relay && native_out.is_empty() {
                         continue; // need more bytes before we have output
                     }
-                    let bytes = if passthrough_responses {
+                    let bytes = if relay {
                         native_out
                     } else {
                         st.encoder.encode(&events)
@@ -1474,8 +1579,11 @@ fn translate_stream(
                     // abandoned; it is recorded as complete the moment the
                     // end goes out.
                     if !st.recorded
-                        && (passthrough_responses && st.responses_terminal_seen
-                            || !passthrough_responses && ends_stream(st.surface, &bytes, &events))
+                        && (if responses_checks {
+                            st.responses_terminal_seen
+                        } else {
+                            ends_stream(st.surface, &bytes, &events)
+                        })
                     {
                         let ir = st.ir_json();
                         st.rctx
@@ -1511,7 +1619,7 @@ fn translate_stream(
                     return Some((Err(e), st));
                 }
                 None => {
-                    if passthrough_responses {
+                    if responses_checks {
                         st.done = true;
                         let ir = st.ir_json();
                         st.rctx
@@ -1530,6 +1638,9 @@ fn translate_stream(
                     let mut events = Vec::new();
                     if !st.buf.is_empty() {
                         let line = std::mem::take(&mut st.buf);
+                        if relay {
+                            st.native_frame.extend_from_slice(&line);
+                        }
                         let text = String::from_utf8_lossy(&line);
                         let line = text.trim_end_matches(['\r', '\n']);
                         let evs = st.decoder.decode_line(line);
@@ -1542,16 +1653,22 @@ fn translate_stream(
                         events.extend(evs);
                     }
                     st.done = true;
-                    let mut b = if events.is_empty() {
-                        Vec::new()
+                    let b = if relay {
+                        // The provider's unterminated last frame, as it sent it.
+                        std::mem::take(&mut st.native_frame)
                     } else {
-                        st.encoder.encode(&events)
+                        let mut b = if events.is_empty() {
+                            Vec::new()
+                        } else {
+                            st.encoder.encode(&events)
+                        };
+                        // Anything the encoder was still holding — the OpenAI
+                        // Chat surface defers [DONE] while waiting on a trailing
+                        // usage chunk, so an upstream that hangs up first must
+                        // not leave the client's stream unterminated.
+                        b.extend(st.encoder.finish());
+                        b
                     };
-                    // Anything the encoder was still holding — the OpenAI Chat
-                    // surface defers [DONE] while waiting on a trailing usage
-                    // chunk, so an upstream that hangs up first must not leave
-                    // the client's stream unterminated.
-                    b.extend(st.encoder.finish());
                     st.response_bytes += b.len() as i64;
                     let bytes = Bytes::from(b);
                     if !st.recorded {

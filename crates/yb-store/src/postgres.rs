@@ -82,7 +82,7 @@ fn enc_enum<T: serde::Serialize>(v: &T) -> String {
 /// disagree, and the row is indexed with the wrong one. Naming the columns keeps
 /// reads pinned to the shape this code expects.
 const DEPLOYMENT_COLS: &str = "d.id, d.model_id, m.name AS model_name, \
-     d.provider_id, p.name AS provider, p.api_base, p.api_key, p.extra, \
+     d.provider_id, p.name AS provider, p.api_base, p.api_key, p.extra, p.shapes, \
      d.upstream_model, d.upstream_format, d.weight, d.pricing, \
      d.health_check, d.health_path, d.created_at, d.updated_at, d.deleted_at";
 
@@ -94,7 +94,7 @@ const DEPLOYMENT_FROM: &str = "FROM deployments d JOIN models m ON m.id = d.mode
 const MODEL_COLS: &str = "id, name, created_at, updated_at";
 
 /// Column list for `providers` reads.
-const PROVIDER_COLS: &str = "id, name, api_base, api_key, extra, created_at, updated_at";
+const PROVIDER_COLS: &str = "id, name, api_base, api_key, extra, shapes, created_at, updated_at";
 
 /// Encode a deployment's `extra` object as JSON (`{}` when empty).
 fn enc_extra(x: &yb_core::Extra) -> String {
@@ -105,6 +105,16 @@ fn enc_extra(x: &yb_core::Extra) -> String {
 /// rather than a hard error, so one bad row cannot take down the whole model
 /// list.
 fn dec_extra(raw: Option<String>) -> yb_core::Extra {
+    raw.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
+/// Decode the `shapes` column. Like `extra`, an unreadable value means "none
+/// declared" rather than an error that takes down the model list.
+fn dec_shapes(raw: Option<String>) -> Vec<yb_core::ProviderShape> {
     raw.as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -230,6 +240,7 @@ fn map_provider(r: &PgRow) -> Result<ProviderRecord> {
         api_base: r.try_get("api_base").map_err(storage_err)?,
         api_key: r.try_get("api_key").map_err(storage_err)?,
         extra: dec_extra(r.try_get("extra").map_err(storage_err)?),
+        shapes: dec_shapes(r.try_get("shapes").map_err(storage_err)?),
         created_at: r.try_get("created_at").map_err(storage_err)?,
         updated_at: r.try_get("updated_at").map_err(storage_err)?,
     })
@@ -281,6 +292,7 @@ fn map_deployment(r: &PgRow) -> Result<DeploymentRecord> {
         .map_err(storage_err)?,
         health_path: r.try_get("health_path").map_err(storage_err)?,
         extra: dec_extra(r.try_get("extra").ok()),
+        shapes: dec_shapes(r.try_get("shapes").ok()),
         created_at: r.try_get("created_at").map_err(storage_err)?,
         updated_at: r.try_get("updated_at").map_err(storage_err)?,
         deleted_at: r.try_get("deleted_at").map_err(storage_err)?,
@@ -1266,6 +1278,26 @@ impl Store for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(storage_err)?;
+        self.get_provider(id)
+            .await?
+            .ok_or_else(|| Error::NotFound("provider".into()))
+    }
+
+    async fn set_provider_shapes(
+        &self,
+        id: &str,
+        shapes: &[yb_core::ProviderShape],
+    ) -> Result<ProviderRecord> {
+        let done = sqlx::query("UPDATE providers SET shapes = $1, updated_at = $2 WHERE id = $3")
+            .bind(serde_json::to_string(shapes).map_err(storage_err)?)
+            .bind(now())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        if done.rows_affected() == 0 {
+            return Err(Error::NotFound("provider".into()));
+        }
         self.get_provider(id)
             .await?
             .ok_or_else(|| Error::NotFound("provider".into()))

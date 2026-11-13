@@ -653,6 +653,9 @@ async fn seed_providers(
                 &pc.extra,
             )
             .await?;
+        if let Some(shapes) = &pc.shapes {
+            store.set_provider_shapes(&existing.id, shapes).await?;
+        }
     }
     Ok(providers.len())
 }

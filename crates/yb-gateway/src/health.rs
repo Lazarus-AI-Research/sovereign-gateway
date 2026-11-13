@@ -311,6 +311,7 @@ mod tests {
             health_check: check,
             health_path: path.map(str::to_string),
             extra: Default::default(),
+            shapes: Vec::new(),
             created_at: yb_core::now(),
             updated_at: yb_core::now(),
             deleted_at: None,
