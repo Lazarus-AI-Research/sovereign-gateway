@@ -20,6 +20,7 @@
 mod aggregate;
 pub mod anthropic;
 mod common;
+pub mod decision;
 pub mod embed;
 pub mod error;
 pub mod gemini;
@@ -27,9 +28,11 @@ pub mod ir;
 pub mod media;
 pub mod openai_chat;
 pub mod openai_responses;
-pub mod qe;
 
 pub use aggregate::{events_from_response, Aggregator};
+pub use decision::{
+    parse_decision_request, parse_decision_usage, translate_decision_response, DecisionMeta,
+};
 pub use embed::{
     EmbedEmitOptions, EmbedInput, EmbedPart, EmbedRequest, EmbedResponse, EmbedUsage,
     EncodingFormat,

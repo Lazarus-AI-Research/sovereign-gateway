@@ -261,6 +261,13 @@ impl Store for RecordingStore {
     async fn seed_deployment(&self, _dep: &yb_core::NewDeployment) -> Result<bool> {
         Ok(true)
     }
+    async fn set_deployment_shapes(
+        &self,
+        _id: &str,
+        _shapes: Option<&[yb_core::UpstreamFormat]>,
+    ) -> Result<yb_core::DeploymentRecord> {
+        unimplemented!("RecordingStore only serves the request path")
+    }
     async fn list_health(&self) -> Result<Vec<yb_core::HealthRecord>> {
         Ok(vec![])
     }
@@ -336,7 +343,8 @@ fn test_router() -> DeploymentRouter {
             upstream_model: "gpt-4o".into(),
             api_base: None,
             api_key: None,
-            upstream_format: WireFormat::OpenaiChat.into(),
+            upstream_format: Some(WireFormat::OpenaiChat.into()),
+            shapes: None,
             weight: 1,
             pricing: None, // falls back to the built-in gpt-4o price
             health_check: Default::default(),
@@ -356,7 +364,8 @@ fn responses_router() -> DeploymentRouter {
             upstream_model: "fake-upstream".into(),
             api_base: None,
             api_key: None,
-            upstream_format: WireFormat::OpenaiResponses.into(),
+            upstream_format: Some(WireFormat::OpenaiResponses.into()),
+            shapes: None,
             weight: 1,
             pricing: None,
             health_check: Default::default(),
@@ -468,7 +477,8 @@ async fn responses_route_replays_request_body_except_the_model_id() {
             upstream_model: "upstream-model".into(),
             api_base: None,
             api_key: None,
-            upstream_format: WireFormat::OpenaiResponses.into(),
+            upstream_format: Some(WireFormat::OpenaiResponses.into()),
+            shapes: None,
             weight: 1,
             pricing: None,
             health_check: Default::default(),
@@ -716,7 +726,8 @@ fn embed_router() -> DeploymentRouter {
                 upstream_model: "text-embedding-3-small".into(),
                 api_base: None,
                 api_key: None,
-                upstream_format: EmbedFormat::OpenaiEmbed.into(),
+                upstream_format: Some(EmbedFormat::OpenaiEmbed.into()),
+                shapes: None,
                 weight: 1,
                 pricing: None,
                 health_check: Default::default(),
@@ -732,7 +743,8 @@ fn embed_router() -> DeploymentRouter {
                 upstream_model: "gpt-4o".into(),
                 api_base: None,
                 api_key: None,
-                upstream_format: WireFormat::OpenaiChat.into(),
+                upstream_format: Some(WireFormat::OpenaiChat.into()),
+                shapes: None,
                 weight: 1,
                 pricing: None,
                 health_check: Default::default(),
@@ -915,7 +927,8 @@ fn media_router() -> DeploymentRouter {
             upstream_model: upstream.into(),
             api_base: Some(format!("http://agent:9100/deployments/{name}/v1")),
             api_key: Some("env:YB_TEST_AGENT_TOKEN".into()),
-            upstream_format: format.into(),
+            upstream_format: Some(format.into()),
+            shapes: None,
             weight: 1,
             pricing: None,
             health_check: Default::default(),
@@ -1123,7 +1136,8 @@ async fn a_video_is_found_on_the_deployment_that_made_it() {
         upstream_model: "wan".into(),
         api_base: Some(format!("http://{base}/v1")),
         api_key: None,
-        upstream_format: yb_core::MediaFormat::OpenaiVideos.into(),
+        upstream_format: Some(yb_core::MediaFormat::OpenaiVideos.into()),
+        shapes: None,
         weight: 1,
         pricing: None,
         health_check: Default::default(),
@@ -1279,7 +1293,8 @@ async fn an_unreachable_video_engine_is_passed_over() {
         upstream_model: "wan".into(),
         api_base: Some(format!("http://{base}/v1")),
         api_key: None,
-        upstream_format: yb_core::MediaFormat::OpenaiVideos.into(),
+        upstream_format: Some(yb_core::MediaFormat::OpenaiVideos.into()),
+        shapes: None,
         weight: 1,
         pricing: None,
         health_check: Default::default(),
@@ -1330,9 +1345,9 @@ fn shaped_router(own: WireFormat, shapes: &[(WireFormat, Option<&str>)]) -> Depl
         model_id: "m1".into(),
         model_name: "glm".into(),
         provider_id: "p1".into(),
-        provider: "qe".into(),
+        provider: "cluster".into(),
         upstream_model: "glm-upstream".into(),
-        api_base: Some("http://qe.test/v1".into()),
+        api_base: Some("http://cluster.test/v1".into()),
         api_key: Some("k".into()),
         upstream_format: own.into(),
         weight: 1,
@@ -1340,10 +1355,11 @@ fn shaped_router(own: WireFormat, shapes: &[(WireFormat, Option<&str>)]) -> Depl
         health_check: Default::default(),
         health_path: None,
         extra: Default::default(),
-        shapes: shapes
+        shapes: None,
+        provider_shapes: shapes
             .iter()
             .map(|(f, b)| yb_core::ProviderShape {
-                format: *f,
+                format: (*f).into(),
                 api_base: b.map(str::to_string),
             })
             .collect(),
@@ -1371,7 +1387,7 @@ async fn collect(resp: GatewayResponse) -> Vec<u8> {
 #[tokio::test]
 async fn a_served_shape_is_relayed_byte_for_byte() {
     let answer = br#"{"id":"msg_1","type":"message","role":"assistant","model":"glm-upstream",
-"content":[{"type":"thinking","thinking":"hm","signature":"qe1abc"},{"type":"text","text":"hi"}],
+"content":[{"type":"thinking","thinking":"hm","signature":"sig1abc"},{"type":"text","text":"hi"}],
 "stop_reason":"stop_sequence","stop_sequence":"END","usage":{"input_tokens":7,"output_tokens":2,
 "cache_read_input_tokens":5,"cache_creation_input_tokens":0}}"#;
     let mock = MockClient::json(answer.to_vec());
@@ -1380,7 +1396,7 @@ async fn a_served_shape_is_relayed_byte_for_byte() {
         Arc::new(mock.clone()),
         Arc::new(shaped_router(
             WireFormat::OpenaiChat,
-            &[(WireFormat::Anthropic, Some("http://qe.test/anthropic"))],
+            &[(WireFormat::Anthropic, Some("http://cluster.test/anthropic"))],
         )),
         store.clone(),
         Arc::new(NullLogger),
@@ -1394,7 +1410,7 @@ async fn a_served_shape_is_relayed_byte_for_byte() {
         .unwrap();
     assert_eq!(collect(resp).await, answer.to_vec());
     let sent = mock.last_request().unwrap();
-    assert_eq!(sent.url, "http://qe.test/anthropic/v1/messages");
+    assert_eq!(sent.url, "http://cluster.test/anthropic/v1/messages");
     assert!(!sent.stream);
     let want = String::from_utf8_lossy(body).replace("\"glm\"", "\"glm-upstream\"");
     assert_eq!(String::from_utf8_lossy(&sent.body), want);
@@ -1487,7 +1503,10 @@ async fn an_unserved_shape_is_still_translated() {
         Arc::new(mock.clone()),
         Arc::new(shaped_router(
             WireFormat::OpenaiChat,
-            &[(WireFormat::OpenaiResponses, None)],
+            &[
+                (WireFormat::OpenaiChat, None),
+                (WireFormat::OpenaiResponses, None),
+            ],
         )),
         Arc::new(RecordingStore::default()),
         Arc::new(NullLogger),
@@ -1500,7 +1519,7 @@ async fn an_unserved_shape_is_still_translated() {
     let v: Value = serde_json::from_slice(&collect(resp).await).unwrap();
     assert_eq!(v["content"][0]["text"], "hi");
     let sent = mock.last_request().unwrap();
-    assert_eq!(sent.url, "http://qe.test/v1/chat/completions");
+    assert_eq!(sent.url, "http://cluster.test/v1/chat/completions");
     assert!(sent.stream);
 }
 
@@ -1521,7 +1540,8 @@ async fn a_deployment_serving_the_clients_shape_is_tried_first() {
         health_check: Default::default(),
         health_path: None,
         extra: Default::default(),
-        shapes: Vec::new(),
+        shapes: None,
+        provider_shapes: Vec::new(),
         created_at: now(),
         updated_at: now(),
         deleted_at: None,
@@ -1561,148 +1581,437 @@ async fn a_deployment_serving_the_clients_shape_is_tried_first() {
 }
 
 // ---------------------------------------------------------------------------
-// QE dialect: a shape the provider does not serve is translated with QE's
-// rules, and Responses state lives in the gateway.
+// Relayed Responses state: GET/DELETE/cancel/input_items forward to the
+// provider that answered the relayed turn, scoped to the owning user.
 // ---------------------------------------------------------------------------
 
-fn qe_router() -> DeploymentRouter {
-    let mut extra = yb_core::Extra::default();
-    extra.rest.insert("dialect".into(), json!("qe"));
-    let rec = yb_core::DeploymentRecord {
-        id: "d1".into(),
-        model_id: "m1".into(),
-        model_name: "glm".into(),
-        provider_id: "p1".into(),
-        provider: "qe".into(),
-        upstream_model: "glm-up".into(),
-        api_base: Some("http://qe.test/v1".into()),
-        api_key: None,
-        upstream_format: WireFormat::OpenaiChat.into(),
-        weight: 1,
-        pricing: None,
-        health_check: Default::default(),
-        health_path: None,
-        extra,
-        shapes: Vec::new(),
-        created_at: now(),
-        updated_at: now(),
-        deleted_at: None,
-    };
-    DeploymentRouter::from_deployments(&[rec], Strategy::Simple, HashMap::new(), HashMap::new())
-}
-
-fn qe_chat_answer(text: &str, calls: Value) -> Vec<u8> {
-    serde_json::to_vec(&json!({"id": "chatcmpl-1", "object": "chat.completion", "model": "glm-up",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text, "tool_calls": calls},
-                     "finish_reason": if calls.is_null() { "stop" } else { "tool_calls" }}],
-        "usage": {"prompt_tokens": 20, "completion_tokens": 4, "total_tokens": 24,
-                  "prompt_tokens_details": {"cached_tokens": 8, "cache_write_tokens": 2},
-                  "completion_tokens_details": {"reasoning_tokens": 0}}}))
-    .unwrap()
-}
-
 #[tokio::test]
-async fn a_qe_provider_gets_the_qe_chat_spelling_of_an_anthropic_request() {
-    let mock = MockClient::json(qe_chat_answer("hi", Value::Null));
-    let store = Arc::new(RecordingStore::default());
+async fn relayed_responses_lookup_forwards_to_owning_provider() {
+    let answer = serde_json::to_vec(&json!({
+        "id": "resp_abc123",
+        "object": "response",
+        "status": "completed",
+        "model": "glm-upstream",
+        "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}],
+        "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}
+    }))
+    .unwrap();
+    let mock = MockClient::json(answer);
     let gateway = Gateway::new(
         Arc::new(mock.clone()),
-        Arc::new(qe_router()),
-        store.clone(),
-        Arc::new(NullLogger),
-    );
-    let body = json!({"model": "glm", "max_tokens": 64, "seed": 1,
-        "thinking": {"type": "enabled", "budget_tokens": 500}, "output_config": {"effort": "max"},
-        "messages": [{"role": "user", "content": "x"}]});
-    let resp = gateway
-        .handle(
-            WireFormat::Anthropic,
-            &serde_json::to_vec(&body).unwrap(),
-            RequestCtx::new(),
-        )
-        .await
-        .unwrap();
-    let out: Value = serde_json::from_slice(&collect(resp).await).unwrap();
-    let sent: Value = serde_json::from_slice(&mock.last_request().unwrap().body).unwrap();
-    assert_eq!(sent["reasoning_effort"], "xhigh");
-    assert_eq!(sent["thinking_token_budget"], 500);
-    assert_eq!(sent["model"], "glm-up");
-    assert!(
-        !mock.last_request().unwrap().stream,
-        "the client's stream choice is kept"
-    );
-    assert_eq!(out["content"][0], json!({"type": "text", "text": "hi"}));
-    assert_eq!(out["usage"]["input_tokens"], 10, "uncached remainder");
-    assert_eq!(store.telemetry()[0].input_tokens, 20);
-}
-
-#[tokio::test]
-async fn previous_response_id_continues_a_translated_conversation() {
-    let mock = MockClient::json(qe_chat_answer(
-        "",
-        json!([{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{\"a\":1}"}}]),
-    ));
-    let gateway = Gateway::new(
-        Arc::new(mock.clone()),
-        Arc::new(qe_router()),
+        Arc::new(shaped_router(
+            WireFormat::OpenaiChat,
+            &[(
+                WireFormat::OpenaiResponses,
+                Some("http://cluster.test/r/v1"),
+            )],
+        )),
         Arc::new(RecordingStore::default()),
         Arc::new(NullLogger),
     );
     let mut ctx = RequestCtx::new();
     ctx.user_id = Some("u1".into());
-    let tools = json!([{"type": "function", "name": "f", "parameters": {"type": "object"}}]);
-    let first = json!({"model": "glm", "instructions": "sys", "input": "go", "tools": tools});
-    let r1: Value = serde_json::from_slice(
-        &collect(
-            gateway
-                .handle(
-                    WireFormat::OpenaiResponses,
-                    &serde_json::to_vec(&first).unwrap(),
-                    ctx.clone(),
-                )
-                .await
-                .unwrap(),
-        )
-        .await,
-    )
-    .unwrap();
-    let id = r1["id"].as_str().unwrap().to_string();
-    let call_id = r1["output"][0]["call_id"].as_str().unwrap().to_string();
-    assert_eq!(call_id, format!("call_{id}_0"));
-    let second = json!({"model": "glm", "instructions": "sys", "previous_response_id": id, "tools": tools,
-        "input": [{"type": "function_call_output", "call_id": call_id, "output": "ok"}]});
+    let req = json!({"model": "glm", "input": "hello"});
     gateway
         .handle(
             WireFormat::OpenaiResponses,
-            &serde_json::to_vec(&second).unwrap(),
+            &serde_json::to_vec(&req).unwrap(),
             ctx.clone(),
         )
         .await
         .unwrap();
-    let sent: Value = serde_json::from_slice(&mock.last_request().unwrap().body).unwrap();
-    let roles: Vec<&str> = sent["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["role"].as_str().unwrap())
-        .collect();
     assert_eq!(
-        roles,
-        ["system", "user", "assistant", "tool"],
-        "instructions, then the stored turn, then the new input"
+        mock.last_request().unwrap().url,
+        "http://cluster.test/r/v1/responses"
     );
-    assert_eq!(sent["messages"][2]["tool_calls"][0]["id"], call_id);
-    // The stored response is the owner's alone.
+
     let got = gateway
-        .response_op(&id, yb_gateway::service::ResponseOp::Get, &ctx)
+        .response_op("resp_abc123", yb_gateway::service::ResponseOp::Get, &ctx)
         .await
         .unwrap();
     let v: Value = serde_json::from_slice(&collect(got).await).unwrap();
-    assert_eq!(v["id"], id);
+    assert_eq!(v["id"], "resp_abc123");
+    assert_eq!(
+        mock.last_request().unwrap().url,
+        "http://cluster.test/r/v1/responses/resp_abc123"
+    );
+
     let mut other = RequestCtx::new();
     other.user_id = Some("u2".into());
     assert!(gateway
-        .response_op(&id, yb_gateway::service::ResponseOp::Get, &other)
+        .response_op("resp_abc123", yb_gateway::service::ResponseOp::Get, &other)
         .await
         .is_err());
+}
+
+// ---------------------------------------------------------------------------
+// SystemOne (`jev`) & OpenAI/LiteLLM Decisions (`decisions`) + multi-family
+// provider & deployment shapes.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn systemone_jev_same_shape_relays_bytes_and_meters_usage() {
+    let upstream_resp = br#"{"id":"s1_live01","object":"systemone","created":1731542000,"model":"qwen-upstream","decisions":{"allow":{"yes":0.94,"no":0.06,"value":true}},"usage":{"prompt_tokens":128,"completion_tokens":0,"total_tokens":128,"prompt_tokens_details":{"cached_tokens":96}}}"#;
+    let mock = MockClient::json(upstream_resp.to_vec());
+    let store = Arc::new(RecordingStore::default());
+
+    let rec = yb_core::DeploymentRecord {
+        id: "d-s1".into(),
+        model_id: "m-s1".into(),
+        model_name: "fast-judge".into(),
+        provider_id: "p-s1".into(),
+        provider: "s1-cluster".into(),
+        upstream_model: "qwen-upstream".into(),
+        api_base: Some("http://s1.test:8000/v1".into()),
+        api_key: Some("secret-k".into()),
+        upstream_format: WireFormat::OpenaiChat.into(),
+        weight: 1,
+        pricing: Some(yb_core::catalog::ModelPrice::new(1.0, 2.0)),
+        health_check: Default::default(),
+        health_path: None,
+        extra: Default::default(),
+        shapes: None,
+        provider_shapes: vec![
+            yb_core::ProviderShape {
+                format: WireFormat::OpenaiChat.into(),
+                api_base: None,
+            },
+            yb_core::ProviderShape {
+                format: yb_core::DecisionFormat::Jev.into(),
+                api_base: Some("http://s1.test:8000/s1/v1".into()),
+            },
+        ],
+        created_at: now(),
+        updated_at: now(),
+        deleted_at: None,
+    };
+    let router = DeploymentRouter::from_deployments(
+        &[rec],
+        Strategy::Simple,
+        HashMap::new(),
+        HashMap::new(),
+    );
+    let gateway = Gateway::new(
+        Arc::new(mock.clone()),
+        Arc::new(router),
+        store.clone(),
+        Arc::new(NullLogger),
+    );
+
+    let req_body = br#"{"model":"fast-judge","state":[{"role":"user","content":"Approve PR #42?"}],"questions":{"allow":{"type":"noul","question":"Should PR #42 merge?"}},"thinking_budget":0,"prompt_cache_key":"pr-judge-v1"}"#;
+    let resp = gateway
+        .handle_decision(yb_core::DecisionFormat::Jev, req_body, RequestCtx::new())
+        .await
+        .unwrap();
+    let got_bytes = collect(resp).await;
+    assert_eq!(
+        got_bytes,
+        upstream_resp.to_vec(),
+        "same-shape jev relays verbatim"
+    );
+
+    let sent = mock.last_request().unwrap();
+    assert_eq!(sent.url, "http://s1.test:8000/s1/v1/systemone");
+    assert!(!sent.stream);
+    assert!(sent
+        .headers
+        .iter()
+        .any(|(k, v)| k == "authorization" && v == "Bearer secret-k"));
+    let expected_req =
+        String::from_utf8_lossy(req_body).replace("\"fast-judge\"", "\"qwen-upstream\"");
+    assert_eq!(String::from_utf8_lossy(&sent.body), expected_req);
+
+    let t = store.telemetry();
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0].surface, "jev");
+    assert_eq!(t[0].input_tokens, 128);
+    assert_eq!(t[0].output_tokens, 0);
+    assert_eq!(t[0].cache_read_tokens, 96);
+    assert!(!t[0].is_error);
+}
+
+#[tokio::test]
+async fn decisions_and_jev_translate_envelopes_across_decision_shapes() {
+    // 1. Client calls `decisions` (`/v1/decisions`), deployment only serves `jev` (`/v1/systemone`).
+    let jev_resp = serde_json::to_vec(&json!({
+        "id": "s1_abc999",
+        "object": "systemone",
+        "model": "qwen-upstream",
+        "decisions": {
+            "route": {"billing": 0.8, "tech": 0.2, "choice": "billing"}
+        },
+        "usage": {"prompt_tokens": 40, "completion_tokens": 0, "total_tokens": 40}
+    }))
+    .unwrap();
+    let mock = MockClient::json(jev_resp);
+    let rec = yb_core::DeploymentRecord {
+        id: "d-jev".into(),
+        model_id: "m-router".into(),
+        model_name: "triage".into(),
+        provider_id: "p-jev".into(),
+        provider: "jev-only".into(),
+        upstream_model: "qwen-upstream".into(),
+        api_base: Some("http://jev.test/v1".into()),
+        api_key: None,
+        upstream_format: yb_core::DecisionFormat::Jev.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+        extra: Default::default(),
+        shapes: None,
+        provider_shapes: vec![yb_core::ProviderShape {
+            format: yb_core::DecisionFormat::Jev.into(),
+            api_base: None,
+        }],
+        created_at: now(),
+        updated_at: now(),
+        deleted_at: None,
+    };
+    let gateway = Gateway::new(
+        Arc::new(mock.clone()),
+        Arc::new(DeploymentRouter::from_deployments(
+            &[rec],
+            Strategy::Simple,
+            HashMap::new(),
+            HashMap::new(),
+        )),
+        Arc::new(RecordingStore::default()),
+        Arc::new(NullLogger),
+    );
+    let req = serde_json::to_vec(&json!({
+        "model": "triage",
+        "state": "My invoice is wrong",
+        "questions": {
+            "route": {
+                "type": "enum",
+                "question": "Which queue?",
+                "options": {"billing": "Billing", "tech": "Tech"}
+            }
+        }
+    }))
+    .unwrap();
+    let resp = gateway
+        .handle_decision(yb_core::DecisionFormat::Decisions, &req, RequestCtx::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.last_request().unwrap().url,
+        "http://jev.test/v1/systemone"
+    );
+    let v: Value = serde_json::from_slice(&collect(resp).await).unwrap();
+    assert_eq!(v["object"], "decision");
+    assert_eq!(v["id"], "dec_abc999");
+    assert_eq!(v["decisions"]["route"]["choice"], "billing");
+
+    // 2. Client calls `jev` (`/v1/systemone`), deployment only serves `decisions` (`/v1/decisions`).
+    let dec_resp = serde_json::to_vec(&json!({
+        "id": "dec_xyz111",
+        "object": "decision",
+        "model": "dec-upstream",
+        "decisions": {"ok": {"yes": 0.5, "no": 0.5, "value": true}},
+        "usage": {"input_tokens": 12}
+    }))
+    .unwrap();
+    let mock2 = MockClient::json(dec_resp);
+    let rec2 = yb_core::DeploymentRecord {
+        id: "d-dec".into(),
+        model_id: "m-router".into(),
+        model_name: "triage".into(),
+        provider_id: "p-dec".into(),
+        provider: "dec-only".into(),
+        upstream_model: "dec-upstream".into(),
+        api_base: Some("http://dec.test/v1".into()),
+        api_key: None,
+        upstream_format: yb_core::DecisionFormat::Decisions.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+        extra: Default::default(),
+        shapes: None,
+        provider_shapes: vec![yb_core::ProviderShape {
+            format: yb_core::DecisionFormat::Decisions.into(),
+            api_base: None,
+        }],
+        created_at: now(),
+        updated_at: now(),
+        deleted_at: None,
+    };
+    let store2 = Arc::new(RecordingStore::default());
+    let gateway2 = Gateway::new(
+        Arc::new(mock2.clone()),
+        Arc::new(DeploymentRouter::from_deployments(
+            &[rec2],
+            Strategy::Simple,
+            HashMap::new(),
+            HashMap::new(),
+        )),
+        store2.clone(),
+        Arc::new(NullLogger),
+    );
+    let resp2 = gateway2
+        .handle_decision(yb_core::DecisionFormat::Jev, &req, RequestCtx::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        mock2.last_request().unwrap().url,
+        "http://dec.test/v1/decisions"
+    );
+    let v2: Value = serde_json::from_slice(&collect(resp2).await).unwrap();
+    assert_eq!(v2["object"], "systemone");
+    assert_eq!(v2["id"], "s1_xyz111");
+    assert_eq!(store2.telemetry()[0].input_tokens, 12);
+}
+
+#[tokio::test]
+async fn provider_shapes_route_chat_embed_and_jev_with_per_shape_bases_and_narrowing() {
+    let provider_shapes = vec![
+        yb_core::ProviderShape {
+            format: WireFormat::Anthropic.into(),
+            api_base: Some("https://api.z.test/api/anthropic".into()),
+        },
+        yb_core::ProviderShape {
+            format: WireFormat::OpenaiChat.into(),
+            api_base: Some("https://api.z.test/api/paas/v4".into()),
+        },
+        yb_core::ProviderShape {
+            format: yb_core::EmbedFormat::OpenaiEmbed.into(),
+            api_base: Some("https://api.z.test/api/paas/v4".into()),
+        },
+    ];
+
+    // Chat-only deployment narrowed to [Anthropic, OpenaiChat], and embed-only narrowed to [OpenaiEmbed].
+    let chat_dep = yb_core::DeploymentRecord {
+        id: "d-chat".into(),
+        model_id: "m-chat".into(),
+        model_name: "glm-5".into(),
+        provider_id: "p-z".into(),
+        provider: "zai".into(),
+        upstream_model: "glm-5".into(),
+        api_base: Some("https://api.z.test/api/anthropic".into()),
+        api_key: Some("zk".into()),
+        upstream_format: WireFormat::Anthropic.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+        extra: Default::default(),
+        shapes: Some(vec![
+            WireFormat::Anthropic.into(),
+            WireFormat::OpenaiChat.into(),
+        ]),
+        provider_shapes: provider_shapes.clone(),
+        created_at: now(),
+        updated_at: now(),
+        deleted_at: None,
+    };
+    let embed_dep = yb_core::DeploymentRecord {
+        id: "d-emb".into(),
+        model_id: "m-emb".into(),
+        model_name: "z-embed".into(),
+        provider_id: "p-z".into(),
+        provider: "zai".into(),
+        upstream_model: "embedding-3".into(),
+        api_base: Some("https://api.z.test/api/anthropic".into()),
+        api_key: Some("zk".into()),
+        upstream_format: yb_core::EmbedFormat::OpenaiEmbed.into(),
+        weight: 1,
+        pricing: None,
+        health_check: Default::default(),
+        health_path: None,
+        extra: Default::default(),
+        shapes: Some(vec![yb_core::EmbedFormat::OpenaiEmbed.into()]),
+        provider_shapes,
+        created_at: now(),
+        updated_at: now(),
+        deleted_at: None,
+    };
+
+    let router = Arc::new(DeploymentRouter::from_deployments(
+        &[chat_dep, embed_dep],
+        Strategy::Simple,
+        HashMap::new(),
+        HashMap::new(),
+    ));
+
+    // 1. OpenAI Chat call to `glm-5` hits `/api/paas/v4/chat/completions` (NO `/v4/v1` bug!).
+    let chat_mock = MockClient::json(
+        serde_json::to_vec(&json!({
+            "id": "c1",
+            "object": "chat.completion",
+            "model": "glm-5",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5}
+        }))
+        .unwrap(),
+    );
+    let gw = Gateway::new(
+        Arc::new(chat_mock.clone()),
+        router.clone(),
+        Arc::new(RecordingStore::default()),
+        Arc::new(NullLogger),
+    );
+    gw.handle(
+        WireFormat::OpenaiChat,
+        br#"{"model":"glm-5","messages":[{"role":"user","content":"hi"}]}"#,
+        RequestCtx::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        chat_mock.last_request().unwrap().url,
+        "https://api.z.test/api/paas/v4/chat/completions"
+    );
+
+    // 2. Calling embed on narrowed chat-only `glm-5` is rejected with 400 BadRequest.
+    let err = gw
+        .handle_embed(
+            yb_core::EmbedFormat::OpenaiEmbed,
+            br#"{"model":"glm-5","input":"hello"}"#,
+            RequestCtx::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.http_status(), 400);
+
+    // 3. Calling decision on `glm-5` (no decision shape enabled) is rejected with 400 BadRequest.
+    let err = gw
+        .handle_decision(
+            yb_core::DecisionFormat::Jev,
+            br#"{"model":"glm-5","state":"hi","questions":{"q":{"type":"noul","question":"ok?"}}}"#,
+            RequestCtx::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.http_status(), 400);
+
+    // 4. Calling embed on `z-embed` uses the provider's `openai_embed` shape base `/api/paas/v4/embeddings`.
+    let emb_mock = MockClient::json(
+        serde_json::to_vec(&json!({
+            "object": "list",
+            "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
+            "model": "embedding-3",
+            "usage": {"prompt_tokens": 3, "total_tokens": 3}
+        }))
+        .unwrap(),
+    );
+    let gw_emb = Gateway::new(
+        Arc::new(emb_mock.clone()),
+        router,
+        Arc::new(RecordingStore::default()),
+        Arc::new(NullLogger),
+    );
+    gw_emb
+        .handle_embed(
+            yb_core::EmbedFormat::OpenaiEmbed,
+            br#"{"model":"z-embed","input":"hello"}"#,
+            RequestCtx::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        emb_mock.last_request().unwrap().url,
+        "https://api.z.test/api/paas/v4/embeddings"
+    );
 }

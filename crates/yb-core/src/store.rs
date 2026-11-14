@@ -175,6 +175,12 @@ pub trait Store: Send + Sync {
     async fn get_deployment(&self, id: &str) -> crate::Result<Option<DeploymentRecord>>;
     /// Create a deployment, resolving (or creating) its model by name. Atomic.
     async fn create_deployment(&self, dep: &NewDeployment) -> crate::Result<DeploymentRecord>;
+    /// Update the per-deployment shape subset (`None` = inherit all provider shapes).
+    async fn set_deployment_shapes(
+        &self,
+        id: &str,
+        shapes: Option<&[crate::routing::UpstreamFormat]>,
+    ) -> crate::Result<DeploymentRecord>;
     async fn delete_deployment(&self, id: &str) -> crate::Result<()>;
     /// Idempotently seed a deployment by its identity tuple (model + provider +
     /// upstream model + api base). Returns `true` if a new row was inserted.

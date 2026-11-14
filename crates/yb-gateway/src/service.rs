@@ -248,11 +248,8 @@ pub struct Gateway {
     /// applied to deployments whose `extra` sets `cloudflare_access`.
     /// File-owned and immutable for the process lifetime.
     pub(crate) cf_access: Option<Arc<CloudflareAccessConfig>>,
-    /// Responses translated for a QE provider, kept for
-    /// `previous_response_id` and the `/v1/responses/{id}` endpoints.
-    pub(crate) responses: Arc<crate::qe::ResponseStore>,
     /// Responses relayed to providers that keep them: where each lives.
-    pub(crate) relayed: Arc<crate::qe::RelayedResponses>,
+    pub(crate) relayed: Arc<crate::relay::RelayedResponses>,
 }
 
 impl Gateway {
@@ -282,8 +279,7 @@ impl Gateway {
             logger,
             observer,
             cf_access: None,
-            responses: Arc::new(crate::qe::ResponseStore::default()),
-            relayed: Arc::new(crate::qe::RelayedResponses::default()),
+            relayed: Arc::new(crate::relay::RelayedResponses::default()),
         }
     }
 
@@ -320,6 +316,7 @@ impl Gateway {
         let mut headers = match fmt {
             yb_core::UpstreamFormat::Chat(f) => auth_headers(f, key),
             yb_core::UpstreamFormat::Embed(f) => yb_providers::embed_auth_headers(f, key),
+            yb_core::UpstreamFormat::Decision(_) => yb_providers::decision_auth_headers(key),
             yb_core::UpstreamFormat::Media(_) => yb_providers::media_auth_headers(key),
         };
         append_headers(&mut headers, self.extra_headers(extra, label));
@@ -461,25 +458,13 @@ impl Gateway {
         //    while buffering, and gives one uniform path that the translator can
         //    either stream through or aggregate into a single response body.
         for deployment in candidates {
-            // Chat requests only dispatch to chat-format deployments; embedding
-            // deployments are a different universe (see Gateway::handle_embed).
-            let upstream_fmt = match deployment.upstream_format {
-                yb_core::UpstreamFormat::Chat(f) => f,
-                yb_core::UpstreamFormat::Embed(_) | yb_core::UpstreamFormat::Media(_) => continue,
+            // Chat requests only dispatch to deployments serving at least one
+            // chat shape; embedding / decision / media-only deployments skip.
+            let Some((wire_fmt, base_ref, relay)) = deployment.chat_target(surface) else {
+                continue;
             };
+            let base = base_ref.map(str::to_string);
             saw_embed_only = false;
-            // The client's own shape, when this deployment's provider serves
-            // it: relayed as the client sent it (model id and credentials
-            // aside) and answered as the provider answered. Otherwise the
-            // request is translated to the deployment's upstream format.
-            let native = deployment
-                .native_base(surface)
-                .map(|b| b.map(str::to_string));
-            let relay = native.is_some();
-            let (wire_fmt, base) = match native {
-                Some(base) => (surface, base),
-                None => (upstream_fmt, deployment.api_base.clone()),
-            };
             // A relay keeps the client's stream choice, so a buffered answer
             // is the provider's own body. A translation always streams: it
             // lets one path either stream through or aggregate.
@@ -490,41 +475,7 @@ impl Gateway {
                 && surface == WireFormat::OpenaiChat
                 && stream_requested
                 && !chat.include_usage;
-            // A QE provider's Chat surface is QE's own request form: a shape
-            // it does not serve natively is translated with QE's rules, not
-            // through the IR (see crate::qe).
-            let qe_reply = if !relay
-                && upstream_fmt == WireFormat::OpenaiChat
-                && crate::qe::is_qe(&deployment.extra)
-                && matches!(surface, WireFormat::Anthropic | WireFormat::OpenaiResponses)
-            {
-                match crate::qe::translate(
-                    surface,
-                    body,
-                    &deployment.upstream_model,
-                    &deployment.extra,
-                    &self.responses,
-                    ctx.user_id.as_deref(),
-                ) {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        guard.fail(e.http_status()).await;
-                        return Err(e);
-                    }
-                }
-            } else {
-                None
-            };
-            let up_stream = match &qe_reply {
-                Some((_, stream, _)) => *stream,
-                None => up_stream,
-            };
-            let emitted = if let Some((bytes, _, _)) = &qe_reply {
-                Ok((
-                    bytes.clone(),
-                    vec![("content-type".to_string(), "application/json".to_string())],
-                ))
-            } else if relay {
+            let emitted = if relay {
                 crate::relay::relay_body(surface, body, &deployment.upstream_model, drop_usage).map(
                     |b| {
                         (
@@ -539,7 +490,7 @@ impl Gateway {
                     force_reasoning_effort: None,
                     stream: true,
                 };
-                wire::emit_request(upstream_fmt, &chat, &opts)
+                wire::emit_request(wire_fmt, &chat, &opts)
             };
             let (up_body, mut headers) = match emitted {
                 Ok(v) => v,
@@ -567,7 +518,7 @@ impl Gateway {
             let register: Option<Register> = (relay && surface == WireFormat::OpenaiResponses)
                 .then(|| {
                     let relayed = self.relayed.clone();
-                    let entry = crate::qe::Relayed {
+                    let entry = crate::relay::Relayed {
                         url: build_url(
                             WireFormat::OpenaiResponses,
                             base.as_deref(),
@@ -662,18 +613,6 @@ impl Gateway {
                 chat.prompt_cache_retention.clone(),
             );
             let upstream_fmt = wire_fmt;
-            if let Some((_, client_stream, reply)) = qe_reply {
-                return self
-                    .qe_answer(
-                        resp,
-                        client_stream,
-                        reply,
-                        &deployment.upstream_model,
-                        rctx,
-                        status,
-                    )
-                    .await;
-            }
             return match (stream_requested, resp.body) {
                 (false, ResponseBody::Full(bytes)) if relay => {
                     if let Some(reg) = &register {
@@ -872,79 +811,8 @@ impl Gateway {
 }
 
 impl Gateway {
-    /// QE's Chat answer, written in the client's shape (see [`crate::qe`]).
-    async fn qe_answer(
-        &self,
-        resp: yb_providers::UpstreamResponse,
-        client_stream: bool,
-        reply: crate::qe::Reply,
-        model: &str,
-        rctx: RecordCtx,
-        status: u16,
-    ) -> Result<GatewayResponse> {
-        let background = matches!(
-            &reply,
-            crate::qe::Reply::Responses {
-                background: true,
-                ..
-            }
-        );
-        if background && !client_stream {
-            let (up, upstream_stream): (ByteStream, bool) = match resp.body {
-                ResponseBody::Stream(s) => (s, true),
-                ResponseBody::Full(b) => (
-                    Box::pin(stream::once(async move { Ok(Bytes::from(b)) })),
-                    false,
-                ),
-            };
-            let body = crate::qe::background(
-                up,
-                upstream_stream,
-                reply,
-                model.to_string(),
-                self.responses.clone(),
-                rctx,
-                status,
-            );
-            return Ok(GatewayResponse::Full {
-                status,
-                headers: json_headers(WireFormat::OpenaiResponses),
-                body,
-            });
-        }
-        match resp.body {
-            ResponseBody::Stream(up) if client_stream => Ok(GatewayResponse::Stream {
-                status,
-                headers: sse_headers(),
-                stream: crate::qe::stream(
-                    up,
-                    reply,
-                    model.to_string(),
-                    self.responses.clone(),
-                    rctx,
-                    status,
-                ),
-            }),
-            ResponseBody::Full(bytes) if !client_stream => {
-                let (status, body) =
-                    crate::qe::full(bytes, reply, model, &self.responses, rctx, status).await?;
-                Ok(GatewayResponse::Full {
-                    status,
-                    headers: json_headers(WireFormat::OpenaiResponses),
-                    body,
-                })
-            }
-            _ => Err(Error::Upstream {
-                provider: "qe".into(),
-                status: 502,
-                message: "QE answered in the other stream mode than asked".into(),
-            }),
-        }
-    }
-
     /// `GET` / `DELETE /v1/responses/{id}`, `POST …/cancel`, `GET
-    /// …/input_items`: answered from the gateway's own store for a response
-    /// it translated, or by the provider that keeps a relayed one.
+    /// …/input_items`: forwarded to the provider that keeps a relayed response.
     pub async fn response_op(
         &self,
         id: &str,
@@ -952,30 +820,6 @@ impl Gateway {
         ctx: &RequestCtx,
     ) -> Result<GatewayResponse> {
         let owner = ctx.user_id.as_deref();
-        let own = match &op {
-            ResponseOp::Get => self.responses.get(id, owner),
-            ResponseOp::Delete => self
-                .responses
-                .delete(id, owner)
-                .then(|| serde_json::json!({"id": id, "object": "response", "deleted": true})),
-            ResponseOp::Cancel => match self.responses.cancel(id, owner) {
-                Ok(v) => Some(v),
-                Err(Error::NotFound(_)) => None,
-                Err(e) => return Err(e),
-            },
-            ResponseOp::InputItems(q) => match self.responses.input_items(id, owner, q) {
-                Ok(v) => Some(v),
-                Err(Error::NotFound(_)) => None,
-                Err(e) => return Err(e),
-            },
-        };
-        if let Some(v) = own {
-            return Ok(GatewayResponse::Full {
-                status: 200,
-                headers: json_headers(WireFormat::OpenaiResponses),
-                body: serde_json::to_vec(&v).unwrap_or_default(),
-            });
-        }
         let Some(r) = self.relayed.get(id, owner) else {
             return Err(Error::NotFound(format!(
                 "No response found with id '{id}'."
@@ -1133,7 +977,7 @@ pub(crate) struct RecordCtx {
 /// waited for a place in its engine, in milliseconds.
 const QUEUE_HEADER: &str = "x-queue-ms";
 
-fn waited_ms(headers: &[(String, String)]) -> Option<i64> {
+pub(crate) fn waited_ms(headers: &[(String, String)]) -> Option<i64> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(QUEUE_HEADER))
@@ -1197,11 +1041,6 @@ fn speed(
 }
 
 impl RecordCtx {
-    /// Notes that the turn's first token arrived (if it is the first).
-    pub(crate) fn first_token(&self) {
-        self.first_token.get_or_init(Instant::now);
-    }
-
     /// Notes the turn's first token among events read from the upstream.
     pub(crate) fn saw(&self, events: &[StreamEvent]) {
         if events.iter().any(is_output) {
@@ -1668,7 +1507,7 @@ fn responses_terminal(line: &str) -> Result<Option<bool>> {
     Ok(Some(kind != "response.completed"))
 }
 
-/// Notes a relayed Responses id (see [`crate::qe::Relayed`]).
+/// Notes a relayed Responses id (see [`crate::relay::Relayed`]).
 type Register = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// How a same-shape relay treats the provider's stream.

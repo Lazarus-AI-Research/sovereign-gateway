@@ -36,7 +36,8 @@ use yb_core::principal::KeyAuth;
 use yb_core::ratelimit::Limits;
 use yb_core::spend::{BudgetAction, SubjectType};
 use yb_core::{
-    new_id, now, AccessPolicy, EmbedFormat, Error, MediaFormat, UpstreamFormat, WireFormat,
+    new_id, now, AccessPolicy, DecisionFormat, EmbedFormat, Error, MediaFormat, UpstreamFormat,
+    WireFormat,
 };
 use yb_gateway::media::VideoLookup;
 use yb_gateway::{GatewayResponse, RequestCtx, TokenMeter};
@@ -71,6 +72,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/responses/:id/cancel", post(response_cancel))
         .route("/v1/responses/:id/input_items", get(response_input_items))
+        .route("/v1/systemone", post(jev_systemone))
+        .route("/v1/decisions", post(openai_decisions))
         .route("/v1/embeddings", post(openai_embeddings))
         .route("/v1/multimodalembeddings", post(voyage_embeddings))
         .route("/v2/embed", post(cohere_embed))
@@ -99,6 +102,10 @@ pub fn build_router(state: AppState) -> Router {
             "/openai/v1/responses/:id/input_items",
             get(response_input_items),
         )
+        .route("/openai/v1/decisions", post(openai_decisions))
+        .route("/jev/v1/systemone", post(jev_systemone))
+        .route("/jev/v1/decisions", post(openai_decisions))
+        .route("/jev/v1/models", get(models_openai))
         .route("/openai/v1/embeddings", post(openai_embeddings))
         .route("/openai/v1/images/generations", post(openai_images))
         .route("/openai/v1/audio/speech", post(openai_speech))
@@ -174,6 +181,18 @@ async fn spa_fallback(uri: axum::http::Uri) -> Response {
         || p.starts_with("/v1")
         || p.starts_with("/v1beta")
         || p.starts_with("/v2")
+        || p == "/jev"
+        || p.starts_with("/jev/")
+        || p == "/openai"
+        || p.starts_with("/openai/")
+        || p == "/anthropic"
+        || p.starts_with("/anthropic/")
+        || p == "/gemini"
+        || p.starts_with("/gemini/")
+        || p == "/cohere"
+        || p.starts_with("/cohere/")
+        || p == "/voyage"
+        || p.starts_with("/voyage/")
         || p.starts_with("/ui")
         || p == "/health";
     if is_api {
@@ -264,7 +283,7 @@ async fn model_names(state: &AppState, access: &AccessPolicy) -> Vec<String> {
 /// A model discovery lists, with what its reachable deployments say it does.
 struct ListedModel {
     name: String,
-    /// What the model answers: `chat`, `embedding`, `image_generation`,
+    /// What the model answers: `chat`, `embedding`, `decision`, `image_generation`,
     /// `video_generation`, `audio_speech` or `audio_transcription`.
     mode: &'static str,
     vision: bool,
@@ -278,10 +297,20 @@ async fn listed_models(state: &AppState, access: &AccessPolicy) -> Vec<ListedMod
             if !access.permits_model(&d.model_id) || !access.permits_provider(&d.provider_id) {
                 continue;
             }
+            let eff: Vec<UpstreamFormat> = d
+                .to_deployment()
+                .effective_shapes()
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect();
+            if eff.is_empty() {
+                continue;
+            }
+            let primary = yb_core::default_upstream_format(&eff).unwrap_or(d.upstream_format);
             match models.iter_mut().find(|m| m.name == d.model_name) {
                 Some(listed) => listed.vision |= d.extra.vision,
                 None => models.push(ListedModel {
-                    mode: mode_of(d.upstream_format),
+                    mode: mode_of(primary),
                     vision: d.extra.vision,
                     name: d.model_name,
                 }),
@@ -295,6 +324,7 @@ fn mode_of(format: UpstreamFormat) -> &'static str {
     match format {
         UpstreamFormat::Chat(_) => "chat",
         UpstreamFormat::Embed(_) => "embedding",
+        UpstreamFormat::Decision(_) => "decision",
         UpstreamFormat::Media(MediaFormat::OpenaiImages) => "image_generation",
         UpstreamFormat::Media(MediaFormat::OpenaiSpeech) => "audio_speech",
         UpstreamFormat::Media(MediaFormat::OpenaiTranscription) => "audio_transcription",
@@ -423,6 +453,20 @@ async fn openai_responses(
     body: Bytes,
 ) -> Response {
     run_inference(state, WireFormat::OpenaiResponses.into(), headers, body).await
+}
+
+/// `POST /v1/systemone` and `/jev/v1/systemone` — SystemOne (`jev`) single-pass logit probing.
+async fn jev_systemone(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    run_inference(state, DecisionFormat::Jev.into(), headers, body).await
+}
+
+/// `POST /v1/decisions`, `/openai/v1/decisions`, `/jev/v1/decisions` — OpenAI / LiteLLM Decisions.
+async fn openai_decisions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    run_inference(state, DecisionFormat::Decisions.into(), headers, body).await
 }
 
 /// `POST /v1/embeddings` — OpenAI-dialect embeddings (also the shape vLLM,
@@ -635,8 +679,8 @@ async fn run_inference(
 enum Call {
     Turn(UpstreamFormat, Bytes),
     Video(String, VideoLookup),
-    /// A stored Responses answer (one the gateway translated for a QE
-    /// provider and keeps): read, deleted, cancelled, or its input listed.
+    /// A relayed Responses answer kept by its upstream provider: read,
+    /// deleted, cancelled, or its input listed.
     Response(String, ResponseLookup),
 }
 
@@ -742,6 +786,9 @@ async fn run_call(state: AppState, headers: HeaderMap, call: Call) -> Response {
         Call::Turn(UpstreamFormat::Chat(f), body) => state.gateway.handle(f, &body, ctx).await,
         Call::Turn(UpstreamFormat::Embed(f), body) => {
             state.gateway.handle_embed(f, &body, ctx).await
+        }
+        Call::Turn(UpstreamFormat::Decision(f), body) => {
+            state.gateway.handle_decision(f, &body, ctx).await
         }
         Call::Turn(UpstreamFormat::Media(f), body) => {
             let content_type =

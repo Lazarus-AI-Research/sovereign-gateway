@@ -12,7 +12,63 @@
 //! Gemini carries the model and the stream switch in the URL; the server lifts
 //! both into the body for routing, and they are removed again here.
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
+
 use yb_core::{Error, Result, WireFormat};
+
+/// Where a relayed Responses answer lives: the provider keeps it (and its
+/// conversation), so `GET` / `DELETE` / `cancel` / `input_items` of its id go
+/// back there, and a `previous_response_id` naming it is routed there first.
+#[derive(Debug, Clone)]
+pub struct Relayed {
+    /// The provider's Responses endpoint (`…/v1/responses`).
+    pub url: String,
+    /// The credentials and edge headers the turn was sent with.
+    pub headers: Vec<(String, String)>,
+    pub owner: Option<String>,
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+/// Relayed Responses ids, newest kept (bounded).
+pub struct RelayedResponses {
+    inner: Mutex<(HashMap<String, Relayed>, VecDeque<String>)>,
+    cap: usize,
+}
+
+impl Default for RelayedResponses {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(Default::default()),
+            cap: 16384,
+        }
+    }
+}
+
+impl RelayedResponses {
+    pub fn insert(&self, id: &str, r: Relayed) {
+        let mut g = self.inner.lock().unwrap();
+        if g.0.insert(id.to_string(), r).is_none() {
+            g.1.push_back(id.to_string());
+        }
+        while g.0.len() > self.cap {
+            let Some(old) = g.1.pop_front() else { break };
+            g.0.remove(&old);
+        }
+    }
+
+    /// The relayed response `id`, if `owner` made it.
+    pub fn get(&self, id: &str, owner: Option<&str>) -> Option<Relayed> {
+        self.inner
+            .lock()
+            .unwrap()
+            .0
+            .get(id)
+            .filter(|r| r.owner.as_deref() == owner)
+            .cloned()
+    }
+}
 
 /// The upstream body for a same-shape relay of `body`.
 ///
@@ -82,7 +138,7 @@ pub fn is_usage_only_chunk(frame: &[u8]) -> bool {
 
 /// `body` with the top-level `key` set to the JSON text `value`: the existing
 /// value's bytes are replaced in place, or the member is added first.
-fn set_top_level(body: &[u8], key: &str, value: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn set_top_level(body: &[u8], key: &str, value: &[u8]) -> Result<Vec<u8>> {
     if let Some((a, b)) = top_level_span(body, key)? {
         let mut out = Vec::with_capacity(body.len() + value.len());
         out.extend_from_slice(&body[..a]);

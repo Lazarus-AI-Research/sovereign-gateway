@@ -414,9 +414,14 @@ pub struct DeploymentConfig {
     /// The upstream provider api key for this deployment.
     #[serde(default)]
     pub api_key: Option<String>,
-    /// The upstream wire format — the single "adapter shape" used to call this
-    /// deployment (`anthropic`, `openai_chat`, `openai_responses`, `gemini`).
-    pub upstream_format: UpstreamFormat,
+    /// Primary / fallback upstream wire format. Optional when the provider or
+    /// `shapes` declares supported API shapes (derived automatically on import).
+    #[serde(default)]
+    pub upstream_format: Option<UpstreamFormat>,
+    /// Optional per-deployment shape subset (`None` = inherit all shapes from
+    /// the provider).
+    #[serde(default)]
+    pub shapes: Option<Vec<UpstreamFormat>>,
     #[serde(default = "default_weight")]
     pub weight: u32,
     #[serde(default)]

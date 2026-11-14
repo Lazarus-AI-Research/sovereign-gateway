@@ -5,7 +5,7 @@
 //! and even that is purely mechanical (endpoint paths, auth header names). All
 //! payload shaping happens in `yb-wire`.
 
-use yb_core::{EmbedFormat, WireFormat};
+use yb_core::{DecisionFormat, EmbedFormat, WireFormat};
 
 /// Default API bases per vendor (without a version segment — `build_url` adds it).
 const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
@@ -18,9 +18,40 @@ const OLLAMA_BASE: &str = "http://localhost:11434";
 /// The `anthropic-version` value we pin for the Messages API.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// Trims a single trailing slash from `base` so path joins don't double up.
-fn trim_base(base: &str) -> &str {
-    base.strip_suffix('/').unwrap_or(base)
+/// Joins `endpoint` below `base`, inserting `default_version` (e.g. `"v1"`,
+/// `"v1beta"`, `"v2"`, `"api"`) only when `base`'s URL path does not already
+/// end in `default_version` or an explicit version segment (`/v<digits>[alpha|beta]`).
+///
+/// Inspecting the URL *path* (after `scheme://host`) ensures hostnames like
+/// `http://v2:8000` still receive `/v1/...`, while custom versioned bases like
+/// `https://api.z.ai/api/paas/v4` join directly to `.../v4/chat/completions`
+/// rather than `.../v4/v1/chat/completions`.
+pub fn join_versioned_endpoint(base: &str, default_version: &str, endpoint: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let path = match base.find("://") {
+        Some(idx) => match base[idx + 3..].find('/') {
+            Some(slash) => &base[idx + 3 + slash + 1..],
+            None => "",
+        },
+        None => base.strip_prefix('/').unwrap_or(base),
+    };
+    let last_seg = path.rsplit('/').next().unwrap_or("");
+    if last_seg == default_version || is_explicit_version_segment(last_seg) {
+        format!("{base}/{endpoint}")
+    } else {
+        format!("{base}/{default_version}/{endpoint}")
+    }
+}
+
+fn is_explicit_version_segment(seg: &str) -> bool {
+    let Some(rest) = seg.strip_prefix('v') else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return false;
+    }
+    matches!(&rest[digits..], "" | "alpha" | "beta")
 }
 
 /// Builds the upstream request URL for a deployment, keyed on the **upstream
@@ -28,10 +59,8 @@ fn trim_base(base: &str) -> &str {
 /// `/chat/completions`).
 ///
 /// A configured `api_base` is the model's own base URL. It may or may not
-/// already include the version segment (`/v1`, `/v1beta`) — both styles are
-/// supported: we only add the version when the base does not already end with
-/// it, so `https://host/v1` + responses → `https://host/v1/responses` (not
-/// `…/v1/v1/responses`).
+/// already include a version segment (`/v1`, `/v1beta`, `/v4`, …) — both styles
+/// are supported via [`join_versioned_endpoint`].
 ///
 /// `stream` only changes the URL for Gemini (a distinct `:streamGenerateContent`
 /// action with `alt=sse`); Anthropic and OpenAI carry the stream toggle in the
@@ -56,19 +85,12 @@ pub fn build_url(
         }
     };
 
-    let base = trim_base(api_base.unwrap_or(default_base));
-    // Don't duplicate the version segment if the model's base already ends in it.
-    if base == version || base.ends_with(&format!("/{version}")) {
-        format!("{base}/{endpoint}")
-    } else {
-        format!("{base}/{version}/{endpoint}")
-    }
+    join_versioned_endpoint(api_base.unwrap_or(default_base), version, &endpoint)
 }
 
 /// Builds the upstream request URL for an **embeddings** deployment. Embeddings
 /// never stream, so there is no stream toggle. Version-segment dedup works the
-/// same as [`build_url`] (an `api_base` ending in `/v1`, `/v1beta`, `/v2`, or
-/// `/api` is not doubled).
+/// same as [`build_url`].
 pub fn build_embed_url(fmt: EmbedFormat, api_base: Option<&str>, upstream_model: &str) -> String {
     let (default_base, version, endpoint) = match fmt {
         EmbedFormat::OpenaiEmbed => (OPENAI_BASE, "v1", "embeddings".to_string()),
@@ -82,23 +104,19 @@ pub fn build_embed_url(fmt: EmbedFormat, api_base: Option<&str>, upstream_model:
         EmbedFormat::OllamaEmbed => (OLLAMA_BASE, "api", "embed".to_string()),
     };
 
-    let base = trim_base(api_base.unwrap_or(default_base));
-    if base == version || base.ends_with(&format!("/{version}")) {
-        format!("{base}/{endpoint}")
-    } else {
-        format!("{base}/{version}/{endpoint}")
-    }
+    join_versioned_endpoint(api_base.unwrap_or(default_base), version, &endpoint)
+}
+
+/// Builds the upstream request URL for a **decision / SystemOne** deployment
+/// (`POST /v1/systemone` for `jev`, `POST /v1/decisions` for `decisions`).
+pub fn build_decision_url(fmt: DecisionFormat, api_base: Option<&str>) -> String {
+    join_versioned_endpoint(api_base.unwrap_or(OPENAI_BASE), "v1", fmt.path())
 }
 
 /// The URL of an OpenAI media endpoint below a deployment's base, with the same
 /// `/v1` handling as the other OpenAI-compatible URLs.
 pub fn build_media_url(fmt: yb_core::MediaFormat, api_base: Option<&str>) -> String {
-    let base = trim_base(api_base.unwrap_or(OPENAI_BASE));
-    if base == "v1" || base.ends_with("/v1") {
-        format!("{base}/{}", fmt.path())
-    } else {
-        format!("{base}/v1/{}", fmt.path())
-    }
+    join_versioned_endpoint(api_base.unwrap_or(OPENAI_BASE), "v1", fmt.path())
 }
 
 /// The prefix that makes a stored upstream key a reference to an environment
@@ -166,6 +184,17 @@ pub fn embed_auth_headers(fmt: EmbedFormat, api_key: &str) -> Vec<(String, Strin
     }
 }
 
+/// The authentication header for SystemOne (`jev`) and Decisions endpoints:
+/// `Authorization: Bearer <key>` when a key is configured.
+pub fn decision_auth_headers(api_key: &str) -> Vec<(String, String)> {
+    let secret = upstream_secret(api_key);
+    if secret.is_empty() {
+        Vec::new()
+    } else {
+        vec![("authorization".to_string(), format!("Bearer {secret}"))]
+    }
+}
+
 /// The authentication header for OpenAI's image, speech and transcription
 /// endpoints: `Authorization: Bearer <key>`.
 pub fn media_auth_headers(api_key: &str) -> Vec<(String, String)> {
@@ -230,4 +259,43 @@ pub fn is_retryable(status: u16) -> bool {
 /// candidate rather than a hard error.
 pub fn is_model_not_found(status: u16) -> bool {
     status == 404
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn joins_versioned_and_unversioned_bases_cleanly() {
+        assert_eq!(
+            build_url(
+                WireFormat::OpenaiChat,
+                Some("https://api.z.ai/api/paas/v4"),
+                "glm-5",
+                false
+            ),
+            "https://api.z.ai/api/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            build_url(
+                WireFormat::Anthropic,
+                Some("https://api.z.ai/api/anthropic"),
+                "glm-5",
+                false
+            ),
+            "https://api.z.ai/api/anthropic/v1/messages"
+        );
+        assert_eq!(
+            build_url(WireFormat::OpenaiChat, Some("http://v2:8000"), "m", false),
+            "http://v2:8000/v1/chat/completions"
+        );
+        assert_eq!(
+            build_decision_url(DecisionFormat::Jev, Some("https://cluster.example/v1/")),
+            "https://cluster.example/v1/systemone"
+        );
+        assert_eq!(
+            build_decision_url(DecisionFormat::Decisions, Some("https://cluster.example")),
+            "https://cluster.example/v1/decisions"
+        );
+    }
 }

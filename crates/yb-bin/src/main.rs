@@ -303,8 +303,8 @@ async fn run_import(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     store.migrate().await?;
 
     let total: usize = models.models.iter().map(|m| m.deployments.len()).sum();
-    if total == 0 {
-        println!("no [[model]] entries in {models_path}; nothing to import");
+    if total == 0 && models.providers.is_empty() {
+        println!("no [[provider]] or [[model]] entries in {models_path}; nothing to import");
         return Ok(());
     }
     let provider_count = seed_providers(store.as_ref(), &models.providers).await?;
@@ -613,11 +613,49 @@ async fn seed_models(
         // only aliases still needs a model row for `seed_aliases` to target.
         store.ensure_model(&mc.model_name).await?;
         for dc in &mc.deployments {
+            let provider = store.get_provider_by_name(&dc.provider).await?;
+            let provider_fmts: Vec<yb_core::UpstreamFormat> = provider
+                .as_ref()
+                .map(|p| p.shapes.iter().map(|s| s.format).collect())
+                .unwrap_or_default();
+            if let Some(shapes) = &dc.shapes {
+                if shapes.is_empty() {
+                    return Err(format!(
+                        "model \"{}\" deployment on provider \"{}\" has an empty `shapes` array",
+                        mc.model_name, dc.provider
+                    )
+                    .into());
+                }
+                if !provider_fmts.is_empty() {
+                    for &fmt in shapes {
+                        if !provider_fmts.contains(&fmt) {
+                            return Err(format!(
+                                "model \"{}\" enables shape \"{}\" which provider \"{}\" does not serve",
+                                mc.model_name,
+                                fmt.as_str(),
+                                dc.provider
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+            let upstream_format = dc
+                .upstream_format
+                .or_else(|| dc.shapes.as_deref().and_then(yb_core::default_upstream_format))
+                .or_else(|| yb_core::default_upstream_format(&provider_fmts))
+                .ok_or_else(|| {
+                    format!(
+                        "model \"{}\" deployment on provider \"{}\" requires `upstream_format` or `shapes`",
+                        mc.model_name, dc.provider
+                    )
+                })?;
             let rec = NewDeployment {
                 model_name: mc.model_name.clone(),
                 provider_name: dc.provider.clone(),
                 upstream_model: dc.upstream_model.clone(),
-                upstream_format: dc.upstream_format,
+                upstream_format,
+                shapes: dc.shapes.clone(),
                 weight: dc.weight,
                 pricing: dc.pricing,
                 health_check: dc.health_check,
@@ -644,14 +682,15 @@ async fn seed_providers(
             return Err("a [[provider]] block is missing its name".into());
         }
         let existing = store.ensure_provider(&pc.name).await?;
+        let api_base = pc.api_base.as_deref().or(existing.api_base.as_deref());
+        let api_key = pc.api_key.as_deref().or(existing.api_key.as_deref());
+        let extra = if pc.extra.is_empty() {
+            &existing.extra
+        } else {
+            &pc.extra
+        };
         store
-            .update_provider(
-                &existing.id,
-                &pc.name,
-                pc.api_base.as_deref(),
-                pc.api_key.as_deref(),
-                &pc.extra,
-            )
+            .update_provider(&existing.id, &pc.name, api_base, api_key, extra)
             .await?;
         if let Some(shapes) = &pc.shapes {
             store.set_provider_shapes(&existing.id, shapes).await?;

@@ -33,8 +33,8 @@ pub use observe::{NullObserver, Observer};
 pub use principal::{KeyAuth, Principal};
 pub use reqlog::{CaptureFilter, CapturedTurn, NullLogger, RequestLogRecord, RequestLogger};
 pub use routing::{
-    Decision, Deployment, DeploymentRecord, EmbedFormat, Extra, HealthCheck, HealthRecord,
-    MediaFormat, ModelRecord, NewDeployment, ProviderRecord, ProviderShape, RouteRequest, Router,
-    UpstreamFormat, WireFormat,
+    default_upstream_format, resolve_effective_shapes, Decision, DecisionFormat, Deployment,
+    DeploymentRecord, EmbedFormat, Extra, HealthCheck, HealthRecord, MediaFormat, ModelRecord,
+    NewDeployment, ProviderRecord, ProviderShape, RouteRequest, Router, UpstreamFormat, WireFormat,
 };
 pub use store::{LimitColumns, Store};
