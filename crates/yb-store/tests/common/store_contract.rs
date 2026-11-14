@@ -573,6 +573,7 @@ fn new_dep(model_name: &str, provider: &str) -> yb_core::NewDeployment {
         provider_name: provider.into(),
         upstream_model: "gpt-4o".into(),
         upstream_format: WireFormat::OpenaiChat.into(),
+        shapes: None,
         weight: 2,
         health_check: Default::default(),
         health_path: None,
@@ -725,7 +726,8 @@ async fn omitting_the_api_key_on_update_keeps_it() {
     );
 }
 
-/// A provider's natively served shapes round-trip, reach its deployments, and
+/// A provider's natively served shapes (chat, embed, decision/SystemOne)
+/// round-trip, reach its deployments, can be narrowed per deployment, and
 /// survive an endpoint edit that does not mention them.
 #[tokio::test]
 async fn provider_shapes_round_trip_and_join_onto_deployments() {
@@ -740,11 +742,23 @@ async fn provider_shapes_round_trip_and_join_onto_deployments() {
     assert!(p.shapes.is_empty(), "an existing provider declares no shapes");
     let shapes = vec![
         yb_core::ProviderShape {
-            format: yb_core::WireFormat::Anthropic,
+            format: yb_core::WireFormat::Anthropic.into(),
             api_base: Some("https://x.test/anthropic".into()),
         },
         yb_core::ProviderShape {
-            format: yb_core::WireFormat::OpenaiChat,
+            format: yb_core::WireFormat::OpenaiChat.into(),
+            api_base: None,
+        },
+        yb_core::ProviderShape {
+            format: yb_core::EmbedFormat::OpenaiEmbed.into(),
+            api_base: Some("https://x.test/embed/v1".into()),
+        },
+        yb_core::ProviderShape {
+            format: yb_core::DecisionFormat::Jev.into(),
+            api_base: None,
+        },
+        yb_core::ProviderShape {
+            format: yb_core::DecisionFormat::Decisions.into(),
             api_base: None,
         },
     ];
@@ -756,8 +770,27 @@ async fn provider_shapes_round_trip_and_join_onto_deployments() {
         .unwrap();
     assert_eq!(edited.shapes, shapes, "an endpoint edit keeps the shapes");
     let deps = store.list_deployments().await.unwrap();
-    assert_eq!(deps[0].shapes, shapes);
+    assert_eq!(deps[0].provider_shapes, shapes);
+    assert_eq!(deps[0].shapes, None, "deployments inherit all shapes by default");
+
+    // Narrow deployment shapes, then reset back to None (inherit all).
+    let narrowed_fmt = vec![
+        yb_core::UpstreamFormat::Chat(yb_core::WireFormat::OpenaiChat),
+        yb_core::UpstreamFormat::Decision(yb_core::DecisionFormat::Jev),
+    ];
+    let narrowed = store
+        .set_deployment_shapes(&deps[0].id, Some(&narrowed_fmt))
+        .await
+        .unwrap();
+    assert_eq!(narrowed.shapes.as_deref(), Some(narrowed_fmt.as_slice()));
+    let reset = store
+        .set_deployment_shapes(&deps[0].id, None)
+        .await
+        .unwrap();
+    assert_eq!(reset.shapes, None);
+
     assert!(store.set_provider_shapes("nope", &shapes).await.is_err());
+    assert!(store.set_deployment_shapes("nope", None).await.is_err());
 }
 
 /// Two deployments of one public name are the load-balancing fan-out: one
@@ -986,6 +1019,7 @@ async fn embed_format_deployment_roundtrips() {
         provider_name: "runtime".into(),
         upstream_model: "LCO-Embedding-Omni".into(),
         upstream_format: EmbedFormat::OpenaiEmbed.into(),
+        shapes: None,
         weight: 1,
         pricing: None,
         health_check: Default::default(),

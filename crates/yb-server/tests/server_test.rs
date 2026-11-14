@@ -84,7 +84,8 @@ async fn setup() -> (AppState, String) {
             upstream_model: "gpt-4o".into(),
             api_base: None,
             api_key: None,
-            upstream_format: WireFormat::OpenaiChat.into(),
+            upstream_format: Some(WireFormat::OpenaiChat.into()),
+            shapes: None,
             weight: 1,
             pricing: None,
             health_check: Default::default(),
@@ -1080,6 +1081,7 @@ async fn seed_dep(store: &dyn Store, model_name: &str, provider: &str) {
         provider_name: provider.into(),
         upstream_model: model_name.into(),
         upstream_format: WireFormat::OpenaiChat.into(),
+        shapes: None,
         weight: 1,
         pricing: None,
         health_check: Default::default(),
@@ -1668,30 +1670,30 @@ async fn deployments_read_their_providers_endpoint() {
 async fn provider_shapes_are_edited_through_the_api() {
     let (state, _token) = setup().await;
     let store = state.store.clone();
-    seed_dep(store.as_ref(), "glm", "qe").await;
-    let id = provider_id(store.as_ref(), "qe").await;
+    seed_dep(store.as_ref(), "glm", "cluster").await;
+    let id = provider_id(store.as_ref(), "cluster").await;
     let cookie = admin_cookie(store.as_ref()).await;
     let app = build_router(state);
 
     let shapes = json!([{"format": "anthropic"},
-                        {"format": "openai_responses", "api_base": "https://qe.example/r/v1"}]);
+                        {"format": "openai_responses", "api_base": "https://cluster.example/r/v1"}]);
     let (status, body) = put_json(
         &app,
         &format!("/admin/v1/providers/{id}"),
         &cookie,
-        json!({ "name": "qe", "api_base": "https://qe.example/v1", "shapes": shapes }),
+        json!({ "name": "cluster", "api_base": "https://cluster.example/v1", "shapes": shapes }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["shapes"], shapes);
     let deps = store.list_deployments().await.unwrap();
-    assert_eq!(deps[0].shapes.len(), 2);
+    assert_eq!(deps[0].provider_shapes.len(), 2);
 
     let (status, body) = put_json(
         &app,
         &format!("/admin/v1/providers/{id}"),
         &cookie,
-        json!({ "name": "qe", "api_base": "https://qe.example/v1" }),
+        json!({ "name": "cluster", "api_base": "https://cluster.example/v1" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1701,7 +1703,7 @@ async fn provider_shapes_are_edited_through_the_api() {
         &app,
         &format!("/admin/v1/providers/{id}"),
         &cookie,
-        json!({ "name": "qe", "shapes": [{"format": "anthropic"}, {"format": "anthropic"}] }),
+        json!({ "name": "cluster", "shapes": [{"format": "anthropic"}, {"format": "anthropic"}] }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "a shape is listed once");
@@ -2092,6 +2094,7 @@ async fn model_discovery_says_what_each_model_does() {
             provider_name: "speech-server".into(),
             upstream_model: "piper".into(),
             upstream_format: yb_core::MediaFormat::OpenaiSpeech.into(),
+            shapes: None,
             weight: 1,
             pricing: None,
             health_check: Default::default(),
@@ -2322,4 +2325,189 @@ async fn forgetting_captured_turns_names_keys() {
         status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN,
         "{status}"
     );
+}
+
+#[tokio::test]
+async fn multi_family_provider_shapes_deployment_narrowing_and_systemone_routes_work() {
+    let (mut state, token) = setup().await;
+    let store = state.store.clone();
+    let s1_body = serde_json::to_vec(&json!({
+        "id": "s1-live77",
+        "object": "systemone",
+        "created": 1731542000,
+        "model": "qwen-s1-upstream",
+        "answers": {
+            "allow": { "answer": "yes", "probability": 0.91 }
+        },
+        "usage": {
+            "prompt_tokens": 64,
+            "completion_tokens": 0,
+            "total_tokens": 64,
+            "prompt_tokens_details": { "cached_tokens": 32 }
+        }
+    }))
+    .unwrap();
+    let mock = MockClient::json(s1_body);
+    state.gateway = Arc::new(Gateway::new(
+        Arc::new(mock.clone()),
+        state.router.clone(),
+        store.clone(),
+        state.request_log.clone(),
+    ));
+    let cookie = admin_cookie(store.as_ref()).await;
+    let app = build_router(state);
+
+    // 1. Create a provider with chat + embed + jev + decisions across custom bases.
+    let p_shapes = json!([
+        { "format": "anthropic", "api_base": "https://api.z.test/api/anthropic" },
+        { "format": "openai_chat", "api_base": "https://api.z.test/api/paas/v4" },
+        { "format": "openai_embed", "api_base": "https://api.z.test/api/paas/v4" },
+        { "format": "jev", "api_base": "https://s1.z.test/v1" },
+        { "format": "decisions", "api_base": "https://s1.z.test/v1" }
+    ]);
+    let (status, p_body) = post_json_as(
+        &app,
+        "/admin/v1/providers",
+        &cookie,
+        json!({
+            "name": "omni-cluster",
+            "api_base": "https://api.z.test/v1",
+            "api_key": "sk-omni",
+            "shapes": p_shapes
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{p_body:?}");
+    assert_eq!(p_body["shapes"], p_shapes);
+
+    // 2. Create a deployment omitting `upstream_format` and `shapes` -> inherits all provider shapes.
+    let (status, dep_body) = post_json_as(
+        &app,
+        "/admin/v1/deployments",
+        &cookie,
+        json!({
+            "model_name": "qwen-s1",
+            "provider": "omni-cluster",
+            "upstream_model": "qwen-s1-upstream"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dep_body:?}");
+    let dep_id = dep_body["id"].as_str().unwrap().to_string();
+    assert!(dep_body["shapes"].is_null());
+    assert_eq!(dep_body["provider_shapes"].as_array().unwrap().len(), 5);
+
+    // 3. Narrow via PUT /admin/v1/deployments/:id, and verify validation rejects invalid shapes.
+    let (status, _) = put_json(
+        &app,
+        &format!("/admin/v1/deployments/{dep_id}"),
+        &cookie,
+        json!({ "shapes": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "empty shapes rejected");
+
+    let (status, _) = put_json(
+        &app,
+        &format!("/admin/v1/deployments/{dep_id}"),
+        &cookie,
+        json!({ "shapes": ["cohere_embed"] }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unserved provider shape rejected"
+    );
+
+    let (status, narrowed) = put_json(
+        &app,
+        &format!("/admin/v1/deployments/{dep_id}"),
+        &cookie,
+        json!({ "shapes": ["jev"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{narrowed:?}");
+    assert_eq!(narrowed["shapes"], json!(["jev"]));
+
+    // 4. Call POST /v1/systemone and /jev/v1/systemone -> relays to https://s1.z.test/v1/systemone.
+    for path in ["/v1/systemone", "/jev/v1/systemone"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "qwen-s1",
+                            "state": "Deploy v2?",
+                            "questions": { "allow": { "type": "noul", "question": "Deploy?" } }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "path {path}");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "systemone");
+        assert_eq!(v["id"], "s1-live77");
+        assert_eq!(
+            mock.last_request().unwrap().url,
+            "https://s1.z.test/v1/systemone"
+        );
+    }
+
+    // 5. Call POST /v1/decisions and /openai/v1/decisions against the `jev`-narrowed deployment ->
+    //    translates envelope from `systemone` to `decision`!
+    for path in ["/v1/decisions", "/openai/v1/decisions", "/jev/v1/decisions"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "qwen-s1",
+                            "state": "Deploy v2?",
+                            "questions": { "allow": { "type": "noul", "question": "Deploy?" } }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "path {path}");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "decision");
+        assert_eq!(v["id"], "dec-live77");
+    }
+
+    // 6. Unmatched `/jev/...` path returns JSON 404 (not SPA HTML).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/jev/unknown")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

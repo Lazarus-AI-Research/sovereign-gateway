@@ -57,11 +57,17 @@ impl Gateway {
 
     pub async fn check_deployment(&self, dep: &DeploymentRecord) -> HealthReport {
         let started = Instant::now();
+        let d = dep.to_deployment();
+        let (probe_fmt, _) = d
+            .effective_shapes()
+            .into_iter()
+            .next()
+            .unwrap_or((dep.upstream_format, dep.api_base.as_deref()));
         let mut report = HealthReport {
             deployment_id: dep.id.clone(),
             model_name: dep.model_name.clone(),
             provider: dep.provider.clone(),
-            upstream_format: dep.upstream_format.as_str(),
+            upstream_format: probe_fmt.as_str(),
             check: dep.health_check.as_str(),
             healthy: false,
             status: None,
@@ -112,10 +118,19 @@ fn build_check_request(
     dep: &DeploymentRecord,
     extra: Vec<(String, String)>,
 ) -> std::result::Result<Option<UpstreamRequest>, String> {
+    let resolved = dep.to_deployment();
+    let (probe_fmt, probe_base) = resolved
+        .effective_shapes()
+        .into_iter()
+        .next()
+        .unwrap_or((dep.upstream_format, dep.api_base.as_deref()));
+    let probe_base = probe_base.map(str::to_string);
+
     let api_key = dep.api_key.clone().unwrap_or_default();
-    let mut auth = match dep.upstream_format {
+    let mut auth = match probe_fmt {
         UpstreamFormat::Chat(f) => auth_headers(f, &api_key),
         UpstreamFormat::Embed(f) => embed_auth_headers(f, &api_key),
+        UpstreamFormat::Decision(_) => yb_providers::decision_auth_headers(&api_key),
         UpstreamFormat::Media(_) => yb_providers::media_auth_headers(&api_key),
     };
     // Edge headers (e.g. Cloudflare Access) apply to every check method — a
@@ -129,9 +144,12 @@ fn build_check_request(
             let url = match dep.health_path.as_deref() {
                 Some(p) if p.starts_with("http://") || p.starts_with("https://") => p.to_string(),
                 other => {
-                    let base = dep.api_base.as_deref().ok_or_else(|| {
-                        "http_ok needs api_base or an absolute health_path".to_string()
-                    })?;
+                    let base = probe_base
+                        .as_deref()
+                        .or(dep.api_base.as_deref())
+                        .ok_or_else(|| {
+                            "http_ok needs api_base or an absolute health_path".to_string()
+                        })?;
                     format!("{}{}", origin_of(base), other.unwrap_or("/"))
                 }
             };
@@ -145,7 +163,7 @@ fn build_check_request(
         }
 
         HealthCheck::ModelsList => {
-            let url = models_list_url(dep)?;
+            let url = models_list_url_for(probe_fmt, probe_base.as_deref())?;
             Ok(Some(UpstreamRequest {
                 url,
                 method: HttpMethod::Get,
@@ -156,13 +174,13 @@ fn build_check_request(
         }
 
         HealthCheck::Probe => {
-            let (url, body, mut headers) = match dep.upstream_format {
+            let (url, body, mut headers) = match probe_fmt {
                 UpstreamFormat::Chat(f) => {
                     let req = probe_chat_request(&dep.upstream_model);
                     let (body, headers) =
                         wire::emit_request(f, &req, &EmitOptions::new(dep.upstream_model.clone()))
                             .map_err(|e| format!("probe emit: {e}"))?;
-                    let url = build_url(f, dep.api_base.as_deref(), &dep.upstream_model, false);
+                    let url = build_url(f, probe_base.as_deref(), &dep.upstream_model, false);
                     (url, body, headers)
                 }
                 UpstreamFormat::Embed(f) => {
@@ -173,7 +191,14 @@ fn build_check_request(
                         &EmbedEmitOptions::new(dep.upstream_model.clone()),
                     )
                     .map_err(|e| format!("probe emit: {e}"))?;
-                    let url = build_embed_url(f, dep.api_base.as_deref(), &dep.upstream_model);
+                    let url = build_embed_url(f, probe_base.as_deref(), &dep.upstream_model);
+                    (url, body, headers)
+                }
+                UpstreamFormat::Decision(f) => {
+                    let body = probe_decision_request(&dep.upstream_model);
+                    let headers =
+                        vec![("content-type".to_string(), "application/json".to_string())];
+                    let url = yb_providers::build_decision_url(f, probe_base.as_deref());
                     (url, body, headers)
                 }
                 // A real image or speech request is too costly to spend on a
@@ -226,6 +251,21 @@ fn probe_embed_request(model: &str) -> EmbedRequest {
     }
 }
 
+/// A minimal 0-generation SystemOne / Decisions probe (`max_tokens = 0` single forward pass).
+fn probe_decision_request(model: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "model": model,
+        "state": "ping",
+        "questions": {
+            "ok": {
+                "type": "noul",
+                "question": "ping?"
+            }
+        }
+    }))
+    .unwrap_or_default()
+}
+
 /// The model-listing URL for a backend family, with the same version-dedup join
 /// semantics as request URLs.
 ///
@@ -241,6 +281,7 @@ pub fn models_list_url_for(
         }
         UpstreamFormat::Chat(WireFormat::OpenaiChat | WireFormat::OpenaiResponses)
         | UpstreamFormat::Embed(EmbedFormat::OpenaiEmbed)
+        | UpstreamFormat::Decision(_)
         | UpstreamFormat::Media(_) => ("https://api.openai.com", "v1", "models"),
         UpstreamFormat::Chat(WireFormat::Gemini)
         | UpstreamFormat::Embed(EmbedFormat::GeminiEmbed) => (
@@ -252,26 +293,22 @@ pub fn models_list_url_for(
             ("https://api.cohere.com", "v1", "models")
         }
         UpstreamFormat::Embed(EmbedFormat::OllamaEmbed) => {
-            ("http://localhost:11434", "api", "tags")
+            let base = api_base.unwrap_or("http://localhost:11434");
+            let base = base.strip_suffix('/').unwrap_or(base);
+            return Ok(if base == "api" || base.ends_with("/api") {
+                format!("{base}/tags")
+            } else {
+                format!("{base}/api/tags")
+            });
         }
         UpstreamFormat::Embed(EmbedFormat::VoyageEmbed) => {
             return Err("voyage has no model-listing endpoint; use http_ok or probe".to_string())
         }
     };
     let base = api_base.unwrap_or(default_base);
-    let base = base.strip_suffix('/').unwrap_or(base);
-    Ok(
-        if base == version || base.ends_with(&format!("/{version}")) {
-            format!("{base}/{endpoint}")
-        } else {
-            format!("{base}/{version}/{endpoint}")
-        },
-    )
-}
-
-/// Back-compat shim for the health path, which has a deployment in hand.
-fn models_list_url(dep: &DeploymentRecord) -> std::result::Result<String, String> {
-    models_list_url_for(dep.upstream_format, dep.api_base.as_deref())
+    Ok(yb_providers::join_versioned_endpoint(
+        base, version, endpoint,
+    ))
 }
 
 /// The `scheme://host[:port]` origin of a URL (path stripped).
@@ -311,7 +348,8 @@ mod tests {
             health_check: check,
             health_path: path.map(str::to_string),
             extra: Default::default(),
-            shapes: Vec::new(),
+            shapes: None,
+            provider_shapes: Vec::new(),
             created_at: yb_core::now(),
             updated_at: yb_core::now(),
             deleted_at: None,
@@ -377,6 +415,26 @@ mod tests {
         );
         let r = build_check_request(&d, Vec::new()).unwrap().unwrap();
         assert_eq!(r.url, "https://api.cohere.com/v2/embed");
+
+        // SystemOne (`jev`) probe + per-shape api_base resolution.
+        let mut d = dep(
+            yb_core::DecisionFormat::Jev.into(),
+            Some("http://s1.test:8000/v1"),
+            HealthCheck::Probe,
+            None,
+        );
+        let r = build_check_request(&d, Vec::new()).unwrap().unwrap();
+        assert_eq!(r.url, "http://s1.test:8000/v1/systemone");
+        let parsed: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(parsed["model"], "um");
+        assert_eq!(parsed["questions"]["ok"]["type"], "noul");
+
+        d.provider_shapes = vec![yb_core::ProviderShape {
+            format: WireFormat::Anthropic.into(),
+            api_base: Some("https://api.z.ai/api/anthropic".into()),
+        }];
+        let r = build_check_request(&d, Vec::new()).unwrap().unwrap();
+        assert_eq!(r.url, "https://api.z.ai/api/anthropic/v1/messages");
     }
 
     /// Edge headers must be present on every check shape, and must not displace
@@ -547,6 +605,22 @@ mod discovery_tests {
         assert_eq!(
             models_list_url_for(WireFormat::OpenaiChat.into(), None).unwrap(),
             "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            models_list_url_for(
+                WireFormat::OpenaiChat.into(),
+                Some("https://api.z.ai/api/paas/v4")
+            )
+            .unwrap(),
+            "https://api.z.ai/api/paas/v4/models"
+        );
+        assert_eq!(
+            models_list_url_for(
+                yb_core::DecisionFormat::Jev.into(),
+                Some("http://s1.test:8000/v1")
+            )
+            .unwrap(),
+            "http://s1.test:8000/v1/models"
         );
     }
 }

@@ -38,6 +38,7 @@ model_name = "gpt-4o"            # the public name clients request
   upstream_model = "gpt-4o"      # id sent upstream
   upstream_format = "openai_chat" # chat: anthropic | openai_chat | openai_responses | gemini
                                   # embeddings: openai_embed | gemini_embed | cohere_embed | voyage_embed | ollama_embed
+                                  # decision / systemone: jev | decisions
   weight = 1
   # health_check = "none"        # none | http_ok | models_list | probe — independent of upstream_format
   # health_path = "/health"      # for http_ok: absolute URL, or path on the provider's api_base
@@ -75,48 +76,48 @@ model_name = "voyage-multimodal-3"
   upstream_format = "voyage_embed"
 
 # ---------------------------------------------------------------------------
-# `shapes` — the chat API shapes a provider's endpoint serves natively. A
-# request in one of these shapes is relayed to the provider as the client sent
-# it (only the model id and the credentials change), streaming or not; a
-# request in any other shape is translated to the deployment's
-# upstream_format. Each shape may have its own base URL when the server puts
-# its endpoints behind different prefixes; the default is the provider's
-# api_base. Without `shapes`, a provider serves each deployment's own
-# upstream_format only, as before. Leaving `shapes` out of a block keeps
-# whatever the database already holds (e.g. ticked in the console).
+# `shapes` — the API shapes (chat, embeddings, and decision / systemone) a
+# provider's endpoint serves natively. A request in one of these shapes is
+# relayed to the provider as the client sent it (only the model id and the
+# credentials change), streaming or not; a request in any other shape within
+# the same family is translated to a compatible shape the deployment serves.
+# Each shape may have its own base URL when the server puts its endpoints
+# behind different prefixes; the default is the provider's api_base. Without
+# `shapes`, a provider serves each deployment's own upstream_format only, as
+# before. Leaving `shapes` out of a block keeps whatever the database already
+# holds (e.g. ticked in the console).
 #
-# Below: a server that answers /v1/messages, /v1/chat/completions and
-# /v1/responses on one base. An Anthropic client reaches /v1/messages
-# directly; a Gemini client is translated to openai_chat.
+# Below: a multi-shape inference cluster serving Chat, Anthropic Messages,
+# OpenAI Responses, Embeddings, and SystemOne / Decisions across custom bases.
+# Deployments inherit all of their provider's shapes by default, or narrow to
+# a subset with `shapes = [...]` (e.g. an embedding-only model).
 # ---------------------------------------------------------------------------
 [[provider]]
-name = "qe"
-api_base = "https://qe.example.com/v1"
+name = "cluster"
+api_base = "https://cluster.example.com/v1"
 api_key = "..."
 shapes = [
-  { format = "anthropic" },
+  { format = "anthropic", api_base = "https://cluster.example.com/anthropic" },
   { format = "openai_chat" },
   { format = "openai_responses" },
-  # { format = "gemini", api_base = "https://qe.example.com/gemini/v1beta" },
+  { format = "openai_embed" },
+  { format = "jev" },
+  { format = "decisions" },
 ]
-
-# A QE server can also be declared with `dialect = "qe"` in its `extra`: a
-# request in a shape the provider does not serve natively is then translated
-# with QE's own rules to QE's Chat Completions (instead of through the generic
-# IR), which QE prepares exactly as its native endpoint for that shape would
-# (same prompt tokens, effort, thinking budget, grammar, tools, stops, …), and
-# QE's Chat answer is written back as QE's own encoder for the client's shape
-# writes it. `qe_sampling` is QE's model default temperature / top_p, which a
-# Responses object echoes when the request does not set them:
-#
-#   extra = { dialect = "qe", qe_sampling = { temperature = 1.0, top_p = 0.95 } }
 
 [[model]]
 model_name = "glm-5"
   [[model.deployments]]
-  provider = "qe"
+  provider = "cluster"
   upstream_model = "glm-5"
-  upstream_format = "openai_chat"   # the translation target for other shapes
+  shapes = ["anthropic", "openai_chat", "openai_responses", "jev", "decisions"]
+
+[[model]]
+model_name = "bge-m3"
+  [[model.deployments]]
+  provider = "cluster"
+  upstream_model = "BAAI/bge-m3"
+  shapes = ["openai_embed"]
 
 # ---------------------------------------------------------------------------
 # `extra` — an open string→value object on the **provider**, for knobs that

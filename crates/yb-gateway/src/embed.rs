@@ -12,7 +12,7 @@
 //! `surface = "openai_embed" | …`, model, provider, status) and is exported as
 //! a per-turn OTLP event + span with full-cardinality attributes.
 
-use yb_core::{EmbedFormat, Error, Result, RouteRequest, UpstreamFormat};
+use yb_core::{Deployment, EmbedFormat, Error, Result, RouteRequest};
 use yb_providers::{
     build_embed_url, embed_auth_headers, is_model_not_found, is_retryable, ResponseBody,
     UpstreamRequest,
@@ -51,7 +51,8 @@ impl Gateway {
                 return Err(e);
             }
         };
-        let candidates = self.filter_access(decision.candidates, &ctx);
+        let candidates =
+            prefer_native_embed(self.filter_access(decision.candidates, &ctx), surface);
         if candidates.is_empty() {
             let e = Error::NoEligibleProvider(req.model.clone());
             guard.fail(e.http_status()).await;
@@ -64,11 +65,12 @@ impl Gateway {
         // 3. Dispatch with fallback — buffered, and always retry-safe (nothing
         //    commits until a 2xx body is in hand).
         for deployment in candidates {
-            // Embedding requests only dispatch to embedding-format deployments.
-            let upstream_fmt = match deployment.upstream_format {
-                UpstreamFormat::Embed(f) => f,
-                UpstreamFormat::Chat(_) | UpstreamFormat::Media(_) => continue,
+            // Embedding requests only dispatch to deployments serving at least
+            // one embedding shape.
+            let Some((upstream_fmt, base_ref, _same)) = deployment.embed_target(surface) else {
+                continue;
             };
+            let base = base_ref.map(str::to_string);
             saw_chat_only = false;
 
             let opts = EmbedEmitOptions::new(deployment.upstream_model.clone());
@@ -85,11 +87,7 @@ impl Gateway {
                 &mut headers,
                 self.extra_headers(&deployment.extra, &deployment.model_name),
             );
-            let url = build_embed_url(
-                upstream_fmt,
-                deployment.api_base.as_deref(),
-                &deployment.upstream_model,
-            );
+            let url = build_embed_url(upstream_fmt, base.as_deref(), &deployment.upstream_model);
 
             let ureq = UpstreamRequest {
                 url,
@@ -199,6 +197,29 @@ impl Gateway {
         guard.fail(e.http_status()).await;
         Err(e)
     }
+}
+
+/// Order candidates within each `model_id` group so deployments serving the
+/// caller's exact embed shape precede cross-shape embed deployments.
+fn prefer_native_embed(candidates: Vec<Deployment>, surface: EmbedFormat) -> Vec<Deployment> {
+    let mut models: Vec<String> = Vec::new();
+    let mut keyed: Vec<(usize, bool, usize, Deployment)> = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let group = match models.iter().position(|m| m == &d.model_id) {
+                Some(g) => g,
+                None => {
+                    models.push(d.model_id.clone());
+                    models.len() - 1
+                }
+            };
+            let cross = !matches!(d.embed_target(surface), Some((_, _, true)));
+            (group, cross, i, d)
+        })
+        .collect();
+    keyed.sort_by_key(|(g, cross, i, _)| (*g, *cross, *i));
+    keyed.into_iter().map(|(_, _, _, d)| d).collect()
 }
 
 /// Distill the caller's policy into a [`RouteRequest`] for an embeddings turn —

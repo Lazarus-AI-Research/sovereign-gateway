@@ -23,10 +23,10 @@
 //! The crate also exposes the per-[`yb_core::WireFormat`] dispatch helpers in
 //! [`wire`], used by both pieces and reusable by `yb-server`.
 
+pub mod decision;
 pub mod embed;
 pub mod health;
 pub mod media;
-pub mod qe;
 pub mod relay;
 pub mod router;
 pub mod service;

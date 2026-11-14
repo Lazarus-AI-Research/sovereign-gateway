@@ -6,8 +6,9 @@ It accepts four chat wire formats in front, normalizes through a provider-agnost
 
 ## What is included
 
-- **Four inference dialects** — Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and Gemini `generateContent`, all served from one binary. The gateway translates between the client's wire format and the upstream's.
+- **Four chat dialects** — Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and Gemini `generateContent`, all served from one binary. A request in a shape the provider natively declares (`shapes`) is relayed byte-faithfully; otherwise the gateway translates between the client's wire format and the upstream's.
 - **Embeddings, including multimodal text+image** — OpenAI `/v1/embeddings` (plus Jina-style multimodal inputs), Gemini `:embedContent`/`:batchEmbedContents`, Cohere `/v2/embed`, and Voyage `/v1/multimodalembeddings` in front; OpenAI-compatible, Gemini, Cohere, Voyage, and Ollama upstreams behind.
+- **Decision / SystemOne** — `POST /v1/systemone` (`jev`) and `POST /v1/decisions` (`decisions`) with same-shape relay and lossless `jev` ↔ `decisions` envelope translation.
 - **Images, speech, transcription and video** — OpenAI `/v1/images/generations`, `/v1/audio/speech`, `/v1/audio/transcriptions` (a multipart form) and `/v1/videos` are routed by model to deployments whose `upstream_format` is `openai_images`, `openai_speech`, `openai_transcription` or `openai_videos`, and forwarded as sent with only the model replaced. A video is made as a job: `GET /v1/videos/{id}`, `GET /v1/videos/{id}/content` and `DELETE /v1/videos/{id}` go to the deployment the id names, and only the making is recorded as a turn.
 - **Provider-agnostic IR** — a hand-rolled intermediate representation (`yb-wire`) covering requests, responses, and SSE streams.
 - **Deterministic routing** — model-to-deployment mapping with ordered fallbacks. No ML routing.
@@ -66,7 +67,7 @@ Users have roles: **admin** (full control) and **member** (use the gateway, mana
 
 ## SSO login
 
-Besides local username/password users, the admin console can sign people in through the lair identity provider (`[auth] providers = ["local", "sso"]`). The gateway is a relying party of the IdP's direct, non-SAML API and reaches it **only over SPIFFE mTLS**: it presents its own X.509-SVID, the IdP maps that SPIFFE id to a service name that must equal `client_id`, and the gateway requires the IdP to present the SPIFFE id it was told to expect. No shared secret exists anywhere.
+Besides local username/password users, the admin console can sign people in through an internal identity provider (`[auth] providers = ["local", "sso"]`). The gateway is a relying party of the IdP's direct, non-SAML API and reaches it **only over SPIFFE mTLS**: it presents its own X.509-SVID, the IdP maps that SPIFFE id to a service name that must equal `client_id`, and the gateway requires the IdP to present the SPIFFE id it was told to expect. No shared secret exists anywhere.
 
 The serve config names the identity file and the relying-party settings:
 

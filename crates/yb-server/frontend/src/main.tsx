@@ -42,7 +42,7 @@ function useAsync<T>(fn: () => Promise<T>, deps: any[] = []) {
   return [state, reload] as const;
 }
 
-const FORMATS = ['openai_chat', 'openai_responses', 'anthropic', 'gemini', 'openai_embed', 'gemini_embed', 'cohere_embed', 'voyage_embed', 'ollama_embed'];
+const FORMATS = ['openai_chat', 'openai_responses', 'anthropic', 'gemini', 'openai_embed', 'gemini_embed', 'cohere_embed', 'voyage_embed', 'ollama_embed', 'jev', 'decisions'];
 const PERIODS = ['day', 'week', 'month', 'total'];
 const SUBJECTS = ['key', 'user', 'team'];
 
@@ -528,15 +528,51 @@ function HealthDot({ rec, busy }: { rec: any; busy?: boolean }) {
   );
 }
 
-/** The chat API shapes a provider can serve natively. A request in a shape
- *  the provider serves is relayed unchanged; any other is translated to the
- *  deployment's upstream format. */
-const SHAPES: [string, string][] = [
-  ['anthropic', 'Anthropic Messages'],
-  ['openai_chat', 'OpenAI Chat Completions'],
-  ['openai_responses', 'OpenAI Responses'],
-  ['gemini', 'Gemini generateContent'],
+/** API shapes a provider can serve natively across Chat, Embeddings, and
+ *  Decision / SystemOne. Each ticked shape may override `api_base` when a
+ *  provider mounts shapes behind distinct URL prefixes. */
+const SHAPE_GROUPS: [string, [string, string][]][] = [
+  ['Chat', [
+    ['anthropic', 'Anthropic Messages'],
+    ['openai_chat', 'OpenAI Chat Completions'],
+    ['openai_responses', 'OpenAI Responses'],
+    ['gemini', 'Gemini generateContent'],
+  ]],
+  ['Embeddings', [
+    ['openai_embed', 'OpenAI Embeddings'],
+    ['gemini_embed', 'Gemini embedContent'],
+    ['cohere_embed', 'Cohere Embed'],
+    ['voyage_embed', 'Voyage Multimodal'],
+    ['ollama_embed', 'Ollama Embed'],
+  ]],
+  ['Decision / SystemOne', [
+    ['jev', 'SystemOne (/v1/systemone)'],
+    ['decisions', 'Decisions (/v1/decisions)'],
+  ]],
 ];
+const SHAPES: [string, string][] = SHAPE_GROUPS.flatMap(([, items]) => items);
+
+/** Effective `{ format, api_base }` list for a deployment row, mirroring `yb_core::resolve_effective_shapes`. */
+const effectiveShapesFor = (dep: any): { format: string; api_base: string | null }[] => {
+  const pShapes: any[] = dep.provider_shapes || [];
+  const dShapes: string[] | null = dep.shapes || null;
+  const baseOf = (ps: any) => (ps.api_base && ps.api_base.trim()) ? ps.api_base.trim() : (dep.api_base || null);
+  if (pShapes.length > 0) {
+    if (dShapes) {
+      return pShapes.filter((ps) => dShapes.includes(ps.format)).map((ps) => ({ format: ps.format, api_base: baseOf(ps) }));
+    }
+    const fmt = dep.upstream_format || '';
+    const isNonLlm = fmt.endsWith('_embed') || fmt.startsWith('openai_images') || fmt.startsWith('openai_speech') || fmt.startsWith('openai_transcription') || fmt.startsWith('openai_videos');
+    if (isNonLlm && !pShapes.some((ps) => ps.format === fmt)) {
+      return [{ format: fmt, api_base: dep.api_base || null }];
+    }
+    return pShapes.map((ps) => ({ format: ps.format, api_base: baseOf(ps) }));
+  }
+  if (dShapes && dShapes.length > 0) {
+    return dShapes.map((fmt) => ({ format: fmt, api_base: dep.api_base || null }));
+  }
+  return [{ format: dep.upstream_format, api_base: dep.api_base || null }];
+};
 
 /** `[{format, api_base?}]` as the form holds it: format → base ('' = the provider's). */
 const shapeForm = (shapes: any[] | undefined): Record<string, string> =>
@@ -648,23 +684,27 @@ function Providers({ admin, data, error, reload }: {
               <span class="mut"> — send the service token from <span class="mono">[upstream.cloudflare_access]</span></span></span>
           </label>
           <div style="margin-top:12px">
-            <div class="mut">Serves natively <span class="mut">— requests in these shapes are relayed unchanged;
-              others are translated to the deployment's format. None ticked: each deployment's own format.</span></div>
-            {SHAPES.map(([k, label]) => (
-              <div class="row" style="margin-top:6px;gap:8px;flex-wrap:nowrap">
-                <label class="row" style="gap:6px;cursor:pointer;flex:none;min-width:220px;flex-wrap:nowrap">
-                  <input type="checkbox" checked={k in f.shapes}
-                         onChange={(e: any) => setF((s: any) => {
-                           const shapes = { ...s.shapes };
-                           if (e.target.checked) shapes[k] = shapes[k] || ''; else delete shapes[k];
-                           return { ...s, shapes };
-                         })} />
-                  <span>{label} <span class="mono mut">{k}</span></span>
-                </label>
-                {k in f.shapes && (
-                  <input style="flex:1" placeholder="api_base for this shape (blank = provider api_base)"
-                         value={f.shapes[k]}
-                         onInput={(e: any) => setF((s: any) => ({ ...s, shapes: { ...s.shapes, [k]: e.target.value } }))} />)}
+            <div class="mut">Supported API shapes <span class="mut">— check every API surface this provider serves, with an optional per-shape <span class="mono">api_base</span> when prefixes differ. Deployments inherit these by default.</span></div>
+            {SHAPE_GROUPS.map(([group, items]) => (
+              <div key={group} style="margin-top:10px">
+                <div class="mono mut" style="font-size:11px;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">{group}</div>
+                {items.map(([k, label]) => (
+                  <div key={k} class="row" style="margin-top:5px;gap:8px;flex-wrap:nowrap">
+                    <label class="row" style="gap:6px;cursor:pointer;flex:none;min-width:250px;flex-wrap:nowrap">
+                      <input type="checkbox" checked={k in f.shapes}
+                             onChange={(e: any) => setF((s: any) => {
+                               const shapes = { ...s.shapes };
+                               if (e.target.checked) shapes[k] = shapes[k] || ''; else delete shapes[k];
+                               return { ...s, shapes };
+                             })} />
+                      <span>{label} <span class="mono mut">{k}</span></span>
+                    </label>
+                    {k in f.shapes && (
+                      <input style="flex:1" placeholder="api_base for this shape (blank = provider api_base)"
+                             value={f.shapes[k]}
+                             onInput={(e: any) => setF((s: any) => ({ ...s, shapes: { ...s.shapes, [k]: e.target.value } }))} />)}
+                  </div>
+                ))}
               </div>
             ))}
           </div>
@@ -683,22 +723,52 @@ function Models({ admin }: { admin: boolean }) {
   // (the upstream fan-out). The table groups the second under the first.
   const [{ loading, data, error }, reload] = useAsync<any[]>(() => api('/deployments'));
   const [{ data: modelData }, reloadModels] = useAsync<any[]>(() => api('/models'));
-  // api_base / api_key / extra are the provider's now, so the deployment form
-  // is just: which model, through which provider, speaking which format.
   const blank = { model_name: '', provider: '', upstream_model: '', upstream_format: 'openai_chat' };
   // Owned here, not inside Providers, so that adding a provider immediately
   // populates this form's picker instead of needing a page reload.
   const [{ data: providerData, error: providerError }, reloadProviders] =
     useAsync<any[]>(() => api('/providers'));
   const [f, setF] = useState<any>(blank);
+  const [depShapes, setDepShapes] = useState<Record<string, boolean>>({});
+  const [discoverFmt, setDiscoverFmt] = useState<string>('openai_chat');
+  const [editingDep, setEditingDep] = useState<any | null>(null);
+  const [editDepShapes, setEditDepShapes] = useState<Record<string, boolean>>({});
+  const [editMsg, setEditMsg] = useState('');
   const [msg, setMsg] = useState('');
+  const selectedProvider = (providerData || []).find((x) => x.name === f.provider);
+  const selectProvider = (name: string) => {
+    const p = (providerData || []).find((x) => x.name === name);
+    const pShapes: any[] = p?.shapes || [];
+    const nextShapes: Record<string, boolean> = {};
+    for (const s of pShapes) nextShapes[s.format] = true;
+    setDepShapes(nextShapes);
+    setDiscoverFmt(pShapes[0]?.format || f.upstream_format || 'openai_chat');
+    setFound(null);
+    setPicked({});
+    setF((s: any) => ({ ...s, provider: name }));
+  };
   const upd = (k: string, v: string) => setF((s: any) => ({ ...s, [k]: v }));
+  const buildShapesPayload = (): { ok: true; shapes?: string[] | null; upstream_format?: string } | { ok: false; err: string } => {
+    const pShapes: any[] = selectedProvider?.shapes || [];
+    if (pShapes.length > 0) {
+      const checked = pShapes.map((s: any) => s.format).filter((k: string) => depShapes[k]);
+      if (!checked.length) return { ok: false, err: 'enable at least one API shape for this deployment' };
+      const shapes = checked.length < pShapes.length ? checked : null;
+      return { ok: true, shapes };
+    }
+    return { ok: true, upstream_format: f.upstream_format };
+  };
   const add = async () => {
     setMsg('');
+    const sp = buildShapesPayload();
+    if (!sp.ok) { setMsg(sp.err); return; }
+    const body: any = { model_name: f.model_name, provider: f.provider, upstream_model: f.upstream_model };
+    if ('shapes' in sp) body.shapes = sp.shapes;
+    if (sp.upstream_format) body.upstream_format = sp.upstream_format;
     try {
-      await api('/deployments', { method: 'POST', body: { ...f } });
+      await api('/deployments', { method: 'POST', body });
       // Providers too: their deployment counts just changed.
-      setF(blank); setShowAdd(false); reload(); reloadModels(); reloadProviders();
+      setF(blank); setDepShapes({}); setShowAdd(false); reload(); reloadModels(); reloadProviders();
     } catch (e: any) { setMsg(e.message); }
   };
   const [showAdd, setShowAdd] = useState(false);
@@ -710,10 +780,11 @@ function Models({ admin }: { admin: boolean }) {
   const detect = async () => {
     const p = (providerData || []).find((x) => x.name === f.provider);
     if (!p) { setMsg('pick a provider first'); return; }
+    const fmt = (p.shapes?.length ? discoverFmt : f.upstream_format) || 'openai_chat';
     setDetecting(true); setMsg(''); setFound(null);
     try {
       const r = await api('/providers/' + encodeURIComponent(p.id) + '/discover',
-                          { method: 'POST', body: { upstream_format: f.upstream_format } });
+                          { method: 'POST', body: { upstream_format: fmt } });
       setFound(r.models || []);
       // Default each public name to the upstream id — the common case — while
       // leaving every row editable so several endpoints can back one model.
@@ -728,16 +799,48 @@ function Models({ admin }: { admin: boolean }) {
       .filter(([, name]) => name && name.trim())
       .map(([upstream_model, model_name]) => ({ upstream_model, model_name: model_name.trim() }));
     if (!models.length) { setMsg('nothing selected'); return; }
+    const sp = buildShapesPayload();
+    if (!sp.ok) { setMsg(sp.err); return; }
     setMsg('');
+    const body: any = { provider: f.provider, models };
+    if ('shapes' in sp) body.shapes = sp.shapes;
+    if (sp.upstream_format) body.upstream_format = sp.upstream_format;
     try {
-      const r = await api('/deployments/bulk', { method: 'POST',
-        body: { provider: f.provider, upstream_format: f.upstream_format, models } });
+      const r = await api('/deployments/bulk', { method: 'POST', body });
       setShowAdd(false); setFound(null); setPicked({});
       reload(); reloadModels(); reloadProviders();
       if (r.errors?.length) alert(r.errors.length + ' failed; ' + r.created + ' added');
     } catch (e: any) { setMsg(e.message); }
   };
   const closeAdd = () => { setShowAdd(false); setFound(null); setPicked({}); setMsg(''); };
+  const openEditDep = (dep: any) => {
+    const eff = effectiveShapesFor(dep).map((s) => s.format);
+    const pShapes: any[] = dep.provider_shapes?.length
+      ? dep.provider_shapes
+      : (dep.shapes || [dep.upstream_format]).map((fmt: string) => ({ format: fmt }));
+    const next: Record<string, boolean> = {};
+    for (const ps of pShapes) next[ps.format] = eff.includes(ps.format);
+    setEditDepShapes(next);
+    setEditMsg('');
+    setEditingDep(dep);
+  };
+  const saveEditDep = async () => {
+    if (!editingDep) return;
+    setEditMsg('');
+    const pShapes: any[] = editingDep.provider_shapes?.length
+      ? editingDep.provider_shapes
+      : (editingDep.shapes || [editingDep.upstream_format]).map((fmt: string) => ({ format: fmt }));
+    const checked = pShapes.map((s: any) => s.format).filter((k: string) => editDepShapes[k]);
+    if (!checked.length) { setEditMsg('enable at least one API shape'); return; }
+    const shapes = (editingDep.provider_shapes?.length && checked.length === editingDep.provider_shapes.length)
+      ? null
+      : checked;
+    try {
+      await api('/deployments/' + encodeURIComponent(editingDep.id), { method: 'PUT', body: { shapes } });
+      setEditingDep(null);
+      reload(); reloadModels();
+    } catch (e: any) { setEditMsg(e.message); }
+  };
   const del = async (id: string) => { if (confirm('Delete this deployment?')) { await api('/deployments/' + id, { method: 'DELETE' }); reload(); reloadModels(); reloadProviders(); } };
   // Cached results only: opening the page must not call every upstream, which
   // would cost real tokens on every render.
@@ -793,7 +896,7 @@ function Models({ admin }: { admin: boolean }) {
           : (
             <div class="tablewrap">
               <table style="margin-top:10px">
-                <thead><tr><th>provider</th><th>upstream_model</th><th>format</th><th>api_base</th><th>health</th>{admin && <th></th>}</tr></thead>
+                <thead><tr><th>provider</th><th>upstream_model</th><th>shapes</th><th>api_base</th><th>health</th>{admin && <th></th>}</tr></thead>
                 {modelData.map((model) => (
                   <tbody key={model.id}>
                     <tr class="grp">
@@ -811,12 +914,28 @@ function Models({ admin }: { admin: boolean }) {
                         </div>
                       </td>
                     </tr>
-                    {deploymentsFor(model.id).map((m) => (
+                    {deploymentsFor(model.id).map((m) => {
+                      const eff = effectiveShapesFor(m);
+                      const bases = Array.from(new Set(eff.map((s) => s.api_base).filter(Boolean)));
+                      return (
                       <tr key={m.id}>
                         <td class="nowrap">{m.provider}</td>
                         <td class="mono nowrap">{m.upstream_model}</td>
-                        <td><span class="pill">{m.upstream_format}</span></td>
-                        <td class="mono mut">{m.api_base || <span class="mut">format default</span>}</td>
+                        <td>
+                          <div class="pills">
+                            {eff.map((sh) => (
+                              <span key={sh.format} class="pill mono" title={sh.api_base || 'format default'}>{sh.format}</span>
+                            ))}
+                            {m.shapes && <span class="mut" style="font-size:11px" title="Narrowed subset of provider shapes">(subset)</span>}
+                          </div>
+                        </td>
+                        <td class="mono mut">
+                          {bases.length === 0
+                            ? <span class="mut">format default</span>
+                            : bases.length === 1
+                              ? bases[0]
+                              : <span title={bases.join('\n')}>{bases[0]} <span class="mut">(+{bases.length - 1})</span></span>}
+                        </td>
                         <td>
                           <div class="row" style="gap:8px">
                             <HealthDot rec={healthFor(m.id)} busy={checking[m.id]} />
@@ -824,9 +943,15 @@ function Models({ admin }: { admin: boolean }) {
                                          onClick={() => checkDeployment(m.id)}>check</a>}
                           </div>
                         </td>
-                        {admin && <td><button class="ghost del" onClick={() => del(m.id)}>delete</button></td>}
+                        {admin && <td class="nowrap">
+                          {(m.provider_shapes?.length > 0 || m.shapes?.length > 0) && (
+                            <Fragment><button class="ghost" onClick={() => openEditDep(m)}>edit</button>{' '}</Fragment>
+                          )}
+                          <button class="ghost del" onClick={() => del(m.id)}>delete</button>
+                        </td>}
                       </tr>
-                    ))}
+                      );
+                    })}
                     {!deploymentsFor(model.id).length && (
                       <tr><td colSpan={admin ? 6 : 5} class="mut" style="padding-left:18px">
                         no deployments — this model is not routable
@@ -842,24 +967,46 @@ function Models({ admin }: { admin: boolean }) {
         <Modal title="Add a deployment" onClose={closeAdd}>
           <div class="grid">
             <input placeholder="model_name (public)" value={f.model_name} onInput={(e: any) => upd('model_name', e.target.value)} />
-            <select value={f.provider} onChange={(e: any) => upd('provider', e.target.value)}>
+            <select value={f.provider} onChange={(e: any) => selectProvider(e.target.value)}>
               <option value="">— provider —</option>
               {(providerData || []).map((p) => <option value={p.name}>{p.name}</option>)}
             </select>
             <input placeholder="upstream_model" value={f.upstream_model} onInput={(e: any) => upd('upstream_model', e.target.value)} />
-            <select value={f.upstream_format} onChange={(e: any) => upd('upstream_format', e.target.value)}>{FORMATS.map((k) => <option>{k}</option>)}</select>
+            {!selectedProvider?.shapes?.length && (
+              <select value={f.upstream_format} onChange={(e: any) => upd('upstream_format', e.target.value)}>{FORMATS.map((k) => <option>{k}</option>)}</select>
+            )}
           </div>
+          {selectedProvider?.shapes?.length > 0 && (
+            <div style="margin-top:10px">
+              <div class="mut" style="font-size:12px;margin-bottom:4px">
+                Enabled API shapes for this model <span class="mut">(inherits provider shapes; untick any this model does not serve)</span>
+              </div>
+              <div class="pills">
+                {selectedProvider.shapes.map((ps: any) => (
+                  <label key={ps.format} class="row" style="gap:5px;cursor:pointer;margin-right:10px" title={ps.api_base || selectedProvider.api_base || 'format default'}>
+                    <input type="checkbox" checked={!!depShapes[ps.format]}
+                           onChange={(e: any) => setDepShapes((s) => ({ ...s, [ps.format]: e.target.checked }))} />
+                    <span class="mono">{ps.format}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
           <p class="mut" style="margin:10px 0 0;font-size:12px">
             The endpoint, credential and edge settings come from the provider —
-            add or edit those in the Providers card above. One endpoint can serve
-            several formats, which is why the format is set here.
+            add or edit those in the Providers card above.
           </p>
-          <div class="row" style="margin-top:10px">
+          <div class="row" style="margin-top:10px;gap:8px">
             <button class="ghost" disabled={!f.provider || detecting} onClick={detect}>
               {detecting ? 'Detecting…' : 'Detect models from this provider'}
             </button>
+            {selectedProvider?.shapes?.length > 1 && (
+              <select value={discoverFmt} onChange={(e: any) => setDiscoverFmt(e.target.value)}>
+                {selectedProvider.shapes.map((ps: any) => <option value={ps.format}>via {ps.format}</option>)}
+              </select>
+            )}
             <span class="mut" style="font-size:12px">
-              asks the endpoint what it serves for this adapter
+              asks the endpoint what it serves
             </span>
           </div>
           {found && (
@@ -925,6 +1072,30 @@ function Models({ admin }: { admin: boolean }) {
           <div class="row" style="margin-top:12px">
             {!found && <button class="btn" onClick={add}>Add deployment</button>}
             {msg && <span class="err">{msg}</span>}
+          </div>
+        </Modal>
+      )}
+      {admin && editingDep && (
+        <Modal title={`Edit shapes — ${editingDep.model_name} (${editingDep.provider})`} onClose={() => setEditingDep(null)}>
+          <div class="mut" style="font-size:12px;margin-bottom:8px">
+            Select which of <span class="mono">{editingDep.provider}</span>’s API shapes this deployment (<span class="mono">{editingDep.upstream_model}</span>) serves. Leave all checked to inherit every shape on the provider.
+          </div>
+          <div class="pills" style="margin-top:6px">
+            {(editingDep.provider_shapes?.length
+              ? editingDep.provider_shapes
+              : (editingDep.shapes || [editingDep.upstream_format]).map((fmt: string) => ({ format: fmt }))
+            ).map((ps: any) => (
+              <label key={ps.format} class="row" style="gap:6px;cursor:pointer;margin-right:12px;margin-top:4px" title={ps.api_base || editingDep.api_base || 'format default'}>
+                <input type="checkbox" checked={!!editDepShapes[ps.format]}
+                       onChange={(e: any) => setEditDepShapes((s) => ({ ...s, [ps.format]: e.target.checked }))} />
+                <span class="mono">{ps.format}</span>
+                {ps.api_base && <span class="mono mut" style="font-size:11px">({ps.api_base})</span>}
+              </label>
+            ))}
+          </div>
+          <div class="row" style="margin-top:14px">
+            <button class="btn" onClick={saveEditDep}>Save shapes</button>
+            {editMsg && <span class="err">{editMsg}</span>}
           </div>
         </Modal>
       )}

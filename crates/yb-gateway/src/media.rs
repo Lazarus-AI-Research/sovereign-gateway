@@ -52,9 +52,12 @@ impl Gateway {
         for deployment in candidates {
             // A media request goes only to a deployment that serves the same
             // endpoint: a speech model cannot answer a transcription.
-            if deployment.upstream_format != UpstreamFormat::Media(surface) {
+            let Some(base) = deployment
+                .native_base(UpstreamFormat::Media(surface))
+                .map(|b| b.map(str::to_string))
+            else {
                 continue;
-            }
+            };
             saw_other_kind_only = false;
 
             let upstream_body = match request.upstream_body(body, &deployment.upstream_model) {
@@ -74,7 +77,7 @@ impl Gateway {
                 self.extra_headers(&deployment.extra, &deployment.model_name),
             );
             let upstream = UpstreamRequest {
-                url: build_media_url(surface, deployment.api_base.as_deref()),
+                url: build_media_url(surface, base.as_deref()),
                 method: Default::default(),
                 headers,
                 body: upstream_body,

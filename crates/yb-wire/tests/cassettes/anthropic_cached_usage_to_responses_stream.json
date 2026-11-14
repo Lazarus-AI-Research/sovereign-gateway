@@ -1,5 +1,5 @@
 {
-  "_comment": "Upstream stream in the shape qe-ds41-b200-tp4 writes (lair inference/qe/serve/src/anthropic.rs: full usage on message_start and message_delta), with the counts of a live deepseek-v4.1-flash-1017-sakura turn on 2026-11-03: 2 uncached + 41 cached prompt tokens. Anthropic's input_tokens excludes the cache; OpenAI's prompt_tokens includes it, so the client must see 43, not 2.",
+  "_comment": "Upstream Anthropic SSE stream reporting full usage on both message_start and message_delta, with 2 uncached + 41 cached prompt tokens. Anthropic's input_tokens excludes the cache; OpenAI's prompt_tokens includes it, so the client must see 43, not 2.",
   "inbound_format": "openai_responses",
   "inbound_body": {
     "model": "deepseek-v4.1-flash-1017-sakura",

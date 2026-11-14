@@ -41,47 +41,25 @@ impl WireFormat {
     }
 }
 
-/// One chat API shape a provider serves natively, with the base URL it is
-/// served under when that differs from the provider's `api_base` (some
-/// servers put `/v1/messages` and `/v1/chat/completions` behind different
-/// prefixes).
+/// One API shape a provider serves natively, with the base URL it is served
+/// under when that differs from the provider's `api_base` (for example, a
+/// provider serving `/v1/messages` at `.../api/anthropic` and
+/// `/v1/chat/completions` at `.../api/paas/v4`).
 ///
-/// A request whose shape the chosen provider serves is relayed to it as the
-/// client sent it — only the model id and the credentials change — rather
-/// than translated through the IR: translation is the fallback for shapes the
-/// provider does not serve.
+/// A request whose shape the chosen deployment serves natively is relayed as
+/// the client sent it — only the model id and credentials change — rather than
+/// translated through an IR; translation within a family (chat, embeddings, or
+/// decision) is the fallback for shapes the deployment does not serve directly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderShape {
-    pub format: WireFormat,
-    /// `None`: the provider's `api_base`.
+    pub format: UpstreamFormat,
+    /// `None` (or blank): falls back to the provider's `api_base`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base: Option<String>,
 }
 
-/// Whether `shapes`, or else the deployment's own `upstream_format`, serves
-/// `surface` natively; and if so under which base URL. A deployment always
-/// serves its own format under the provider's `api_base`, which is what keeps
-/// a provider with no declared shapes behaving as it did before shapes
-/// existed.
-pub fn native_base<'a>(
-    shapes: &'a [ProviderShape],
-    upstream_format: UpstreamFormat,
-    api_base: Option<&'a str>,
-    surface: WireFormat,
-) -> Option<Option<&'a str>> {
-    if let Some(s) = shapes.iter().find(|s| s.format == surface) {
-        return Some(
-            s.api_base
-                .as_deref()
-                .filter(|b| !b.trim().is_empty())
-                .or(api_base),
-        );
-    }
-    (upstream_format == UpstreamFormat::Chat(surface)).then_some(api_base)
-}
-
 /// The wire protocol an **embeddings** surface or upstream speaks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EmbedFormat {
     /// OpenAI `POST /v1/embeddings` — also vLLM, TEI, LiteLLM, Jina (incl. its
@@ -107,13 +85,60 @@ impl EmbedFormat {
             EmbedFormat::OllamaEmbed => "ollama_embed",
         }
     }
+
+    pub const ALL: [EmbedFormat; 5] = [
+        EmbedFormat::OpenaiEmbed,
+        EmbedFormat::GeminiEmbed,
+        EmbedFormat::CohereEmbed,
+        EmbedFormat::VoyageEmbed,
+        EmbedFormat::OllamaEmbed,
+    ];
+}
+
+/// The wire protocol a **decision / SystemOne** surface or upstream speaks:
+/// single-forward-pass structured logit probing (`max_tokens = 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionFormat {
+    /// SystemOne (`POST /v1/systemone`, `"object": "systemone"`).
+    Jev,
+    /// OpenAI / LiteLLM Decisions (`POST /v1/decisions`, `"object": "decision"`).
+    Decisions,
+}
+
+impl DecisionFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecisionFormat::Jev => "jev",
+            DecisionFormat::Decisions => "decisions",
+        }
+    }
+
+    /// Endpoint path segment below `/v1`.
+    pub fn path(self) -> &'static str {
+        match self {
+            DecisionFormat::Jev => "systemone",
+            DecisionFormat::Decisions => "decisions",
+        }
+    }
+
+    /// The sibling decision surface, for lossless envelope translation when an
+    /// upstream serves one decision shape and the client called the other.
+    pub fn other(self) -> Self {
+        match self {
+            DecisionFormat::Jev => DecisionFormat::Decisions,
+            DecisionFormat::Decisions => DecisionFormat::Jev,
+        }
+    }
+
+    pub const ALL: [DecisionFormat; 2] = [DecisionFormat::Jev, DecisionFormat::Decisions];
 }
 
 /// The protocol a **media** surface or upstream speaks: OpenAI's image
 /// generation, speech, transcription and video endpoints. Nothing is
 /// translated: the gateway reads the model to route and forwards the request
 /// as it came.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaFormat {
     /// `POST /v1/images/generations`, JSON in and out.
@@ -148,14 +173,16 @@ impl MediaFormat {
     }
 }
 
-/// What a deployment speaks upstream: a chat, embeddings or media dialect.
-/// Untagged serde over disjoint snake_case string sets, so config/DB/admin
-/// carry flat strings (`"openai_chat"`, `"cohere_embed"`, …) with no migration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// What a provider or deployment speaks upstream: chat, embeddings, decision,
+/// or media. Untagged serde over disjoint snake_case string sets, so config,
+/// DB, and admin JSON carry flat strings (`"openai_chat"`, `"openai_embed"`,
+/// `"jev"`, `"decisions"`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum UpstreamFormat {
     Chat(WireFormat),
     Embed(EmbedFormat),
+    Decision(DecisionFormat),
     Media(MediaFormat),
 }
 
@@ -164,6 +191,7 @@ impl UpstreamFormat {
         match self {
             UpstreamFormat::Chat(f) => f.as_str(),
             UpstreamFormat::Embed(f) => f.as_str(),
+            UpstreamFormat::Decision(f) => f.as_str(),
             UpstreamFormat::Media(f) => f.as_str(),
         }
     }
@@ -185,6 +213,25 @@ impl From<EmbedFormat> for UpstreamFormat {
     fn from(f: EmbedFormat) -> Self {
         UpstreamFormat::Embed(f)
     }
+}
+
+impl From<DecisionFormat> for UpstreamFormat {
+    fn from(f: DecisionFormat) -> Self {
+        UpstreamFormat::Decision(f)
+    }
+}
+
+/// Choose a deterministic primary `upstream_format` from a list of enabled
+/// shapes when a caller omits `upstream_format` (preferring `openai_chat`, then
+/// the first chat shape, then the first shape).
+pub fn default_upstream_format(shapes: &[UpstreamFormat]) -> Option<UpstreamFormat> {
+    if shapes.contains(&UpstreamFormat::Chat(WireFormat::OpenaiChat)) {
+        return Some(UpstreamFormat::Chat(WireFormat::OpenaiChat));
+    }
+    if let Some(&chat) = shapes.iter().find(|f| matches!(f, UpstreamFormat::Chat(_))) {
+        return Some(chat);
+    }
+    shapes.first().copied()
 }
 
 /// How to health-check a deployment's backend. Chosen **independently** of the
@@ -317,13 +364,74 @@ pub struct ProviderRecord {
     pub api_key: Option<String>,
     #[serde(default)]
     pub extra: Extra,
-    /// The chat API shapes this endpoint serves natively (see
-    /// [`ProviderShape`]). Empty: only each deployment's own
-    /// `upstream_format`, as before shapes existed.
+    /// The API shapes this endpoint serves natively (see [`ProviderShape`]),
+    /// across chat, embeddings, decision/SystemOne, and media. Empty: legacy
+    /// mode where each deployment serves its own `upstream_format`.
     #[serde(default)]
     pub shapes: Vec<ProviderShape>,
     pub created_at: crate::ids::Timestamp,
     pub updated_at: crate::ids::Timestamp,
+}
+
+impl ProviderRecord {
+    /// Resolved `api_base` for `fmt` on this provider: the shape's own
+    /// non-blank `api_base` if declared, otherwise the provider's `api_base`.
+    pub fn base_for(&self, fmt: UpstreamFormat) -> Option<&str> {
+        self.shapes
+            .iter()
+            .find(|s| s.format == fmt)
+            .and_then(|s| s.api_base.as_deref().filter(|b| !b.trim().is_empty()))
+            .or(self.api_base.as_deref())
+    }
+}
+
+/// Resolve the effective `(format, api_base)` pairs served by a deployment.
+///
+/// - When `provider_shapes` is non-empty, it defines the ceiling of shapes the
+///   provider supports (and each shape's `api_base`). `deployment_shapes = None`
+///   inherits all of them; `Some(filter)` narrows to the subset in `filter`.
+/// - When `provider_shapes` is empty (legacy provider with no checkboxes set),
+///   `deployment_shapes = None` falls back to `[(upstream_format, api_base)]`.
+pub fn resolve_effective_shapes<'a>(
+    provider_shapes: &'a [ProviderShape],
+    deployment_shapes: Option<&'a [UpstreamFormat]>,
+    upstream_format: UpstreamFormat,
+    api_base: Option<&'a str>,
+) -> Vec<(UpstreamFormat, Option<&'a str>)> {
+    let shape_base = |ps: &'a ProviderShape| -> Option<&'a str> {
+        ps.api_base
+            .as_deref()
+            .filter(|b| !b.trim().is_empty())
+            .or(api_base)
+    };
+    if !provider_shapes.is_empty() {
+        match deployment_shapes {
+            Some(filter) => provider_shapes
+                .iter()
+                .filter(|ps| filter.contains(&ps.format))
+                .map(|ps| (ps.format, shape_base(ps)))
+                .collect(),
+            None => {
+                if matches!(
+                    upstream_format,
+                    UpstreamFormat::Embed(_) | UpstreamFormat::Media(_)
+                ) && !provider_shapes.iter().any(|ps| {
+                    std::mem::discriminant(&ps.format) == std::mem::discriminant(&upstream_format)
+                }) {
+                    return vec![(upstream_format, api_base)];
+                }
+                provider_shapes
+                    .iter()
+                    .map(|ps| (ps.format, shape_base(ps)))
+                    .collect()
+            }
+        }
+    } else {
+        match deployment_shapes {
+            Some(filter) => filter.iter().map(|&f| (f, api_base)).collect(),
+            None => vec![(upstream_format, api_base)],
+        }
+    }
 }
 
 /// The fields a caller supplies to create a deployment.
@@ -342,6 +450,8 @@ pub struct NewDeployment {
     pub provider_name: String,
     pub upstream_model: String,
     pub upstream_format: UpstreamFormat,
+    /// Optional per-deployment shape subset (`None` = inherit all provider shapes).
+    pub shapes: Option<Vec<UpstreamFormat>>,
     pub weight: u32,
     pub pricing: Option<ModelPrice>,
     pub health_check: HealthCheck,
@@ -368,8 +478,7 @@ pub struct Deployment {
     /// back out (kept out of admin API responses).
     #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
-    /// The upstream wire format — the sole "adapter shape" for a deployment.
-    /// Picks the endpoint path, request/response translation, and auth scheme.
+    /// Primary / fallback upstream format.
     pub upstream_format: UpstreamFormat,
     pub weight: u32,
     pub pricing: Option<ModelPrice>,
@@ -382,21 +491,119 @@ pub struct Deployment {
     /// Open-ended per-deployment extras (see [`Extra`]).
     #[serde(default)]
     pub extra: Extra,
-    /// The provider's natively served chat shapes, joined at read time.
+    /// Optional per-deployment shape filter (`None` = inherit all of
+    /// `provider_shapes`).
     #[serde(default)]
-    pub shapes: Vec<ProviderShape>,
+    pub shapes: Option<Vec<UpstreamFormat>>,
+    /// The provider's natively served API shapes, joined at read time.
+    #[serde(default)]
+    pub provider_shapes: Vec<ProviderShape>,
 }
 
 impl Deployment {
-    /// The base URL to relay a `surface`-shaped request to unchanged, if this
-    /// deployment's provider serves that shape (see [`native_base`]).
-    pub fn native_base(&self, surface: WireFormat) -> Option<Option<&str>> {
-        native_base(
-            &self.shapes,
+    /// Effective `(format, api_base)` pairs served by this deployment.
+    pub fn effective_shapes(&self) -> Vec<(UpstreamFormat, Option<&str>)> {
+        resolve_effective_shapes(
+            &self.provider_shapes,
+            self.shapes.as_deref(),
             self.upstream_format,
             self.api_base.as_deref(),
-            surface,
         )
+    }
+
+    /// The base URL to relay a `fmt`-shaped request to unchanged, if this
+    /// deployment serves `fmt` natively.
+    pub fn native_base(&self, fmt: impl Into<UpstreamFormat>) -> Option<Option<&str>> {
+        let target = fmt.into();
+        self.effective_shapes()
+            .into_iter()
+            .find(|(f, _)| *f == target)
+            .map(|(_, b)| b)
+    }
+
+    /// Resolve how this deployment handles an inbound chat `surface`:
+    /// `(target_wire_format, resolved_api_base, is_same_shape_relay)`.
+    /// Returns `None` if this deployment serves no chat shapes at all.
+    pub fn chat_target(&self, surface: WireFormat) -> Option<(WireFormat, Option<&str>, bool)> {
+        let eff = self.effective_shapes();
+        if let Some((_, base)) = eff
+            .iter()
+            .find(|(f, _)| *f == UpstreamFormat::Chat(surface))
+        {
+            return Some((surface, *base, true));
+        }
+        let chats: Vec<(WireFormat, Option<&str>)> = eff
+            .into_iter()
+            .filter_map(|(f, b)| match f {
+                UpstreamFormat::Chat(w) => Some((w, b)),
+                _ => None,
+            })
+            .collect();
+        if chats.is_empty() {
+            return None;
+        }
+        if let UpstreamFormat::Chat(own) = self.upstream_format {
+            if let Some(&(_, base)) = chats.iter().find(|(w, _)| *w == own) {
+                return Some((own, base, false));
+            }
+        }
+        if let Some(&(_, base)) = chats.iter().find(|(w, _)| *w == WireFormat::OpenaiChat) {
+            return Some((WireFormat::OpenaiChat, base, false));
+        }
+        let (w, base) = chats[0];
+        Some((w, base, false))
+    }
+
+    /// Resolve how this deployment handles an inbound embedding `surface`:
+    /// `(target_embed_format, resolved_api_base, is_same_shape)`.
+    pub fn embed_target(&self, surface: EmbedFormat) -> Option<(EmbedFormat, Option<&str>, bool)> {
+        let eff = self.effective_shapes();
+        if let Some((_, base)) = eff
+            .iter()
+            .find(|(f, _)| *f == UpstreamFormat::Embed(surface))
+        {
+            return Some((surface, *base, true));
+        }
+        let embeds: Vec<(EmbedFormat, Option<&str>)> = eff
+            .into_iter()
+            .filter_map(|(f, b)| match f {
+                UpstreamFormat::Embed(e) => Some((e, b)),
+                _ => None,
+            })
+            .collect();
+        if embeds.is_empty() {
+            return None;
+        }
+        if let UpstreamFormat::Embed(own) = self.upstream_format {
+            if let Some(&(_, base)) = embeds.iter().find(|(e, _)| *e == own) {
+                return Some((own, base, false));
+            }
+        }
+        let (e, base) = embeds[0];
+        Some((e, base, false))
+    }
+
+    /// Resolve how this deployment handles an inbound decision `surface`:
+    /// `(target_decision_format, resolved_api_base, is_same_shape_relay)`.
+    pub fn decision_target(
+        &self,
+        surface: DecisionFormat,
+    ) -> Option<(DecisionFormat, Option<&str>, bool)> {
+        let eff = self.effective_shapes();
+        if let Some((_, base)) = eff
+            .iter()
+            .find(|(f, _)| *f == UpstreamFormat::Decision(surface))
+        {
+            return Some((surface, *base, true));
+        }
+        let other = surface.other();
+        if let Some((_, base)) = eff
+            .iter()
+            .find(|(f, _)| *f == UpstreamFormat::Decision(other))
+        {
+            return Some((other, *base, false));
+        }
+        None
     }
 }
 
@@ -431,15 +638,29 @@ pub struct DeploymentRecord {
     /// Open-ended per-deployment extras (see [`Extra`]).
     #[serde(default)]
     pub extra: Extra,
-    /// The provider's natively served chat shapes, joined at read time.
+    /// Optional per-deployment shape subset (`None` = inherit all of
+    /// `provider_shapes`).
     #[serde(default)]
-    pub shapes: Vec<ProviderShape>,
+    pub shapes: Option<Vec<UpstreamFormat>>,
+    /// The provider's natively served API shapes, joined at read time.
+    #[serde(default)]
+    pub provider_shapes: Vec<ProviderShape>,
     pub created_at: crate::ids::Timestamp,
     pub updated_at: crate::ids::Timestamp,
     pub deleted_at: Option<crate::ids::Timestamp>,
 }
 
 impl DeploymentRecord {
+    /// Effective `(format, api_base)` pairs served by this deployment record.
+    pub fn effective_shapes(&self) -> Vec<(UpstreamFormat, Option<&str>)> {
+        resolve_effective_shapes(
+            &self.provider_shapes,
+            self.shapes.as_deref(),
+            self.upstream_format,
+            self.api_base.as_deref(),
+        )
+    }
+
     /// Project the storage row onto the routing-time [`Deployment`] value.
     pub fn to_deployment(&self) -> Deployment {
         Deployment {
@@ -457,6 +678,7 @@ impl DeploymentRecord {
             health_path: self.health_path.clone(),
             extra: self.extra.clone(),
             shapes: self.shapes.clone(),
+            provider_shapes: self.provider_shapes.clone(),
         }
     }
 }
@@ -506,51 +728,132 @@ pub trait Router: Send + Sync {
 mod shape_tests {
     use super::*;
 
+    fn mk_dep(
+        own: UpstreamFormat,
+        api_base: Option<&str>,
+        provider_shapes: Vec<ProviderShape>,
+        shapes: Option<Vec<UpstreamFormat>>,
+    ) -> Deployment {
+        Deployment {
+            model_id: "m1".into(),
+            model_name: "m".into(),
+            provider_id: "p1".into(),
+            provider: "p".into(),
+            upstream_model: "um".into(),
+            api_base: api_base.map(str::to_string),
+            api_key: None,
+            upstream_format: own,
+            weight: 1,
+            pricing: None,
+            health_check: HealthCheck::None,
+            health_path: None,
+            extra: Extra::default(),
+            shapes,
+            provider_shapes,
+        }
+    }
+
     #[test]
-    fn a_deployment_serves_its_own_format_and_its_providers_shapes() {
-        let own = UpstreamFormat::Chat(WireFormat::OpenaiChat);
+    fn provider_shapes_are_inherited_by_default_and_narrowed_per_deployment() {
         let base = Some("https://h/v1");
-        // No shapes declared: only the deployment's own format, as before.
-        assert_eq!(
-            native_base(&[], own, base, WireFormat::OpenaiChat),
-            Some(base)
-        );
-        assert_eq!(native_base(&[], own, base, WireFormat::Anthropic), None);
-        let shapes = [
+        // Legacy provider with no shapes declared: only the deployment's own format.
+        let legacy = mk_dep(WireFormat::OpenaiChat.into(), base, Vec::new(), None);
+        assert_eq!(legacy.native_base(WireFormat::OpenaiChat), Some(base));
+        assert_eq!(legacy.native_base(WireFormat::Anthropic), None);
+        assert_eq!(legacy.decision_target(DecisionFormat::Jev), None);
+
+        // Provider declaring chat + embed + jev across distinct bases.
+        let p_shapes = vec![
             ProviderShape {
-                format: WireFormat::Anthropic,
+                format: WireFormat::Anthropic.into(),
                 api_base: Some("https://h/anthropic".into()),
             },
             ProviderShape {
-                format: WireFormat::OpenaiResponses,
+                format: WireFormat::OpenaiChat.into(),
                 api_base: Some("  ".into()),
             },
+            ProviderShape {
+                format: EmbedFormat::OpenaiEmbed.into(),
+                api_base: Some("https://h/embed/v1".into()),
+            },
+            ProviderShape {
+                format: DecisionFormat::Jev.into(),
+                api_base: None,
+            },
         ];
+
+        // Deployment with shapes = None inherits all provider shapes.
+        let inherited = mk_dep(WireFormat::OpenaiChat.into(), base, p_shapes.clone(), None);
         assert_eq!(
-            native_base(&shapes, own, base, WireFormat::Anthropic),
-            Some(Some("https://h/anthropic"))
+            inherited.chat_target(WireFormat::Anthropic),
+            Some((WireFormat::Anthropic, Some("https://h/anthropic"), true))
         );
-        // A blank per-shape base falls back to the provider's.
+        // Blank per-shape base falls back to provider's api_base.
         assert_eq!(
-            native_base(&shapes, own, base, WireFormat::OpenaiResponses),
-            Some(base)
+            inherited.chat_target(WireFormat::OpenaiChat),
+            Some((WireFormat::OpenaiChat, base, true))
         );
-        assert_eq!(native_base(&shapes, own, base, WireFormat::Gemini), None);
-        // An embeddings deployment serves no chat shape of its own.
-        let embed = UpstreamFormat::Embed(EmbedFormat::OpenaiEmbed);
-        assert_eq!(native_base(&[], embed, base, WireFormat::OpenaiChat), None);
+        // Unchecked chat shape translates to preferred enabled chat shape.
+        assert_eq!(
+            inherited.chat_target(WireFormat::Gemini),
+            Some((WireFormat::OpenaiChat, base, false))
+        );
+        // Decision target relays Jev natively and translates Decisions -> Jev.
+        assert_eq!(
+            inherited.decision_target(DecisionFormat::Jev),
+            Some((DecisionFormat::Jev, base, true))
+        );
+        assert_eq!(
+            inherited.decision_target(DecisionFormat::Decisions),
+            Some((DecisionFormat::Jev, base, false))
+        );
+        assert_eq!(
+            inherited.embed_target(EmbedFormat::OpenaiEmbed),
+            Some((EmbedFormat::OpenaiEmbed, Some("https://h/embed/v1"), true))
+        );
+
+        // Narrowed embed-only deployment on the same provider serves neither chat nor jev.
+        let embed_only = mk_dep(
+            EmbedFormat::OpenaiEmbed.into(),
+            base,
+            p_shapes,
+            Some(vec![EmbedFormat::OpenaiEmbed.into()]),
+        );
+        assert_eq!(embed_only.chat_target(WireFormat::OpenaiChat), None);
+        assert_eq!(embed_only.decision_target(DecisionFormat::Jev), None);
+        assert_eq!(
+            embed_only.embed_target(EmbedFormat::OpenaiEmbed),
+            Some((EmbedFormat::OpenaiEmbed, Some("https://h/embed/v1"), true))
+        );
     }
 
     #[test]
     fn shapes_serialize_as_flat_format_names() {
-        let s = ProviderShape {
-            format: WireFormat::OpenaiChat,
-            api_base: None,
-        };
+        let shapes = [
+            ProviderShape {
+                format: WireFormat::OpenaiChat.into(),
+                api_base: None,
+            },
+            ProviderShape {
+                format: EmbedFormat::OpenaiEmbed.into(),
+                api_base: Some("https://e/v1".into()),
+            },
+            ProviderShape {
+                format: DecisionFormat::Jev.into(),
+                api_base: None,
+            },
+            ProviderShape {
+                format: DecisionFormat::Decisions.into(),
+                api_base: None,
+            },
+        ];
+        let json = serde_json::to_string(&shapes).unwrap();
         assert_eq!(
-            serde_json::to_string(&[s]).unwrap(),
-            r#"[{"format":"openai_chat"}]"#
+            json,
+            r#"[{"format":"openai_chat"},{"format":"openai_embed","api_base":"https://e/v1"},{"format":"jev"},{"format":"decisions"}]"#
         );
+        let back: Vec<ProviderShape> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.as_slice(), &shapes);
         assert_eq!(
             WireFormat::parse("openai_responses"),
             Some(WireFormat::OpenaiResponses)

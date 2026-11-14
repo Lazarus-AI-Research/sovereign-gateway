@@ -124,21 +124,32 @@ impl DeploymentRouter {
             .into_iter()
             .flat_map(|mc| {
                 let model_id = cfg_model_id(&mc.model_name);
-                mc.deployments.into_iter().map(move |dc| Deployment {
-                    model_id: model_id.clone(),
-                    model_name: mc.model_name.clone(),
-                    provider_id: cfg_provider_id(&dc.provider),
-                    provider: dc.provider,
-                    upstream_model: dc.upstream_model,
-                    api_base: dc.api_base,
-                    api_key: dc.api_key,
-                    upstream_format: dc.upstream_format,
-                    weight: dc.weight,
-                    pricing: dc.pricing,
-                    health_check: dc.health_check,
-                    health_path: dc.health_path,
-                    extra: dc.extra.clone(),
-                    shapes: Vec::new(),
+                mc.deployments.into_iter().map(move |dc| {
+                    let upstream_format = dc
+                        .upstream_format
+                        .or_else(|| {
+                            dc.shapes
+                                .as_deref()
+                                .and_then(yb_core::default_upstream_format)
+                        })
+                        .unwrap_or_else(|| yb_core::WireFormat::OpenaiChat.into());
+                    Deployment {
+                        model_id: model_id.clone(),
+                        model_name: mc.model_name.clone(),
+                        provider_id: cfg_provider_id(&dc.provider),
+                        provider: dc.provider,
+                        upstream_model: dc.upstream_model,
+                        api_base: dc.api_base,
+                        api_key: dc.api_key,
+                        upstream_format,
+                        weight: dc.weight,
+                        pricing: dc.pricing,
+                        health_check: dc.health_check,
+                        health_path: dc.health_path,
+                        extra: dc.extra.clone(),
+                        shapes: dc.shapes,
+                        provider_shapes: Vec::new(),
+                    }
                 })
             })
             .collect();
@@ -294,7 +305,10 @@ impl Router for DeploymentRouter {
         snap.models
             .values()
             .flat_map(|entry| entry.deployments.iter())
-            .filter(|d| d.upstream_format == format && d.upstream_model == upstream_model)
+            .filter(|d| {
+                d.upstream_model == upstream_model
+                    && (d.native_base(format).is_some() || d.upstream_format == format)
+            })
             .cloned()
             .collect()
     }
@@ -352,7 +366,8 @@ mod tests {
             upstream_model: format!("{provider}-model"),
             api_base: None,
             api_key: None,
-            upstream_format: fmt.into(),
+            upstream_format: Some(fmt.into()),
+            shapes: None,
             weight,
             pricing: None,
             health_check: Default::default(),
@@ -515,7 +530,8 @@ mod tests {
             health_check: Default::default(),
             health_path: None,
             extra: Default::default(),
-            shapes: Vec::new(),
+            shapes: None,
+            provider_shapes: Vec::new(),
             created_at: yb_core::now(),
             updated_at: yb_core::now(),
             deleted_at: None,
